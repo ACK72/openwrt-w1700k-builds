@@ -129,17 +129,24 @@ build_npu() {
 }
 
 configure() {
+    local profile feeds_file
+    # Resolve caller-supplied relative paths before entering the source tree.
+    profile=$(realpath -e -- "$CONFIG_FILE")
+    feeds_file=$(realpath -e -- "${FEEDS_LOCK:-$OPENWRT/feeds.conf.default}")
     cd "$OPENWRT"
     # An optional lock uses normal src-git name URL^FULL_COMMIT lines.
-    cp "${FEEDS_LOCK:-$OPENWRT/feeds.conf.default}" feeds.conf
+    cp "$feeds_file" feeds.conf
     ./scripts/feeds update -a 2>&1 | tee "$LOGS/feeds-update.log"
+    # Keep exact feed revisions even when installation or defconfig fails.
+    ./scripts/feeds list -s -f > "$WORK/feeds.lock"
     ./scripts/feeds uninstall -a 2>&1 | tee "$LOGS/feeds-uninstall.log"
     ./scripts/feeds install -a 2>&1 | tee "$LOGS/feeds-install.log"
-    cp "$CONFIG_FILE" .config
+    cp "$profile" .config
     printf 'CONFIG_CCACHE_DIR="%s"\n' "$CCACHE_DIR" >> .config
+    # Validate Kconfig against the effective request, including builder overrides.
+    cp .config "$WORK/requested.config"
     make defconfig 2>&1 | tee "$LOGS/defconfig.log"
-    python3 "$ROOT/scripts/build-meta.py" check-config "$OPENWRT" "$CONFIG_FILE"
-    ./scripts/feeds list -s -f > "$WORK/feeds.lock"
+    python3 "$ROOT/scripts/build-meta.py" check-config "$OPENWRT" "$WORK/requested.config"
     python3 "$ROOT/scripts/build-meta.py" keys "$OPENWRT" "$NPU" | tee "$WORK/keys.env"
 }
 
@@ -186,7 +193,9 @@ compile() {
         echo 'Parallel build failed; retrying once with one job and full diagnostics.' >&2
         make -C "$OPENWRT" -j1 V=s 2>&1 | tee "$LOGS/build-retry.log"
     fi
-    "$OPENWRT/staging_dir/host/bin/ccache" -s | tee "$LOGS/ccache.log"
+    if ! "$OPENWRT/staging_dir/host/bin/ccache" -s 2>&1 | tee "$LOGS/ccache.log"; then
+        echo 'WARNING: Could not collect ccache statistics; firmware compilation succeeded.' >&2
+    fi
 }
 
 collect() {

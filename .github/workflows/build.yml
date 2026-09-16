@@ -204,6 +204,10 @@ jobs:
             logs/
             .work/openwrt/logs/
             .work/build-state.json
+            .work/sources.env
+            .work/feeds.lock
+            .work/requested.config
+            .work/openwrt/feeds.conf
             .work/openwrt/.config
           include-hidden-files: true
           if-no-files-found: ignore

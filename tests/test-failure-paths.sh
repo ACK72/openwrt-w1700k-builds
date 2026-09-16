@@ -22,6 +22,7 @@ SH
 cat > "$test_root/.work/openwrt/staging_dir/host/bin/ccache" <<'SH'
 #!/usr/bin/env bash
 echo stats >> "$TEST_STATS"
+exit "${TEST_STATS_EXIT:-0}"
 SH
 chmod +x "$test_root/fake-bin/"* "$test_root/.work/openwrt/staging_dir/host/bin/ccache"
 export PATH="$test_root/fake-bin:$PATH" JOBS=2
@@ -51,3 +52,12 @@ if bash "$test_root/scripts/build.sh" download > "$test_root/output" 2>&1; then
     exit 1
 fi
 echo 'PASS: download failure propagates'
+
+export TEST_MODE=success TEST_STATS_EXIT=42
+if ! bash "$test_root/scripts/build.sh" compile > "$test_root/output" 2>&1; then
+    cat "$test_root/output"
+    echo 'Statistics failure discarded a successful compilation' >&2
+    exit 1
+fi
+grep -q 'WARNING: Could not collect ccache statistics' "$test_root/output"
+echo 'PASS: statistics failure does not discard compiled firmware'
