@@ -1,0 +1,13 @@
+This OpenWrt firmware builder is provided under:
+
+	SPDX-License-Identifier: GPL-2.0-only
+
+Being under the terms of the GNU General Public License version 2 only,
+according with:
+
+	LICENSES/GPL-2.0
+
+The NPU FDK compatibility patches retain the MIT license and upstream
+copyright notice included in LICENSES/MIT.
+
+The full license text is included in LICENSES/GPL-2.0.

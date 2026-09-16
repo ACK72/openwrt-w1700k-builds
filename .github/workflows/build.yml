@@ -1,0 +1,234 @@
+name: Build W1700K ubi2-oc
+
+on:
+  schedule:
+    - cron: '17 18 * * *'
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build.yml', 'scripts/**', 'configs/**', 'package/**', 'patches/**']
+  workflow_dispatch:
+    inputs:
+      openwrt_ref:
+        description: ACK72/openwrt branch, tag, or commit
+        default: ubi2-oc
+        type: string
+      npu_ref:
+        description: ACK72/airoha-npu-fdk branch, tag, or commit
+        default: main
+        type: string
+      runner:
+        description: Build host architecture (separate toolchain caches)
+        default: ubuntu-24.04
+        type: choice
+        options: [ubuntu-24.04, ubuntu-24.04-arm]
+      force:
+        description: Build even when the source fingerprint already succeeded
+        default: true
+        type: boolean
+      publish:
+        description: Also publish an immutable prerelease with firmware and packages
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: w1700k-${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'ubuntu-24.04' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 350
+    env:
+      OPENWRT_REF: ${{ inputs.openwrt_ref || 'ubi2-oc' }}
+      NPU_REF: ${{ inputs.npu_ref || 'main' }}
+      CCACHE_MAXSIZE: 3G
+    outputs:
+      built: ${{ steps.collect.outcome == 'success' }}
+      fingerprint: ${{ steps.keys.outputs.fingerprint }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check builder before compiling
+        run: |
+          python3 -B -m unittest discover -s tests -v
+          for script in tests/*.sh; do bash "$script"; done
+      - name: Reclaim hosted runner space for cross compilation
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h .
+      - name: Install build dependencies
+        run: bash scripts/install-deps.sh
+      - name: Resolve source revisions
+        id: sources
+        run: |
+          bash scripts/build.sh prepare
+          cat .work/sources.env >> "$GITHUB_OUTPUT"
+      - name: Restore paired NPU firmware
+        id: npu
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/npu
+          key: npu-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.sources.outputs.npu-key }}
+      - name: Build and package FDK firmware
+        run: bash scripts/build.sh npu
+      - name: Save paired NPU firmware
+        if: steps.npu.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/npu
+          key: ${{ steps.npu.outputs.cache-primary-key }}
+      - name: Resolve feeds and configuration
+        id: keys
+        run: |
+          bash scripts/build.sh configure
+          cat .work/keys.env >> "$GITHUB_OUTPUT"
+      - name: Check previous successful build
+        id: previous
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/success
+          key: success-v2-${{ steps.keys.outputs.fingerprint }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: success-v2-${{ steps.keys.outputs.fingerprint }}-
+      - name: Decide whether compilation is needed
+        id: needed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FINGERPRINT: ${{ steps.keys.outputs.fingerprint }}
+          FORCE: ${{ inputs.force }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          decision=$(bash scripts/should-build.sh)
+          echo "$decision" >> "$GITHUB_OUTPUT"
+          if [[ "$decision" == build=false ]]; then
+            echo 'Sources, feeds, configuration and host environment are unchanged; the previous firmware artifact is still available.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Restore downloads
+        if: steps.needed.outputs.build == 'true'
+        id: dl
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/dl
+          key: dl-v1-${{ steps.keys.outputs.fingerprint }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: dl-v1-
+      - name: Restore compiler cache
+        if: steps.needed.outputs.build == 'true'
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/ccache
+          key: ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.toolchain }}-
+            ccache-v1-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore exact toolchain snapshot
+        if: steps.needed.outputs.build == 'true'
+        id: toolchain
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/toolchain
+          key: toolchain-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.toolchain }}
+      - name: Download sources in parallel
+        if: steps.needed.outputs.build == 'true'
+        run: bash scripts/build.sh download
+      - name: Build tools and toolchain
+        if: steps.needed.outputs.build == 'true'
+        id: tools
+        run: bash scripts/build.sh toolchain
+      - name: Save successful toolchain before firmware compilation
+        if: steps.tools.outcome == 'success' && steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/toolchain
+          key: ${{ steps.toolchain.outputs.cache-primary-key }}
+      - name: Compile firmware
+        if: steps.needed.outputs.build == 'true'
+        id: compile
+        run: bash scripts/build.sh compile
+      - name: Collect firmware, APKs and provenance
+        if: steps.needed.outputs.build == 'true'
+        id: collect
+        run: |
+          bash scripts/build.sh collect
+          echo "artifact-path=$(cat .work/artifact-path)" >> "$GITHUB_OUTPUT"
+          cat .work/build-state.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload firmware and packages
+        if: steps.collect.outcome == 'success'
+        id: firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: w1700k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.collect.outputs.artifact-path }}
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remember successful fingerprint
+        if: steps.firmware.outcome == 'success'
+        env:
+          FINGERPRINT: ${{ steps.keys.outputs.fingerprint }}
+          ARTIFACT_ID: ${{ steps.firmware.outputs.artifact-id }}
+        run: |
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          mkdir -p .cache/success
+          printf '%s\n' "$FINGERPRINT" > .cache/success/fingerprint
+          printf '%s\n' "$ARTIFACT_ID" > .cache/success/artifact-id
+      - name: Save successful fingerprint
+        if: steps.firmware.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/success
+          key: ${{ steps.previous.outputs.cache-primary-key }}
+      - name: Save reusable downloads even after compilation failure
+        if: always() && steps.dl.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/dl
+          key: ${{ steps.dl.outputs.cache-primary-key }}
+      - name: Save compiler cache even after compilation failure
+        if: always() && steps.ccache.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            logs/
+            .work/openwrt/logs/
+            .work/build-state.json
+            .work/openwrt/.config
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && needs.build.outputs.built == 'true'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: w1700k-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release
+      - name: Create prerelease without deleting previous builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FINGERPRINT: ${{ needs.build.outputs.fingerprint }}
+        run: |
+          tag="ubi2-oc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          printf 'ACK72 ubi2-oc with source-built AN7581/MT7996 NPU firmware.\n\nFingerprint: %s\n\nSee build-manifest.json and feeds.lock for exact revisions. Hardware validation is required.\n' "$FINGERPRINT" > release-notes.md
+          tar --zstd -cf build-bundle.tar.zst -C release .
+          gh release create "$tag" --prerelease --title "$tag" --target "$GITHUB_SHA" \
+            --notes-file release-notes.md \
+            release/firmware/*sysupgrade.itb release/build-manifest.json build-bundle.tar.zst
