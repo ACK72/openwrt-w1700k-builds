@@ -63,7 +63,10 @@ def config_digest(path, toolchain=False):
     """Package selection and release labels do not change compiler binaries."""
     values = read_config(path)
     ignored = ("CONFIG_VERSION_", "CONFIG_PACKAGE_") if toolchain else ("CONFIG_VERSION_",)
-    values = {key: value for key, value in values.items() if not key.startswith(ignored)}
+    # Feeds frequently add unselected packages. An absent boolean and an
+    # explicitly disabled boolean are equivalent after make defconfig.
+    values = {key: value for key, value in values.items()
+              if value != "n" and not key.startswith(ignored)}
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 

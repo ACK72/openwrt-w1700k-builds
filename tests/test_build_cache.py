@@ -103,6 +103,14 @@ class SourceTimestamps(unittest.TestCase):
 
 
 class CacheKeys(unittest.TestCase):
+    def test_new_unselected_feed_package_does_not_discard_build_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".config"
+            path.write_text('CONFIG_PACKAGE_one=y\n')
+            before = meta.config_digest(path)
+            path.write_text('CONFIG_PACKAGE_one=y\n# CONFIG_PACKAGE_new is not set\n')
+            self.assertEqual(before, meta.config_digest(path))
+
     def test_package_change_reuses_toolchain_but_not_incompatible_build_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".config"
