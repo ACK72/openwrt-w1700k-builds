@@ -71,9 +71,38 @@ def config_digest(path, toolchain=False):
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
+def target_packages(openwrt):
+    """Keep target/device defaults when registering only selected feed recipes."""
+    metadata = (openwrt / "tmp/.targetinfo").read_text(encoding="utf-8")
+    targets = re.split(r"(?m)^Target: ", metadata)
+    target = next((item for item in targets if item.startswith("airoha/an7581\n")), "")
+    profiles = re.split(r"(?m)^Target-Profile: ", target)
+    device = next((item for item in profiles if item.startswith("DEVICE_gemtek_w1700k-ubi\n")), "")
+    defaults = re.search(r"(?m)^Default-Packages: (.*)$", profiles[0])
+    packages = re.search(r"(?m)^Target-Profile-Packages: (.*)$", device)
+    if not defaults or not packages:
+        raise RuntimeError("W1700K target/device package metadata is missing")
+    names = (defaults[1] + " " + packages[1]).split()
+    return {name for name in names if not name.startswith("-")} - {
+        name[1:] for name in names if name.startswith("-")
+    }
+
+
+def requested_packages(openwrt, profile):
+    expected = {"CONFIG_PACKAGE_" + name: "y" for name in target_packages(openwrt)}
+    expected.update(read_config(profile))
+    return expected
+
+
+def feed_packages(openwrt, profile):
+    return sorted(name.removeprefix("CONFIG_PACKAGE_")
+                  for name, value in requested_packages(openwrt, profile).items()
+                  if name.startswith("CONFIG_PACKAGE_") and value in ("y", "m"))
+
+
 def check_config(openwrt, profile):
     actual = read_config(openwrt / ".config")
-    expected = read_config(profile)
+    expected = requested_packages(openwrt, profile)
     expected.update(dict.fromkeys(REQUIRED_CONFIG, "y"))
     mismatches = [
         f"{name}: requested {value}, got {actual.get(name, 'n')}"
@@ -182,10 +211,10 @@ def manifest(openwrt, npu, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("install-npu", "keys", "manifest", "check-config"):
+    for command in ("install-npu", "keys", "manifest", "check-config", "feed-packages"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("openwrt", type=Path)
-        if command == "check-config":
+        if command in ("check-config", "feed-packages"):
             subparser.add_argument("profile", type=Path)
         else:
             subparser.add_argument("npu", type=Path)
@@ -194,6 +223,8 @@ def main():
     args = parser.parse_args()
     if args.command == "check-config":
         check_config(args.openwrt, args.profile)
+    elif args.command == "feed-packages":
+        print("\n".join(feed_packages(args.openwrt, args.profile)))
     elif args.command == "keys":
         keys(args.openwrt, args.npu)
     elif args.command == "install-npu":

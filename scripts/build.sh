@@ -24,6 +24,8 @@ export CCACHE_COMPRESSLEVEL=1
 # Keep ccache's correctness checks; no time_macros/file_stat_matches sloppiness.
 export LLVM_CC=clang-18 LLVM_OBJCOPY=llvm-objcopy-18
 export LLVM_READOBJ=llvm-readobj-18 LLVM_AR=llvm-ar-18
+# OpenWrt otherwise prints recursive Kconfig errors but exits successfully.
+export RECURSIVE_DEP_IS_ERROR=1
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 [[ $(uname -s) == Linux ]] || die 'Use Ubuntu 24.04, a Linux VM, or WSL2 on an ext4 filesystem.'
@@ -130,6 +132,7 @@ build_npu() {
 
 configure() {
     local profile feeds_file
+    local feed_packages=()
     # Resolve caller-supplied relative paths before entering the source tree.
     profile=$(realpath -e -- "$CONFIG_FILE")
     feeds_file=$(realpath -e -- "${FEEDS_LOCK:-$OPENWRT/feeds.conf.default}")
@@ -140,7 +143,13 @@ configure() {
     # Keep exact feed revisions even when installation or defconfig fails.
     ./scripts/feeds list -s -f > "$WORK/feeds.lock"
     ./scripts/feeds uninstall -a 2>&1 | tee "$LOGS/feeds-uninstall.log"
-    ./scripts/feeds install -a 2>&1 | tee "$LOGS/feeds-install.log"
+    make -s prepare-tmpinfo 2>&1 | tee "$LOGS/package-metadata.log"
+    # Unselected feed recipes can have broken Kconfig dependencies. Register
+    # device defaults and requested packages; feeds resolves their dependencies.
+    python3 "$ROOT/scripts/build-meta.py" feed-packages "$OPENWRT" "$profile" > "$WORK/feed-packages.txt"
+    mapfile -t feed_packages < "$WORK/feed-packages.txt"
+    (( ${#feed_packages[@]} > 0 )) || die 'No firmware packages selected'
+    ./scripts/feeds install "${feed_packages[@]}" 2>&1 | tee "$LOGS/feeds-install.log"
     cp "$profile" .config
     printf 'CONFIG_CCACHE_DIR="%s"\n' "$CCACHE_DIR" >> .config
     # Validate Kconfig against the effective request, including builder overrides.

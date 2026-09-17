@@ -96,6 +96,12 @@ class Configuration(unittest.TestCase):
         self.profile = self.root / "profile"
         self.profile.write_text('CONFIG_PACKAGE_luci=y\n# CONFIG_SDK is not set\n')
         self.config = self.root / ".config"
+        (self.root / "tmp").mkdir()
+        (self.root / "tmp/.targetinfo").write_text(
+            "Target: airoha/an7581\nDefault-Packages: luci\n"
+            "Target-Profile: DEVICE_gemtek_w1700k-ubi\n"
+            "Target-Profile-Packages: kmod-mt7996e\n"
+        )
         self.valid = "".join(f"{name}=y\n" for name in meta.REQUIRED_CONFIG)
         self.valid += 'CONFIG_PACKAGE_luci=y\n# CONFIG_SDK is not set\n'
         self.config.write_text(self.valid)
@@ -122,6 +128,34 @@ class Configuration(unittest.TestCase):
         self.config.write_text(self.valid.replace('# CONFIG_SDK is not set', 'CONFIG_SDK=y'))
         with self.assertRaisesRegex(RuntimeError, 'CONFIG_SDK'):
             meta.check_config(self.root, self.profile)
+
+    def test_device_defaults_modules_and_explicit_overrides(self):
+        (self.root / "tmp/.targetinfo").write_text(
+            "Target: unrelated/target\nDefault-Packages: unwanted\n"
+            "Target: airoha/an7581\nDefault-Packages: base-files wpad-basic-mbedtls removed\n"
+            "Target-Profile: DEVICE_other\nTarget-Profile-Packages: unwanted\n"
+            "Target-Profile: DEVICE_gemtek_w1700k-ubi\n"
+            "Target-Profile-Packages: kmod-mt7996e -removed\n"
+            "Target-Profile: DEVICE_last\nTarget-Profile-Packages: unwanted\n"
+        )
+        self.profile.write_text(
+            "CONFIG_PACKAGE_luci=y\nCONFIG_PACKAGE_iperf3=m\n"
+            "# CONFIG_PACKAGE_wpad-basic-mbedtls is not set\n"
+        )
+        self.assertEqual(meta.feed_packages(self.root, self.profile),
+                         ["base-files", "iperf3", "kmod-mt7996e", "luci"])
+
+    def test_missing_default_package_is_rejected(self):
+        metadata = self.root / "tmp/.targetinfo"
+        metadata.write_text(metadata.read_text().replace("Default-Packages: luci",
+                                                       "Default-Packages: luci base-files"))
+        with self.assertRaisesRegex(RuntimeError, "CONFIG_PACKAGE_base-files"):
+            meta.check_config(self.root, self.profile)
+
+    def test_missing_device_metadata_is_rejected(self):
+        (self.root / "tmp/.targetinfo").write_text("Target: airoha/an7581\n")
+        with self.assertRaisesRegex(RuntimeError, "metadata is missing"):
+            meta.feed_packages(self.root, self.profile)
 
 
 class CacheDigest(unittest.TestCase):

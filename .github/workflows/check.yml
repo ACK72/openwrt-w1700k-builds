@@ -6,7 +6,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - run: sudo apt-get update && sudo apt-get install -y shellcheck zstd
@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Install release build dependencies
@@ -32,12 +32,13 @@ jobs:
           bash scripts/build.sh configure
       - name: Preserve configuration diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: release-config-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             logs/
             .work/feeds.lock
+            .work/feed-packages.txt
             .work/build-state.json
             .work/openwrt/.config
           include-hidden-files: true

@@ -23,12 +23,29 @@ if [[ $1 == list ]]; then
     cat feeds.conf
 elif [[ $1 == install && ${TEST_FAIL_INSTALL:-false} == true ]]; then
     exit 42
+elif [[ $1 == install ]]; then
+    [[ $2 != -a ]]
+    printf '%s\n' "${@:2}" > installed-packages.txt
 fi
 SH
 cat > "$test_root/fake-bin/make" <<'SH'
 #!/usr/bin/env bash
 set -eu
+if [[ $* == '-s prepare-tmpinfo' ]]; then
+    mkdir -p tmp
+    cat > tmp/.targetinfo <<'META'
+Target: airoha/an7581
+Default-Packages: ca-bundle
+Target-Profile: DEVICE_gemtek_w1700k-ubi
+Target-Profile-Packages: kmod-mt7996e
+META
+    exit
+fi
 [[ $* == defconfig ]]
+if [[ ${TEST_RECURSIVE_DEP:-false} == true ]]; then
+    echo 'error: recursive dependency detected!' >&2
+    [[ ${RECURSIVE_DEP_IS_ERROR:-0} != 1 ]] || exit 1
+fi
 if [[ ${TEST_DROP_PACKAGE:-false} == true ]]; then
     sed -i '/^CONFIG_PACKAGE_luci-app-wifi7=/d' .config
 fi
@@ -52,6 +69,8 @@ if ! bash scripts/build.sh configure > configure.log 2>&1; then
     exit 1
 fi
 cmp configs/feeds.lock .work/feeds.lock
+grep -qx 'luci-app-wifi7' .work/openwrt/installed-packages.txt
+grep -qx 'kmod-mt7996e' .work/openwrt/installed-packages.txt
 echo 'PASS: relative profile and feed lock paths'
 
 # Reusing an exported config must honor the builder-owned cache location.
@@ -84,3 +103,11 @@ if bash scripts/build.sh configure > configure.log 2>&1; then
 fi
 cmp configs/feeds.lock .work/feeds.lock
 echo 'PASS: feed install failure retains its source revisions'
+
+export TEST_FAIL_INSTALL=false TEST_RECURSIVE_DEP=true
+if bash scripts/build.sh configure > configure.log 2>&1; then
+    echo 'Recursive Kconfig error was hidden' >&2
+    exit 1
+fi
+grep -q 'recursive dependency detected' logs/defconfig.log
+echo 'PASS: recursive Kconfig errors abort configuration'
