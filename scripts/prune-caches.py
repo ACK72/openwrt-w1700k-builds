@@ -24,7 +24,7 @@ def main():
     replacements = {"dl": f"{prefix}-dl-{run}",
                     "ccache": f"{prefix}-ccache-{env['TOOLCHAIN_KEY']}-{run}",
                     "build": f"{prefix}-build-{env['BUILD_KEY']}-{run}",
-                    "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}",
+                    "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}-{run}",
                     "npu": f"{prefix}-npu-{env['NPU_KEY']}"}
     raw = subprocess.check_output(["gh", "api", "--paginate", "--slurp",
                                    f"repos/{repo}/actions/caches?per_page=100&ref={quote(ref, safe='')}"], text=True)

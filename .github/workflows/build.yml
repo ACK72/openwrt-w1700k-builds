@@ -108,7 +108,9 @@ jobs:
         with:
           path: .cache/dl
           key: ${{ env.CACHE_PREFIX }}-dl-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ${{ env.CACHE_PREFIX }}-dl-
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-dl-
+            dl-v1-
       - name: Restore compiler cache
         if: steps.needed.outputs.build == 'true' && inputs.clean != true
         id: ccache
@@ -119,6 +121,7 @@ jobs:
           restore-keys: |
             ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-
             ${{ env.CACHE_PREFIX }}-ccache-
+            ccache-v1-${{ runner.os }}-${{ runner.arch }}-
       - name: Restore compatible kernel and package build state
         if: steps.needed.outputs.build == 'true' && inputs.clean != true
         id: buildcache
@@ -132,7 +135,8 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: .cache/toolchain
-          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}
+          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-
       - name: Restore build products before make download
         if: steps.needed.outputs.build == 'true'
         id: restored
@@ -154,7 +158,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: .cache/toolchain
-          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}
+          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Compile release firmware
         if: steps.needed.outputs.build == 'true'
         run: bash scripts/build.sh compile
