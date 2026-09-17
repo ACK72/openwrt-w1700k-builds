@@ -9,10 +9,36 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck zstd
       - run: for script in scripts/*.sh tests/*.sh; do bash -n "$script"; done
       - run: shellcheck scripts/*.sh tests/*.sh
       - run: python3 -B -m unittest discover -s tests -v
       - run: for script in tests/*.sh; do bash "$script"; done
       - name: Check Actions syntax
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+  release-config:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install release build dependencies
+        run: bash scripts/install-deps.sh
+      - name: Validate the real device, NPU integration and release Kconfig
+        run: |
+          bash scripts/build.sh prepare
+          bash scripts/build.sh npu
+          bash scripts/build.sh configure
+      - name: Preserve configuration diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-config-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            logs/
+            .work/feeds.lock
+            .work/build-state.json
+            .work/openwrt/.config
+          include-hidden-files: true
+          retention-days: 7

@@ -59,6 +59,14 @@ def read_config(path):
     return values
 
 
+def config_digest(path, toolchain=False):
+    """Package selection and release labels do not change compiler binaries."""
+    values = read_config(path)
+    ignored = ("CONFIG_VERSION_", "CONFIG_PACKAGE_") if toolchain else ("CONFIG_VERSION_",)
+    values = {key: value for key, value in values.items() if not key.startswith(ignored)}
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+
 def check_config(openwrt, profile):
     actual = read_config(openwrt / ".config")
     expected = read_config(profile)
@@ -117,31 +125,37 @@ def keys(openwrt, npu):
         for p in sorted((openwrt / "feeds").iterdir())
         if p.is_dir() and not p.is_symlink() and (p / ".git").exists()
     }
+    # A browser/SDK update in the runner image is unrelated to the compiler.
+    # Include the build dependencies and their installed dependency closure.
     host = subprocess.check_output(
-        ["dpkg-query", "-W", "-f=${Package}=${Version}\n"], text=True
+        ["bash", str(ROOT / "scripts/host-key.sh")], text=True
     )
     # Use tracked inputs only: generated conf binaries and pycache must not
     # invalidate a toolchain cache after make defconfig.
     tracked = git(openwrt, "ls-files", "--", *TOOLCHAIN_INPUTS).splitlines()
-    tracked.append(".config")
     source_hash = digest_paths(openwrt, tracked)
     builder_hash = digest_paths(ROOT, ["scripts", "configs", "package", "patches", ".github"])
     host_hash = hashlib.sha256((platform.machine() + host).encode()).hexdigest()
-    toolchain = hashlib.sha256((source_hash + host_hash + builder_hash).encode()).hexdigest()
+    toolchain = hashlib.sha256(
+        ("toolchain-v2" + source_hash + host_hash + config_digest(openwrt / ".config", True)).encode()
+    ).hexdigest()
+    build = hashlib.sha256((toolchain + config_digest(openwrt / ".config")).encode()).hexdigest()
     state = {
         "openwrt": git(openwrt, "rev-parse", "HEAD"),
         "npu": git(npu, "rev-parse", "HEAD"),
         "feeds": feeds, "builder": builder_hash, "toolchain": toolchain,
-        "host": host_hash,
+        "host": host_hash, "build": build,
+        "config": digest_paths(openwrt, [".config"]), "channel": "ubi2-oc",
     }
     fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
     state["fingerprint"] = fingerprint
     (openwrt.parent / "build-state.json").write_text(json.dumps(state, indent=2) + "\n")
-    print(f"toolchain={toolchain}\nfingerprint={fingerprint}")
+    print(f"toolchain={toolchain}\nbuild={build}\nfingerprint={fingerprint}")
 
 
 def manifest(openwrt, npu, output):
     state = json.loads((openwrt.parent / "build-state.json").read_text())
+    state["build_type"] = "release"
     try:
         state["builder_commit"] = git(ROOT, "rev-parse", "--verify", "HEAD")
     except subprocess.CalledProcessError:

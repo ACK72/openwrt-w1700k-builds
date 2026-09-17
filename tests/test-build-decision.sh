@@ -1,42 +1,33 @@
 #!/usr/bin/env bash
-# Verify skip decisions against available, deleted and expired artifacts.
+# Verify forced builds and the fail-open API behavior; release policy has Python tests.
 set -Eeuo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT
-mkdir -p "$test_root/scripts" "$test_root/.cache/success" "$test_root/fake-bin"
+mkdir -p "$test_root/scripts" "$test_root/fake-bin"
 cp "$ROOT/scripts/should-build.sh" "$test_root/scripts/"
-cat > "$test_root/fake-bin/gh" <<'SH'
+cat > "$test_root/fake-bin/python3" <<'SH'
 #!/usr/bin/env bash
 echo called >> "$TEST_CALLS"
-case $TEST_ARTIFACT in
-    available) echo true ;;
-    expired) echo false ;;
-    deleted) exit 1 ;;
+case $TEST_RELEASE in
+    available) echo build=false ;;
+    missing) echo build=true ;;
+    api-failure) exit 1 ;;
 esac
 SH
-chmod +x "$test_root/fake-bin/gh"
-export PATH="$test_root/fake-bin:$PATH" GH_REPO=example/builder
+chmod +x "$test_root/fake-bin/python3"
+export PATH="$test_root/fake-bin:$PATH"
 export FINGERPRINT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-export TEST_CALLS="$test_root/calls" TEST_ARTIFACT=available FORCE=false PUBLISH=false
+export TEST_CALLS="$test_root/calls" TEST_RELEASE=available FORCE=false
 decision() { bash "$test_root/scripts/should-build.sh"; }
-[[ $(decision) == build=true ]]
-printf '%s\n' "$FINGERPRINT" > "$test_root/.cache/success/fingerprint"
-echo 123 > "$test_root/.cache/success/artifact-id"
 [[ $(decision) == build=false ]]
-export TEST_ARTIFACT=expired
+export TEST_RELEASE=missing
 [[ $(decision) == build=true ]]
-export TEST_ARTIFACT=deleted
+export TEST_RELEASE=api-failure
 [[ $(decision) == build=true ]]
-export TEST_ARTIFACT=available FORCE=true
-[[ $(decision) == build=true ]]
-export FORCE=false PUBLISH=true
-[[ $(decision) == build=true ]]
-export PUBLISH=false
-echo mismatched-source > "$test_root/.cache/success/fingerprint"
-[[ $(decision) == build=true ]]
-printf '%s\n' "$FINGERPRINT" > "$test_root/.cache/success/fingerprint"
-echo invalid-id > "$test_root/.cache/success/artifact-id"
+export TEST_RELEASE=available FORCE=true
 [[ $(decision) == build=true ]]
 [[ $(wc -l < "$TEST_CALLS") == 3 ]]
-echo 'PASS: build decisions (missing, valid, expired, deleted, forced, publish, stale, invalid)'
+export FINGERPRINT=invalid
+if decision >/dev/null 2>&1; then exit 1; fi
+echo 'PASS: published-release skip, missing release, API failure and force'

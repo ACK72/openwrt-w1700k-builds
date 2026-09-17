@@ -1,4 +1,4 @@
-name: Build W1700K ubi2-oc
+name: Release W1700K ubi2-oc
 
 on:
   schedule:
@@ -8,156 +8,165 @@ on:
     paths: ['.github/workflows/build.yml', 'scripts/**', 'configs/**', 'package/**', 'patches/**']
   workflow_dispatch:
     inputs:
-      openwrt_ref:
-        description: ACK72/openwrt branch, tag, or commit
-        default: ubi2-oc
-        type: string
-      npu_ref:
-        description: ACK72/airoha-npu-fdk branch, tag, or commit
-        default: main
-        type: string
       runner:
-        description: Build host architecture (separate toolchain caches)
+        description: Build host (independent caches per architecture)
         default: ubuntu-24.04
         type: choice
         options: [ubuntu-24.04, ubuntu-24.04-arm]
       force:
-        description: Build even when the source fingerprint already succeeded
-        default: true
+        description: Build another release even if these inputs are already published
+        default: false
         type: boolean
-      publish:
-        description: Also publish an immutable prerelease with firmware and packages
+      clean:
+        description: Rebuild tools, toolchain, kernel and packages without compiler/build caches
         default: false
         type: boolean
 
 permissions:
   contents: read
-  actions: read
 
+# Serialize both host architectures, including publication and retention.
 concurrency:
-  group: w1700k-${{ github.workflow }}-${{ github.ref }}-${{ inputs.runner || 'ubuntu-24.04' }}
+  group: w1700k-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   build:
+    if: github.ref == 'refs/heads/main'
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 350
+    permissions:
+      contents: read
+      actions: write
     env:
-      OPENWRT_REF: ${{ inputs.openwrt_ref || 'ubi2-oc' }}
-      NPU_REF: ${{ inputs.npu_ref || 'main' }}
+      OPENWRT_REF: ubi2-oc
+      NPU_REF: main
       CCACHE_MAXSIZE: 3G
     outputs:
-      built: ${{ steps.collect.outcome == 'success' }}
-      fingerprint: ${{ steps.keys.outputs.fingerprint }}
+      built: ${{ steps.firmware.outcome == 'success' }}
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Check builder before compiling
+      - name: Identify host cache namespace
+        run: echo "CACHE_PREFIX=w1700k-v2-${RUNNER_OS}-${RUNNER_ARCH}" >> "$GITHUB_ENV"
+      - name: Validate release builder
         run: |
           python3 -B -m unittest discover -s tests -v
           for script in tests/*.sh; do bash "$script"; done
-      - name: Reclaim hosted runner space for cross compilation
+      - name: Reclaim space only when needed
         run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          available=$(df --output=avail -BG . | tail -1 | tr -dc '0-9')
+          if (( available < 30 )); then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+          fi
           df -h .
       - name: Install build dependencies
         run: bash scripts/install-deps.sh
-      - name: Resolve source revisions
+      - name: Resolve exact source revisions
         id: sources
         run: |
           bash scripts/build.sh prepare
           cat .work/sources.env >> "$GITHUB_OUTPUT"
       - name: Restore paired NPU firmware
         id: npu
+        if: inputs.clean != true
         uses: actions/cache/restore@v4
         with:
           path: .cache/npu
-          key: npu-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.sources.outputs.npu-key }}
-      - name: Build and package FDK firmware
+          key: ${{ env.CACHE_PREFIX }}-npu-${{ steps.sources.outputs.npu-key }}
+      - name: Build and verify paired NPU firmware
         run: bash scripts/build.sh npu
       - name: Save paired NPU firmware
         if: steps.npu.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: .cache/npu
-          key: ${{ steps.npu.outputs.cache-primary-key }}
-      - name: Resolve feeds and configuration
+          key: ${{ env.CACHE_PREFIX }}-npu-${{ steps.sources.outputs.npu-key }}
+      - name: Resolve feeds and validate release configuration
         id: keys
         run: |
           bash scripts/build.sh configure
           cat .work/keys.env >> "$GITHUB_OUTPUT"
-      - name: Check previous successful build
-        id: previous
-        uses: actions/cache/restore@v4
-        with:
-          path: .cache/success
-          key: success-v2-${{ steps.keys.outputs.fingerprint }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: success-v2-${{ steps.keys.outputs.fingerprint }}-
-      - name: Decide whether compilation is needed
+      - name: Check for an already published release
         id: needed
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           FINGERPRINT: ${{ steps.keys.outputs.fingerprint }}
-          FORCE: ${{ inputs.force }}
-          PUBLISH: ${{ inputs.publish }}
+          FORCE: ${{ inputs.force || inputs.clean }}
         run: |
           decision=$(bash scripts/should-build.sh)
           echo "$decision" >> "$GITHUB_OUTPUT"
           if [[ "$decision" == build=false ]]; then
-            echo 'Sources, feeds, configuration and host environment are unchanged; the previous firmware artifact is still available.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'These exact build inputs already have a downloadable release; compilation was skipped.' >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Restore downloads
+      - name: Restore source downloads
         if: steps.needed.outputs.build == 'true'
         id: dl
         uses: actions/cache/restore@v4
         with:
           path: .cache/dl
-          key: dl-v1-${{ steps.keys.outputs.fingerprint }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: dl-v1-
+          key: ${{ env.CACHE_PREFIX }}-dl-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ env.CACHE_PREFIX }}-dl-
       - name: Restore compiler cache
-        if: steps.needed.outputs.build == 'true'
+        if: steps.needed.outputs.build == 'true' && inputs.clean != true
         id: ccache
         uses: actions/cache/restore@v4
         with:
           path: .cache/ccache
-          key: ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.toolchain }}-
-            ccache-v1-${{ runner.os }}-${{ runner.arch }}-
-      - name: Restore exact toolchain snapshot
-        if: steps.needed.outputs.build == 'true'
-        id: toolchain
+            ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-
+            ${{ env.CACHE_PREFIX }}-ccache-
+      - name: Restore compatible kernel and package build state
+        if: steps.needed.outputs.build == 'true' && inputs.clean != true
+        id: buildcache
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/build
+          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-
+      - name: Restore compatible toolchain when no full build state exists
+        if: steps.needed.outputs.build == 'true' && inputs.clean != true && steps.buildcache.outputs.cache-matched-key == ''
         uses: actions/cache/restore@v4
         with:
           path: .cache/toolchain
-          key: toolchain-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.keys.outputs.toolchain }}
+          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}
+      - name: Restore build products before make download
+        if: steps.needed.outputs.build == 'true'
+        id: restored
+        run: |
+          bash scripts/build.sh restore
+          kind=none
+          if [[ -f .work/cache-restored ]]; then kind=$(cat .work/cache-restored); fi
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+          echo "Build state restored: $kind" >> "$GITHUB_STEP_SUMMARY"
       - name: Download sources in parallel
         if: steps.needed.outputs.build == 'true'
         run: bash scripts/build.sh download
-      - name: Build tools and toolchain
+      - name: Build missing tools and toolchain
         if: steps.needed.outputs.build == 'true'
         id: tools
         run: bash scripts/build.sh toolchain
       - name: Save successful toolchain before firmware compilation
-        if: steps.tools.outcome == 'success' && steps.toolchain.outputs.cache-hit != 'true'
+        if: steps.tools.outcome == 'success' && steps.restored.outputs.kind == 'none'
         uses: actions/cache/save@v4
         with:
           path: .cache/toolchain
-          key: ${{ steps.toolchain.outputs.cache-primary-key }}
-      - name: Compile firmware
+          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}
+      - name: Compile release firmware
         if: steps.needed.outputs.build == 'true'
-        id: compile
         run: bash scripts/build.sh compile
-      - name: Collect firmware, APKs and provenance
+      - name: Validate and collect firmware, matching APKs and provenance
         if: steps.needed.outputs.build == 'true'
         id: collect
         run: |
           bash scripts/build.sh collect
           echo "artifact-path=$(cat .work/artifact-path)" >> "$GITHUB_OUTPUT"
           cat .work/build-state.json >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload firmware and packages
+          cat logs/timings.tsv >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload validated release payload
         if: steps.collect.outcome == 'success'
         id: firmware
         uses: actions/upload-artifact@v4
@@ -167,34 +176,42 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 14
-      - name: Remember successful fingerprint
+      - name: Snapshot successful kernel and package build state
         if: steps.firmware.outcome == 'success'
-        env:
-          FINGERPRINT: ${{ steps.keys.outputs.fingerprint }}
-          ARTIFACT_ID: ${{ steps.firmware.outputs.artifact-id }}
-        run: |
-          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
-          mkdir -p .cache/success
-          printf '%s\n' "$FINGERPRINT" > .cache/success/fingerprint
-          printf '%s\n' "$ARTIFACT_ID" > .cache/success/artifact-id
-      - name: Save successful fingerprint
-        if: steps.firmware.outcome == 'success'
+        id: snapshot
+        continue-on-error: true
+        run: bash scripts/build.sh snapshot
+      - name: Save successful incremental build state
+        if: steps.snapshot.outcome == 'success'
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          path: .cache/success
-          key: ${{ steps.previous.outputs.cache-primary-key }}
-      - name: Save reusable downloads even after compilation failure
+          path: .cache/build
+          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save reusable downloads
         if: always() && steps.dl.outcome == 'success'
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: .cache/dl
-          key: ${{ steps.dl.outputs.cache-primary-key }}
-      - name: Save compiler cache even after compilation failure
-        if: always() && steps.ccache.outcome == 'success'
+          key: ${{ env.CACHE_PREFIX }}-dl-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save compiler cache, including clean builds
+        if: always() && steps.tools.outcome == 'success'
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: .cache/ccache
-          key: ${{ steps.ccache.outputs.cache-primary-key }}
+          key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Retain only caches whose replacement was successfully saved
+        if: always() && steps.needed.outputs.build == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TOOLCHAIN_KEY: ${{ steps.keys.outputs.toolchain }}
+          BUILD_KEY: ${{ steps.keys.outputs.build }}
+          NPU_KEY: ${{ steps.sources.outputs.npu-key }}
+        run: python3 scripts/prune-caches.py
       - name: Upload diagnostic logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -214,25 +231,21 @@ jobs:
           retention-days: 7
 
   publish:
-    if: github.event_name == 'workflow_dispatch' && inputs.publish && needs.build.outputs.built == 'true'
+    if: always() && !cancelled() && needs.build.outputs.built == 'true'
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: w1700k-${{ github.run_id }}-${{ github.run_attempt }}
-          path: release
-      - name: Create prerelease without deleting previous builds
+          path: release-payload
+      - name: Publish complete release and retain the latest three
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          FINGERPRINT: ${{ needs.build.outputs.fingerprint }}
-        run: |
-          tag="ubi2-oc-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          printf 'ACK72 ubi2-oc with source-built AN7581/MT7996 NPU firmware.\n\nFingerprint: %s\n\nSee build-manifest.json and feeds.lock for exact revisions. Hardware validation is required.\n' "$FINGERPRINT" > release-notes.md
-          tar --zstd -cf build-bundle.tar.zst -C release .
-          gh release create "$tag" --prerelease --title "$tag" --target "$GITHUB_SHA" \
-            --notes-file release-notes.md \
-            release/firmware/*sysupgrade.itb release/build-manifest.json build-bundle.tar.zst
+        run: python3 scripts/release.py publish release-payload release-assets

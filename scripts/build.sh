@@ -153,7 +153,28 @@ configure() {
 run_make() {
     local name=$1
     shift
-    make -C "$OPENWRT" -j"$JOBS" "$@" 2>&1 | tee "$LOGS/$name.log"
+    local start=$SECONDS status=0
+    make -C "$OPENWRT" -j"$JOBS" "$@" 2>&1 | tee "$LOGS/$name.log" || status=$?
+    printf '%s\t%s\t%s\n' "$name" "$((SECONDS-start))" "$status" >> "$LOGS/timings.tsv"
+    return "$status"
+}
+
+restore_build() {
+    local kind key
+    rm -f "$WORK/cache-restored"
+    for kind in build toolchain; do
+        key=$(sed -n "s/^${kind}=//p" "$WORK/keys.env")
+        [[ $key =~ ^[a-f0-9]{64}$ ]] || die 'Run configure before restoring build state'
+        python3 "$ROOT/scripts/build-cache.py" restore "$kind" "$OPENWRT" "$CACHE/$kind" "$key"
+        [[ ! -f $WORK/cache-restored ]] || break
+    done
+}
+
+save_build() {
+    local kind=${1:-build} key
+    key=$(sed -n "s/^${kind}=//p" "$WORK/keys.env")
+    [[ $key =~ ^[a-f0-9]{64}$ ]] || die 'Run configure before saving build state'
+    python3 "$ROOT/scripts/build-cache.py" save "$kind" "$OPENWRT" "$CACHE/$kind" "$key"
 }
 
 download() {
@@ -161,34 +182,24 @@ download() {
 }
 
 toolchain() {
-    local key archive
-    key=$(sed -n 's/^toolchain=//p' "$WORK/keys.env")
-    [[ $key =~ ^[a-f0-9]{64}$ ]] || die 'Run configure before toolchain'
-    archive="$CACHE/toolchain/$key.tar.zst"
-    mkdir -p "$CACHE/toolchain"
-    if [[ -f $archive ]]; then
-        # The exact key covers source inputs, full config, builder and host packages.
-        # Restore source mtimes with their matching stamps to prevent fake rebuilds.
-        tar --zstd -xf "$archive" -C "$OPENWRT"
+    if [[ -f $WORK/cache-restored ]]; then
+        echo "Using compatible $(cat "$WORK/cache-restored") snapshot; tools will still be dependency-checked by make."
+        return
     fi
     run_make tools tools/install
     run_make toolchain toolchain/install
-    if [[ ! -f $archive ]]; then
-        (
-            cd "$OPENWRT"
-            shopt -s nullglob
-            inputs=(tools toolchain include config target/Config.in target/Makefile
-                target/linux/Makefile target/linux/airoha target/linux/generic
-                scripts Makefile rules.mk Config.in .config)
-            products=(build_dir/host build_dir/toolchain-* staging_dir/host staging_dir/toolchain-*)
-            (( ${#products[@]} >= 4 )) || die 'Incomplete toolchain cache'
-            ZSTD_CLEVEL=3 tar --zstd -cf "$archive.tmp" "${inputs[@]}" "${products[@]}"
-        )
-        mv "$archive.tmp" "$archive"
-    fi
+    save_build toolchain
 }
 
 compile() {
+    # Cached package stamps are reusable; previously emitted images/APKs are not.
+    # This path is always the builder-owned .work checkout, never a sibling repo.
+    [[ ! -L $OPENWRT/bin ]] || die 'Unexpected output directory symlink'
+    rm -rf -- "${OPENWRT:?}/bin"
+    if [[ -f $WORK/cache-restored && $(cat "$WORK/cache-restored") == build ]]; then
+        # Regenerate release identity and the public package key for this run.
+        run_make base-files-clean package/base-files/clean
+    fi
     if ! run_make build; then
         echo 'Parallel build failed; retrying once with one job and full diagnostics.' >&2
         make -C "$OPENWRT" -j1 V=s 2>&1 | tee "$LOGS/build-retry.log"
@@ -203,6 +214,8 @@ collect() {
     shopt -s nullglob
     images=("$target"/*gemtek_w1700k-ubi*sysupgrade.itb)
     (( ${#images[@]} == 1 )) || die 'Expected exactly one W1700K sysupgrade image'
+    "$OPENWRT/staging_dir/host/bin/fwtool" -i "$WORK/image-metadata.json" "${images[0]}"
+    python3 "$ROOT/scripts/release.py" verify-image "$target" "$WORK/image-metadata.json"
     # Output is owned by this script, but preserve old runs in separate directories.
     local dest fingerprint
     fingerprint=$(sed -n 's/^fingerprint=//p' "$WORK/keys.env")
@@ -212,6 +225,8 @@ collect() {
     find "$target" -maxdepth 1 -type f -exec cp -t "$dest/firmware" {} +
     cp "$OPENWRT/.config" "$dest/openwrt.config"
     cp "$WORK/feeds.lock" "$dest/feeds.lock"
+    cp "$WORK/image-metadata.json" "$dest/image-metadata.json"
+    cp "$OPENWRT/public-key.pem" "$dest/public-key.pem"
     "$OPENWRT/scripts/diffconfig.sh" > "$dest/config.diff"
     cp "$CACHE/npu/"*.bin "$dest/npu/"
     cp "$NPU/LICENSE" "$dest/npu/LICENSE"
@@ -229,10 +244,12 @@ case ${1:-all} in
     prepare) prepare ;;
     npu) build_npu ;;
     configure) configure ;;
+    restore) restore_build ;;
+    snapshot) save_build build ;;
     download) download ;;
     toolchain) toolchain ;;
     compile) compile ;;
     collect) cd "$OPENWRT"; collect ;;
-    all) prepare; build_npu; configure; download; toolchain; compile; cd "$OPENWRT"; collect ;;
-    *) die 'Usage: bash scripts/build.sh [all|prepare|npu|configure|download|toolchain|compile|collect]' ;;
+    all) prepare; build_npu; configure; restore_build; download; toolchain; compile; cd "$OPENWRT"; collect; save_build build ;;
+    *) die 'Usage: bash scripts/build.sh [all|prepare|npu|configure|restore|download|toolchain|compile|collect|snapshot]' ;;
 esac
