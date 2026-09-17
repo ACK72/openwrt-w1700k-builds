@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -164,6 +165,8 @@ def manifest(openwrt, npu, output):
     except subprocess.CalledProcessError:
         state["builder_commit"] = "uncommitted (see builder content hash)"
     state["source_date_epoch"] = git(openwrt, "show", "-s", "--format=%ct", "HEAD")
+    state["built_at"] = datetime.now(timezone.utc).isoformat()
+    state["changelog"] = git(openwrt, "log", "-20", "--format=%h %s", "--abbrev=10", "HEAD").splitlines()
     state["npu_compiler"] = subprocess.check_output(["clang-18", "--version"], text=True).strip()
     state["npu_patches"] = {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
