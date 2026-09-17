@@ -95,9 +95,16 @@ def requested_packages(openwrt, profile):
 
 
 def feed_packages(openwrt, profile):
-    return sorted(name.removeprefix("CONFIG_PACKAGE_")
-                  for name, value in requested_packages(openwrt, profile).items()
-                  if name.startswith("CONFIG_PACKAGE_") and value in ("y", "m"))
+    requested = requested_packages(openwrt, profile)
+    packages = {name.removeprefix("CONFIG_PACKAGE_")
+                for name, value in requested.items()
+                if name.startswith("CONFIG_PACKAGE_") and value in ("y", "m")}
+    if requested.get("CONFIG_ALL_KMODS") == "y":
+        # ALL_KMODS can only select registered recipes. Include feed modules
+        # too, without importing unrelated userspace recipes with Kconfig cycles.
+        for index in (openwrt / "feeds").glob("*.index"):
+            packages.update(re.findall(r"(?m)^Package: (kmod-\S+)$", index.read_text(encoding="utf-8")))
+    return sorted(packages)
 
 
 def check_config(openwrt, profile):
@@ -113,6 +120,19 @@ def check_config(openwrt, profile):
     ]
     if mismatches:
         raise RuntimeError("Configuration lost after defconfig:\n" + "\n".join(mismatches))
+
+
+def check_installed(openwrt):
+    """Verify APK's actual rootfs inventory, including ABI-suffixed libraries."""
+    requested = set((openwrt / "tmp/apk_install_list").read_text().split())
+    manifests = list((openwrt / "bin/targets/airoha/an7581").glob("*.manifest"))
+    if not requested or len(manifests) != 1:
+        raise RuntimeError("Missing or ambiguous image package inventory")
+    installed = {line.split(" - ", 1)[0] for line in manifests[0].read_text().splitlines() if " - " in line}
+    missing = requested - installed
+    if missing:
+        raise RuntimeError("Packages missing from image rootfs: " + ", ".join(sorted(missing)))
+    print(f"Verified {len(requested)} requested packages in the image rootfs ({len(installed)} installed)")
 
 
 def install_npu(openwrt, npu, firmware):
@@ -213,18 +233,20 @@ def manifest(openwrt, npu, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("install-npu", "keys", "manifest", "check-config", "feed-packages"):
+    for command in ("install-npu", "keys", "manifest", "check-config", "feed-packages", "check-installed"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("openwrt", type=Path)
         if command in ("check-config", "feed-packages"):
             subparser.add_argument("profile", type=Path)
-        else:
+        elif command != "check-installed":
             subparser.add_argument("npu", type=Path)
             if command != "keys":
                 subparser.add_argument("output", type=Path)
     args = parser.parse_args()
     if args.command == "check-config":
         check_config(args.openwrt, args.profile)
+    elif args.command == "check-installed":
+        check_installed(args.openwrt)
     elif args.command == "feed-packages":
         print("\n".join(feed_packages(args.openwrt, args.profile)))
     elif args.command == "keys":

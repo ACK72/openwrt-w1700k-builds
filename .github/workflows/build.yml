@@ -31,8 +31,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  clean-drafts:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Remove drafts left by previous builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/release.py clean-drafts
+
   build:
     if: github.ref == 'refs/heads/main'
+    needs: clean-drafts
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 350
     permissions:
@@ -164,7 +181,7 @@ jobs:
       - name: Compile release firmware
         if: steps.needed.outputs.build == 'true'
         run: bash scripts/build.sh compile
-      - name: Validate and collect firmware, matching APKs and provenance
+      - name: Validate firmware and preserve build provenance
         if: steps.needed.outputs.build == 'true'
         id: collect
         run: |

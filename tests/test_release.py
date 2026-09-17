@@ -4,7 +4,6 @@ import importlib.util
 import json
 import subprocess
 import tempfile
-import tarfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +14,7 @@ release = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(release)
 FINGERPRINT = "a" * 64
 COMMIT = "b" * 40
+IMAGE_NAME = "openwrt-airoha-an7581-gemtek_w1700k-ubi-squashfs-sysupgrade-r36347.itb"
 
 
 def record(number, **overrides):
@@ -28,6 +28,22 @@ def record(number, **overrides):
 
 
 class Retention(unittest.TestCase):
+    def test_new_single_image_releases_and_legacy_releases_share_retention(self):
+        image = {"name": IMAGE_NAME, "size": 100, "state": "uploaded"}
+        items = [record(n) for n in range(1, 4)] + [record(4, assets=[image])]
+        self.assertTrue(release.complete(items[-1]))
+        self.assertEqual([r["id"] for r in release.prune_candidates(items)], [1])
+        for bad in ([dict(image, state="starter")], [dict(image, size=0)],
+                    [dict(image, name="other.itb")], [image, dict(image, name="notes.txt")]):
+            self.assertFalse(release.complete(record(5, assets=bad)))
+
+    def test_next_build_deletes_only_managed_drafts_without_deleting_tags(self):
+        items = [record(1, draft=True), record(2), record(3, draft=True, body="manual"),
+                 record(4, draft=True, tag_name="manual"), record(5, prerelease=True)]
+        with patch.object(release, "releases", return_value=items), patch.object(release, "gh") as gh:
+            release.clean_drafts("owner/repo")
+        gh.assert_called_once_with("api", "--method", "DELETE", "repos/owner/repo/releases/1")
+
     def test_publish_only_retry_keeps_original_build_attempt(self):
         with patch.dict(release.os.environ, {"GH_REPO": "owner/repo", "GITHUB_RUN_ID": "10",
                         "GITHUB_RUN_ATTEMPT": "2", "RELEASE_ATTEMPT": "1", "GITHUB_SHA": COMMIT}), \
@@ -85,26 +101,31 @@ class ReleaseImage(unittest.TestCase):
     def test_accepts_ubi2_metadata_and_prepares_standalone_installable_asset(self):
         output = Path(self.temp.name) / "assets"
         release.prepare(self.root, output)
-        release.verify_checksums(output)
-        self.assertEqual((output / self.image.name).read_bytes(), self.image.read_bytes())
-        self.assertEqual(len(list(output.iterdir())), 5)
-        with tarfile.open(output / "build-info.tar.gz") as archive:
-            self.assertEqual(json.load(archive.extractfile("build-manifest.json"))["builder_commit"], COMMIT)
-            self.assertIn("profiles.json", archive.getnames())
+        self.assertEqual([p.name for p in output.iterdir()], [IMAGE_NAME])
+        self.assertEqual((output / IMAGE_NAME).read_bytes(), self.image.read_bytes())
 
-    def test_build_info_archive_has_repeatable_checksums(self):
+    def test_publication_retries_preserve_image_digest(self):
         first, second = (Path(self.temp.name) / name for name in ("first", "second"))
         release.prepare(self.root, first)
         (self.root / "build-manifest.json").touch()
         release.prepare(self.root, second)
-        self.assertEqual((first / "SHA256SUMS").read_bytes(), (second / "SHA256SUMS").read_bytes())
+        self.assertEqual(release.sha256(first / IMAGE_NAME), release.sha256(second / IMAGE_NAME))
+
+    def test_invalid_or_dirty_revision_is_never_published(self):
+        for revision in ("SNAPSHOT", "r1-abc-dirty", "../../escape", "r1"):
+            self.profile["version_code"] = revision
+            self.write_metadata()
+            self.checksums()
+            with self.assertRaisesRegex(ValueError, "Invalid firmware revision"):
+                release.prepare(self.root, Path(self.temp.name) / "invalid")
 
     def test_notes_show_firmware_revision_build_date_and_source_changes(self):
         manifest = json.loads((self.root / "build-manifest.json").read_text())
         title, notes = release.release_notes(self.root, manifest, "owner/repo", "10")
         self.assertEqual(title, "ubi2-oc_2026.09.18_r36347-e304e64c26")
         self.assertIn("    e304e64c26 Firmware update", notes)
-        self.assertIn(f"/tree/{COMMIT}", notes)
+        for removed in ("설치", "Assets", "SHA256SUMS", "추가 패키지", "<details>"):
+            self.assertNotIn(removed, notes)
         self.assertIn("<!-- fingerprint:", notes)
 
     def test_wrong_device_wrong_target_and_missing_image_are_rejected(self):
@@ -185,7 +206,7 @@ class ReleaseImage(unittest.TestCase):
         deletion = next(i for i, c in enumerate(self.calls) if c[:2] == ("release", "delete"))
         self.assertLess(edit, deletion)
         self.assertEqual(self.calls[deletion][2], f"{release.PREFIX}1-1")
-        self.assertEqual(len(self.draft["assets"]), 5)
+        self.assertEqual(len(self.draft["assets"]), 1)
 
     def test_digest_mismatch_keeps_draft_and_previous_releases(self):
         with patch.object(release, "releases", return_value=[]), \
@@ -196,7 +217,7 @@ class ReleaseImage(unittest.TestCase):
 
     def test_resume_replaces_only_incomplete_assets_in_existing_draft(self):
         fake_gh = self.publication_api()
-        self.draft["assets"] = [{"id": 42, "name": "packages.tar.zst", "state": "uploaded", "size": 1}]
+        self.draft["assets"] = [{"id": 42, "name": IMAGE_NAME, "state": "uploaded", "size": 1}]
         with patch.object(release, "releases", return_value=[self.draft]), patch.object(release, "gh", side_effect=fake_gh):
             release.publish(self.root, Path(self.temp.name) / "assets", "owner/repo", "10", "1", COMMIT)
         self.assertFalse(any("draft=true" in c for c in self.calls))
@@ -208,10 +229,10 @@ class ReleaseImage(unittest.TestCase):
         failed = False
         def flaky(*args):
             nonlocal failed
-            if args[:3] == ("api", "--method", "POST") and self.image.name in args[3] and not failed:
+            if args[:3] == ("api", "--method", "POST") and IMAGE_NAME in args[3] and not failed:
                 failed = True
                 self.calls.append(args)
-                self.draft["assets"].append({"id": 42, "name": self.image.name, "state": "starter", "size": 0})
+                self.draft["assets"].append({"id": 42, "name": IMAGE_NAME, "state": "starter", "size": 0})
                 raise subprocess.CalledProcessError(1, args, stderr="gh: Error saving asset (HTTP 500)")
             return api(*args)
         with patch.object(release, "releases", return_value=[]), patch.object(release, "gh", side_effect=flaky), \
@@ -220,8 +241,8 @@ class ReleaseImage(unittest.TestCase):
         sleep.assert_called_once_with(5)
         self.assertIn(("api", "--method", "DELETE", "repos/owner/repo/releases/assets/42"), self.calls)
         uploads = [c for c in self.calls if c[:3] == ("api", "--method", "POST") and "--input" in c]
-        self.assertEqual(len(uploads), 6)
-        self.assertEqual(len(self.draft["assets"]), 5)
+        self.assertEqual(len(uploads), 2)
+        self.assertEqual(len(self.draft["assets"]), 1)
         self.assertTrue(release.complete(self.draft))
 
     def test_lost_upload_response_reuses_asset_after_verifying_digest(self):
@@ -232,7 +253,7 @@ class ReleaseImage(unittest.TestCase):
                 def flaky(*args):
                     nonlocal failed
                     result = api(*args)
-                    if args[:3] == ("api", "--method", "POST") and self.image.name in args[3] and not failed:
+                    if args[:3] == ("api", "--method", "POST") and IMAGE_NAME in args[3] and not failed:
                         failed = True
                         if fault == "timeout":
                             raise subprocess.TimeoutExpired(args, 180)
@@ -242,7 +263,7 @@ class ReleaseImage(unittest.TestCase):
                      patch.object(release.time, "sleep"):
                     release.publish(self.root, Path(self.temp.name) / fault, "owner/repo", "10", "1", COMMIT)
                 uploads = [c for c in self.calls if c[:3] == ("api", "--method", "POST") and "--input" in c]
-                self.assertEqual(len(uploads), 5)
+                self.assertEqual(len(uploads), 1)
                 self.assertFalse(any(c[:3] == ("api", "--method", "DELETE") for c in self.calls))
                 self.assertTrue(release.complete(self.draft))
 
@@ -251,7 +272,7 @@ class ReleaseImage(unittest.TestCase):
             with self.subTest(status=status):
                 api = self.publication_api()
                 def failing(*args):
-                    if args[:3] == ("api", "--method", "POST") and self.image.name in args[3]:
+                    if args[:3] == ("api", "--method", "POST") and IMAGE_NAME in args[3]:
                         self.calls.append(args)
                         raise subprocess.CalledProcessError(1, args, stderr=f"HTTP {status}")
                     return api(*args)
@@ -259,7 +280,7 @@ class ReleaseImage(unittest.TestCase):
                      patch.object(release.time, "sleep") as sleep:
                     with self.assertRaises(subprocess.CalledProcessError):
                         release.publish(self.root, Path(self.temp.name) / str(status), "owner/repo", "10", "1", COMMIT)
-                uploads = [c for c in self.calls if c[:3] == ("api", "--method", "POST") and self.image.name in c[3]]
+                uploads = [c for c in self.calls if c[:3] == ("api", "--method", "POST") and IMAGE_NAME in c[3]]
                 self.assertEqual(len(uploads), attempts)
                 self.assertEqual(sleep.call_count, attempts - 1)
                 self.assert_not_published_or_pruned()

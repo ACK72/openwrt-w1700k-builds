@@ -158,6 +158,32 @@ class Configuration(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "metadata is missing"):
             meta.feed_packages(self.root, self.profile)
 
+    def test_all_kmods_registers_feed_modules_without_unrelated_userspace(self):
+        feeds = self.root / "feeds"
+        feeds.mkdir()
+        (feeds / "packages.index").write_text(
+            "Package: kmod-feed-driver\nVersion: 1\n\nPackage: unrelated-app\n")
+        self.assertNotIn("kmod-feed-driver", meta.feed_packages(self.root, self.profile))
+        self.profile.write_text(self.profile.read_text() + "CONFIG_ALL_KMODS=y\n")
+        self.assertIn("kmod-feed-driver", meta.feed_packages(self.root, self.profile))
+        self.assertNotIn("unrelated-app", meta.feed_packages(self.root, self.profile))
+
+
+class InstalledPackages(unittest.TestCase):
+    def test_rootfs_must_contain_the_requested_packages_with_actual_abi_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "tmp").mkdir()
+            (root / "tmp/apk_install_list").write_text("luci-app-ttyd libatomic1\n")
+            target = root / "bin/targets/airoha/an7581"
+            target.mkdir(parents=True)
+            inventory = target / "openwrt.manifest"
+            inventory.write_text("luci-app-ttyd - 1.0\nlibatomic1 - 14.3\nlibc - 1.2\n")
+            meta.check_installed(root)
+            inventory.write_text("libatomic1 - 14.3\nlibc - 1.2\n")
+            with self.assertRaisesRegex(RuntimeError, "missing from image rootfs: luci-app-ttyd"):
+                meta.check_installed(root)
+
 
 class CacheDigest(unittest.TestCase):
     def test_content_and_path_changes_invalidate_but_mtime_does_not(self):

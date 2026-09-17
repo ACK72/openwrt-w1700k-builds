@@ -1,6 +1,6 @@
 # W1700K OpenWrt
 
-Gemtek W1700K용 `ubi2-oc` 커스텀 펌웨어입니다. OpenWrt와 Airoha NPU 펌웨어를 함께 제공합니다.
+Gemtek W1700K용 `ubi2-oc` 커스텀 펌웨어입니다. OpenWrt, Airoha NPU 펌웨어와 기본 패키지가 하나의 ITB 이미지에 포함됩니다.
 
 **[최신 펌웨어 다운로드](https://github.com/ACK72/openwrt-w1700k-builds/releases/latest)** · [이전 릴리즈](https://github.com/ACK72/openwrt-w1700k-builds/releases)
 
@@ -13,8 +13,8 @@ Gemtek W1700K용 `ubi2-oc` 커스텀 펌웨어입니다. OpenWrt와 Airoha NPU �
 ## 업데이트
 
 1. LuCI의 **시스템 → 백업 / 펌웨어 업데이트**에서 현재 설정을 백업합니다.
-2. 릴리즈의 **Assets**에서 `*-sysupgrade.itb`와 `SHA256SUMS`를 다운로드합니다. GitHub의 `Source code` 압축 파일은 설치 이미지가 아닙니다.
-3. 다운로드한 이미지의 SHA-256을 `SHA256SUMS`에 적힌 값과 비교합니다.
+2. 릴리즈의 **Assets**에서 `openwrt-airoha-an7581-gemtek_w1700k-ubi-squashfs-sysupgrade-r숫자.itb`를 다운로드합니다. GitHub의 `Source code` 압축 파일은 설치 이미지가 아닙니다.
+3. 다운로드한 이미지의 SHA-256을 GitHub Assets에 표시되는 `sha256` 값과 비교합니다.
    - Linux: `sha256sum <다운로드한 이미지.itb>`
    - Windows PowerShell: `Get-FileHash <다운로드한 이미지.itb> -Algorithm SHA256`
 4. LuCI에서 이미지를 업로드하고 호환성 검사를 통과한 뒤 업데이트합니다. 호환성 오류가 나오면 강제 설치하지 마세요.
@@ -22,15 +22,11 @@ Gemtek W1700K용 `ubi2-oc` 커스텀 펌웨어입니다. OpenWrt와 Airoha NPU �
 
 최근 **3개 릴리즈**를 보관합니다. 복구에 사용할 이전 이미지와 설정 백업은 PC에도 저장해 두세요.
 
-## 추가 파일
+## 포함 기능
 
-| 파일 | 용도 |
-| --- | --- |
-| `packages.tar.zst` | 해당 펌웨어와 함께 빌드한 추가 APK 패키지 |
-| `public-key.pem` | APK 패키지 서명 검증용 공개키 |
-| `build-info.tar.gz` | 문제 신고·빌드 확인에 사용하는 소스 커밋, 설정, 이미지 정보 |
+`w1700k/builds`의 `ubi2-oc` 패키지 구성을 사용합니다. LuCI, NPU·Wi-Fi 7·MLO·팬 제어, 파일 관리자, 웹 터미널, 속도 측정, 패키지 관리와 업그레이드 도구가 이미지에 포함됩니다. 별도 패키지 파일을 합치거나 설치할 필요가 없습니다.
 
-추가 패키지는 **같은 릴리즈의 이미지**와 함께 사용하세요. 다른 릴리즈나 공개 snapshot 저장소의 커널 모듈(`kmod`)은 호환되지 않을 수 있습니다. 일반적인 펌웨어 업데이트에는 이 추가 파일들이 필요하지 않습니다.
+펌웨어 업데이트에는 이 저장소의 ITB를 사용하세요. 공개 snapshot 저장소의 커널 모듈(`kmod`)과 외부 Attended Sysupgrade 서버가 만드는 이미지는 이 커스텀 펌웨어와 호환되지 않을 수 있습니다.
 
 문제가 생기면 [Issues](https://github.com/ACK72/openwrt-w1700k-builds/issues)에 릴리즈 이름, 기기 버전, 증상과 재현 방법을 남겨 주세요. 로그의 비밀번호·개인정보는 제거해 주세요.
 

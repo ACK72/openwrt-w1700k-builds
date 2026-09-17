@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """Validate W1700K images, publish complete releases, then retain the newest three."""
 import argparse
-import gzip
 import hashlib
-import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
-import tarfile
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,8 +19,16 @@ DEVICE = "gemtek_w1700k-ubi"
 SUPPORTED_DEVICE = "gemtek,w1700k-ubi"
 TARGET = "airoha/an7581"
 MARKER = "<!-- w1700k-release:v1 -->"
-BUILD_INFO = ("build-manifest.json", "openwrt.config", "config.diff", "feeds.lock",
-              "image-metadata.json", "firmware/profiles.json")
+IMAGE_PREFIX = "openwrt-airoha-an7581-gemtek_w1700k-ubi-squashfs-sysupgrade-"
+RELEASE_IMAGE = re.compile(re.escape(IMAGE_PREFIX) + r"r[0-9]+\.itb\Z")
+
+
+def firmware_revision(root):
+    profiles = json.loads((root / "firmware/profiles.json").read_text(encoding="utf-8"))
+    revision = profiles["version_code"]
+    if not re.fullmatch(r"r[0-9]+-[a-f0-9]+", revision):
+        raise ValueError("Invalid firmware revision")
+    return revision
 
 
 def sha256(path):
@@ -90,22 +95,10 @@ def prepare(root, output):
     output.mkdir(parents=True, exist_ok=True)
     if any(output.iterdir()):
         raise ValueError("Release staging directory must be empty")
-    for path in (image, root / "packages.tar.zst", root / "public-key.pem", *[root / name for name in BUILD_INFO]):
-        if path.is_symlink() or not path.is_file() or not path.stat().st_size:
-            raise ValueError(f"Missing/invalid release asset: {path.name}")
-    for path in (image, root / "packages.tar.zst", root / "public-key.pem"):
-        shutil.copy2(path, output / path.name)
-    # Fixed archive metadata keeps checksums identical on publication retries.
-    with (output / "build-info.tar.gz").open("wb") as raw:
-        with gzip.GzipFile(filename="", fileobj=raw, mode="wb", mtime=0) as zipped:
-            with tarfile.open(fileobj=zipped, mode="w") as archive:
-                for name in BUILD_INFO:
-                    data = (root / name).read_bytes()
-                    member = tarfile.TarInfo(Path(name).name)
-                    member.size, member.mode = len(data), 0o644
-                    archive.addfile(member, io.BytesIO(data))
-    (output / "SHA256SUMS").write_text("".join(
-        f"{sha256(p)}  {p.name}\n" for p in sorted(output.iterdir())), encoding="utf-8")
+    # OpenWrt has already installed the selected packages in the FIT rootfs.
+    # Renaming must preserve the validated image bytes, including fwtool metadata.
+    revision = firmware_revision(root).split("-", 1)[0]
+    shutil.copy2(image, output / f"{IMAGE_PREFIX}{revision}.itb")
     return manifest
 
 
@@ -161,10 +154,24 @@ def managed(release):
 
 def complete(release):
     assets = {a["name"]: a for a in release.get("assets", []) if a.get("state") == "uploaded" and a.get("size", 0) > 0}
+    single_image = (len(release.get("assets", [])) == 1 and len(assets) == 1
+                    and bool(RELEASE_IMAGE.fullmatch(next(iter(assets)))))
+    # Count the previous multi-asset releases during migration so retention
+    # still keeps three working versions, rather than accumulating old ones.
+    legacy = (all(name in assets for name in ("SHA256SUMS", "packages.tar.zst", "public-key.pem"))
+              and ("build-info.tar.gz" in assets or "build-manifest.json" in assets)
+              and len([name for name in assets if name.endswith("-sysupgrade.itb")]) == 1)
     return (managed(release) and not release.get("draft") and not release.get("prerelease")
-            and all(name in assets for name in ("SHA256SUMS", "packages.tar.zst", "public-key.pem"))
-            and ("build-info.tar.gz" in assets or "build-manifest.json" in assets)
-            and len([name for name in assets if name.endswith("-sysupgrade.itb")]) == 1)
+            and (single_image or legacy))
+
+
+def clean_drafts(repo):
+    # Run before the next serialized build, never during publication retries.
+    # Preserve manually created drafts and all published releases/tags.
+    for item in releases(repo):
+        if item.get("draft") and managed(item):
+            gh("api", "--method", "DELETE", f"repos/{repo}/releases/{item['id']}")
+            print(f"Deleted previous build draft: {item['tag_name']}")
 
 
 def already_published(items, fingerprint):
@@ -181,10 +188,7 @@ def prune_candidates(items, keep=3):
 
 
 def release_notes(root, manifest, repo, run_id):
-    profiles = json.loads((root / "firmware/profiles.json").read_text(encoding="utf-8"))
-    revision = profiles["version_code"]
-    if not re.fullmatch(r"r[0-9]+-[a-f0-9]+(?:-dirty)?", revision):
-        raise ValueError("Invalid firmware revision")
+    revision = firmware_revision(root)
     built_at = datetime.fromisoformat(manifest["built_at"])
     if built_at.tzinfo is None:
         raise ValueError("Build timestamp must include a timezone")
@@ -193,18 +197,6 @@ def release_notes(root, manifest, repo, run_id):
     changes = "\n".join("    " + line for line in manifest["changelog"])
     notes = (
         f"## {title}\n\n{changes}\n\n"
-        "### 설치\n\n"
-        "Assets의 `*-sysupgrade.itb`를 받으세요. **UBI2 파티션과 호환 chainloader를 이미 사용하는 W1700K**의 업그레이드용입니다.\n\n"
-        f"설정 백업·업데이트 방법은 [설치 안내](https://github.com/{repo}#업데이트)를 확인하세요. "
-        "체크섬은 `SHA256SUMS`에 있습니다.\n\n"
-        "<details>\n<summary>추가 패키지와 빌드 정보</summary>\n\n"
-        "- `packages.tar.zst`: 이 이미지와 함께 빌드한 APK 패키지\n"
-        "- `public-key.pem`: 패키지 서명 검증용 공개키\n"
-        "- `build-info.tar.gz`: 빌드 설정, 소스 커밋, 이미지 메타데이터\n\n"
-        "패키지는 같은 릴리즈의 이미지와 함께 사용하세요.\n\n"
-        f"[빌드 기록](https://github.com/{repo}/actions/runs/{run_id}) · "
-        f"[빌드에 사용한 코드](https://github.com/{repo}/tree/{manifest['builder_commit']})\n\n"
-        "</details>\n\n"
         f"{MARKER}\n<!-- fingerprint:{manifest['fingerprint']} -->\n"
     )
     return title, notes
@@ -237,6 +229,9 @@ def publish(root, output, repo, run_id, attempt, commit):
     # Drafts have an ID before their Git tag exists. Use that ID for all writes.
     endpoint = f"repos/{repo}/releases/{existing['id']}"
     actual = {a["name"]: a for a in existing.get("assets", [])}
+    expected_names = {path.name for path in output.iterdir()}
+    if any(name not in expected_names for name in actual):
+        raise ValueError("Release contains unexpected assets; refusing to publish")
     for path in sorted(output.iterdir()):
         asset = actual.get(path.name, {})
         digest = f"sha256:{sha256(path)}"
@@ -267,12 +262,15 @@ def main():
     verify.add_argument("metadata", type=Path)
     check = sub.add_parser("check")
     check.add_argument("fingerprint")
+    sub.add_parser("clean-drafts")
     upload = sub.add_parser("publish")
     upload.add_argument("artifact", type=Path)
     upload.add_argument("output", type=Path)
     args = parser.parse_args()
     if args.command == "verify-image":
         print(verify_image(args.target, args.metadata))
+    elif args.command == "clean-drafts":
+        clean_drafts(os.environ["GH_REPO"])
     elif args.command == "check":
         if not re.fullmatch(r"[a-f0-9]{64}", args.fingerprint):
             raise ValueError("Invalid fingerprint")

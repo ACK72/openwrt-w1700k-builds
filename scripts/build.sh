@@ -228,6 +228,7 @@ collect() {
     shopt -s nullglob
     images=("$target"/*gemtek_w1700k-ubi*sysupgrade.itb)
     (( ${#images[@]} == 1 )) || die 'Expected exactly one W1700K sysupgrade image'
+    python3 "$ROOT/scripts/build-meta.py" check-installed "$OPENWRT"
     "$OPENWRT/staging_dir/host/bin/fwtool" -i "$WORK/image-metadata.json" "${images[0]}"
     python3 "$ROOT/scripts/release.py" verify-image "$target" "$WORK/image-metadata.json"
     # Output is owned by this script, but preserve old runs in separate directories.
@@ -246,8 +247,8 @@ collect() {
     cp "$NPU/LICENSE" "$dest/npu/LICENSE"
     cp -r "$CACHE/npu/debug" "$dest/npu/"
     python3 "$ROOT/scripts/build-meta.py" manifest "$OPENWRT" "$NPU" "$dest"
-    # Include the locally compiled APKs with the image's real kernel ABI.
-    tar --zstd -cf "$dest/packages.tar.zst" -C "$OPENWRT/bin" packages targets/airoha/an7581/packages
+    # Packages selected with =y are already installed in the image rootfs.
+    # Keep diagnostics in the Actions artifact; releases publish only the ITB.
     # SHA256SUMS itself is explicitly excluded from the input file list.
     # shellcheck disable=SC2094
     (cd "$dest" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
