@@ -195,7 +195,7 @@ def main():
         print("build=false" if already_published(releases(os.environ["GH_REPO"]), args.fingerprint) else "build=true")
     else:
         publish(args.artifact, args.output, os.environ["GH_REPO"], os.environ["GITHUB_RUN_ID"],
-                os.environ["GITHUB_RUN_ATTEMPT"], os.environ["GITHUB_SHA"])
+                os.environ.get("RELEASE_ATTEMPT", os.environ["GITHUB_RUN_ATTEMPT"]), os.environ["GITHUB_SHA"])
 
 
 if __name__ == "__main__":

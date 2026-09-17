@@ -21,6 +21,7 @@ esac
 SH
 cat > "$test_root/.work/openwrt/staging_dir/host/bin/ccache" <<'SH'
 #!/usr/bin/env bash
+[[ ${1:-} != -z ]] || exit 0
 echo stats >> "$TEST_STATS"
 exit "${TEST_STATS_EXIT:-0}"
 SH

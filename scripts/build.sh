@@ -196,6 +196,11 @@ compile() {
     # This path is always the builder-owned .work checkout, never a sibling repo.
     [[ ! -L $OPENWRT/bin ]] || die 'Unexpected output directory symlink'
     rm -rf -- "${OPENWRT:?}/bin"
+    # Cached statistics otherwise include previous runs. Report this firmware
+    # compilation separately from the initial tools/toolchain build.
+    if [[ -x $OPENWRT/staging_dir/host/bin/ccache ]]; then
+        "$OPENWRT/staging_dir/host/bin/ccache" -z > "$LOGS/ccache-reset.log" 2>&1 || true
+    fi
     if [[ -f $WORK/cache-restored && $(cat "$WORK/cache-restored") == build ]]; then
         # Regenerate release identity and the public package key for this run.
         run_make base-files-clean package/base-files/clean

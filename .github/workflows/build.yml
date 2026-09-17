@@ -44,6 +44,8 @@ jobs:
       CCACHE_MAXSIZE: 3G
     outputs:
       built: ${{ steps.firmware.outcome == 'success' }}
+      artifact-name: ${{ steps.collect.outputs.artifact-name }}
+      build-attempt: ${{ steps.collect.outputs.build-attempt }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -167,7 +169,11 @@ jobs:
         id: collect
         run: |
           bash scripts/build.sh collect
-          echo "artifact-path=$(cat .work/artifact-path)" >> "$GITHUB_OUTPUT"
+          {
+            echo "artifact-path=$(cat .work/artifact-path)"
+            echo "artifact-name=w1700k-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            echo "build-attempt=$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_OUTPUT"
           cat .work/build-state.json >> "$GITHUB_STEP_SUMMARY"
           cat logs/timings.tsv >> "$GITHUB_STEP_SUMMARY"
       - name: Upload validated release payload
@@ -175,7 +181,7 @@ jobs:
         id: firmware
         uses: actions/upload-artifact@v4
         with:
-          name: w1700k-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ steps.collect.outputs.artifact-name }}
           path: ${{ steps.collect.outputs.artifact-path }}
           compression-level: 0
           if-no-files-found: error
@@ -246,10 +252,11 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: w1700k-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ needs.build.outputs.artifact-name }}
           path: release-payload
       - name: Publish complete release and retain the latest three
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          RELEASE_ATTEMPT: ${{ needs.build.outputs.build-attempt }}
         run: python3 scripts/release.py publish release-payload release-assets

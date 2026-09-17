@@ -27,6 +27,14 @@ def record(number, **overrides):
 
 
 class Retention(unittest.TestCase):
+    def test_publish_only_retry_keeps_original_build_attempt(self):
+        with patch.dict(release.os.environ, {"GH_REPO": "owner/repo", "GITHUB_RUN_ID": "10",
+                        "GITHUB_RUN_ATTEMPT": "2", "RELEASE_ATTEMPT": "1", "GITHUB_SHA": COMMIT}), \
+             patch("sys.argv", ["release.py", "publish", "payload", "output"]), \
+             patch.object(release, "publish") as publish:
+            release.main()
+        self.assertEqual(publish.call_args.args[-2], "1")
+
     def test_keep_newest_three_and_preserve_unrelated_drafts_and_prereleases(self):
         items = [record(n) for n in range(1, 6)]
         items += [record(6, draft=True), record(7, prerelease=True), record(8, tag_name="unrelated")]
