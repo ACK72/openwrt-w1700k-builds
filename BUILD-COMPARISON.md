@@ -8,6 +8,8 @@
 
 이전 이미지에서 빠졌던 파일 관리자(`luci-app-filemanager`), 웹 터미널(`luci-app-ttyd`, `ttyd`), 속도 측정(`luci-app-netspeedtest`, `librespeed-go`), 시스템 정보(`fastfetch`), 업그레이드 도구(`luci-app-attendedsysupgrade`, `owut`), 릴레이(`relayd`, `luci-proto-relay`), Footstrap 테마와 필요한 라이브러리를 포함합니다. APK 관리자는 기준과 같은 `apk-openssl`을 사용합니다.
 
+이전 구성에만 있던 `luci-ssl-openssl`과 `openssl-util` 선택은 제거했습니다. 스트림 TLS 라이브러리도 기준에 맞춰 `libustream-openssl`에서 `libustream-mbedtls`로 바뀝니다. `wpad-openssl`은 유지합니다.
+
 `=y` 패키지는 OpenWrt가 루트 파일시스템에 설치하고 커널과 함께 FIT/ITB에 넣습니다. APK 압축 파일을 ITB 뒤에 이어 붙이지 않습니다. 빌드 후 실제 루트 파일시스템의 패키지 목록을 검사합니다.
 
 기준과 같은 `CONFIG_ALL_KMODS=y`도 적용합니다. 이는 사용 가능한 커널 모듈을 별도 패키지로 빌드하는 옵션이며, 모든 모듈을 이미지에 설치한다는 뜻은 아닙니다. 기준의 `airoha-en7581-npu-firmware=m` 역시 별도 빌드 대상이며, W1700K 이미지에는 MT7996용 펌웨어를 넣습니다. 별도 APK는 릴리즈에 올리지 않습니다. 전체 커널 모듈 빌드는 필요한 모듈만 빌드하던 이전 구성보다 첫 빌드의 시간과 저장 공간을 더 사용합니다.

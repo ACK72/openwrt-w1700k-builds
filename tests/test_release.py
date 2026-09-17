@@ -215,6 +215,14 @@ class ReleaseImage(unittest.TestCase):
                 release.publish(self.root, Path(self.temp.name) / "assets", "owner/repo", "10", "1", COMMIT)
         self.assert_not_published_or_pruned()
 
+    def test_unexpected_asset_prevents_publication_of_a_resumed_draft(self):
+        fake_gh = self.publication_api()
+        self.draft["assets"] = [{"id": 42, "name": "packages.tar.zst", "state": "uploaded", "size": 1}]
+        with patch.object(release, "releases", return_value=[self.draft]), patch.object(release, "gh", side_effect=fake_gh):
+            with self.assertRaisesRegex(ValueError, "unexpected assets"):
+                release.publish(self.root, Path(self.temp.name) / "assets", "owner/repo", "10", "1", COMMIT)
+        self.assert_not_published_or_pruned()
+
     def test_resume_replaces_only_incomplete_assets_in_existing_draft(self):
         fake_gh = self.publication_api()
         self.draft["assets"] = [{"id": 42, "name": IMAGE_NAME, "state": "uploaded", "size": 1}]
