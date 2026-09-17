@@ -145,12 +145,13 @@ class Configuration(unittest.TestCase):
         self.assertEqual(meta.feed_packages(self.root, self.profile),
                          ["base-files", "iperf3", "kmod-mt7996e", "luci"])
 
-    def test_missing_default_package_is_rejected(self):
+    def test_virtual_defaults_are_registered_without_forcing_a_provider(self):
         metadata = self.root / "tmp/.targetinfo"
         metadata.write_text(metadata.read_text().replace("Default-Packages: luci",
-                                                       "Default-Packages: luci base-files"))
-        with self.assertRaisesRegex(RuntimeError, "CONFIG_PACKAGE_base-files"):
-            meta.check_config(self.root, self.profile)
+                                                       "Default-Packages: luci nftables"))
+        self.config.write_text(self.valid + "CONFIG_PACKAGE_nftables-json=y\n")
+        self.assertIn("nftables", meta.feed_packages(self.root, self.profile))
+        meta.check_config(self.root, self.profile)
 
     def test_missing_device_metadata_is_rejected(self):
         (self.root / "tmp/.targetinfo").write_text("Target: airoha/an7581\n")

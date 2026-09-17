@@ -102,7 +102,9 @@ def feed_packages(openwrt, profile):
 
 def check_config(openwrt, profile):
     actual = read_config(openwrt / ".config")
-    expected = requested_packages(openwrt, profile)
+    # Defaults are feed installation roots, not exact Kconfig requirements:
+    # virtual packages and TLS alternatives may resolve to another provider.
+    expected = read_config(profile)
     expected.update(dict.fromkeys(REQUIRED_CONFIG, "y"))
     mismatches = [
         f"{name}: requested {value}, got {actual.get(name, 'n')}"
