@@ -9,7 +9,9 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
@@ -108,7 +110,44 @@ def prepare(root, output):
 
 
 def gh(*args):
-    return subprocess.check_output(["gh", *args], text=True)
+    try:
+        return subprocess.check_output(["gh", *args], text=True, stderr=subprocess.PIPE, timeout=180)
+    except subprocess.CalledProcessError as error:
+        if error.stderr:
+            print(error.stderr, file=sys.stderr, end="")
+        raise
+
+
+def matching_asset(asset, path, digest):
+    return (asset.get("state") == "uploaded" and asset.get("size") == path.stat().st_size
+            and asset.get("digest") == digest)
+
+
+def upload_asset(repo, endpoint, path, asset, digest):
+    """Retry transient uploads without duplicating or trusting partial assets."""
+    for attempt in range(3):
+        if attempt:
+            # A failed response can leave either a complete asset or a starter.
+            # Reconcile by release ID before retrying the non-idempotent POST.
+            items = json.loads(gh("api", f"{endpoint}/assets?per_page=100"))
+            asset = next((item for item in items if item["name"] == path.name), {})
+        if matching_asset(asset, path, digest):
+            return asset
+        if asset:
+            gh("api", "--method", "DELETE", f"repos/{repo}/releases/assets/{asset['id']}")
+        try:
+            return json.loads(gh("api", "--method", "POST",
+                                 f"https://uploads.github.com/{endpoint}/assets?name={quote(path.name)}",
+                                 "-H", "Content-Type: application/octet-stream", "--input", str(path)))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            retryable = isinstance(error, subprocess.TimeoutExpired) or re.search(
+                r"HTTP 5[0-9]{2}\b", error.stderr or "")
+            if not retryable or attempt == 2:
+                raise
+            delay = 5 * 2 ** attempt
+            print(f"Transient upload failure for {path.name}; retry {attempt + 2}/3 in {delay}s",
+                  file=sys.stderr, flush=True)
+            time.sleep(delay)
 
 
 def releases(repo):
@@ -201,13 +240,8 @@ def publish(root, output, repo, run_id, attempt, commit):
     for path in sorted(output.iterdir()):
         asset = actual.get(path.name, {})
         digest = f"sha256:{sha256(path)}"
-        if existing["draft"] and (asset.get("state") != "uploaded" or asset.get("size") != path.stat().st_size
-                                  or asset.get("digest") != digest):
-            if asset:
-                gh("api", "--method", "DELETE", f"repos/{repo}/releases/assets/{asset['id']}")
-            asset = json.loads(gh("api", "--method", "POST",
-                                  f"https://uploads.github.com/{endpoint}/assets?name={quote(path.name)}",
-                                  "-H", "Content-Type: application/octet-stream", "--input", str(path)))
+        if existing["draft"]:
+            asset = upload_asset(repo, endpoint, path, asset, digest)
         if asset.get("state") != "uploaded" or asset.get("size") != path.stat().st_size:
             raise RuntimeError(f"Release asset upload incomplete: {path.name}")
         if asset.get("digest") != digest:

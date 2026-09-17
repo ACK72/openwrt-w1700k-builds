@@ -131,6 +131,8 @@ class ReleaseImage(unittest.TestCase):
         self.draft = record(10, draft=True, assets=[])
         def fake_gh(*args):
             self.calls.append(args)
+            if args == ("api", "repos/owner/repo/releases/10/assets?per_page=100"):
+                return json.dumps(self.draft["assets"])
             if args[:3] == ("api", "--method", "POST"):
                 if args[3] == "repos/owner/repo/releases":
                     return json.dumps(self.draft)
@@ -200,6 +202,67 @@ class ReleaseImage(unittest.TestCase):
         self.assertFalse(any("draft=true" in c for c in self.calls))
         self.assertIn(("api", "--method", "DELETE", "repos/owner/repo/releases/assets/42"), self.calls)
         self.assertTrue(release.complete(self.draft))
+
+    def test_server_failure_removes_starter_and_preserves_verified_uploads(self):
+        api = self.publication_api()
+        failed = False
+        def flaky(*args):
+            nonlocal failed
+            if args[:3] == ("api", "--method", "POST") and self.image.name in args[3] and not failed:
+                failed = True
+                self.calls.append(args)
+                self.draft["assets"].append({"id": 42, "name": self.image.name, "state": "starter", "size": 0})
+                raise subprocess.CalledProcessError(1, args, stderr="gh: Error saving asset (HTTP 500)")
+            return api(*args)
+        with patch.object(release, "releases", return_value=[]), patch.object(release, "gh", side_effect=flaky), \
+             patch.object(release.time, "sleep") as sleep:
+            release.publish(self.root, Path(self.temp.name) / "assets", "owner/repo", "10", "1", COMMIT)
+        sleep.assert_called_once_with(5)
+        self.assertIn(("api", "--method", "DELETE", "repos/owner/repo/releases/assets/42"), self.calls)
+        uploads = [c for c in self.calls if c[:3] == ("api", "--method", "POST") and "--input" in c]
+        self.assertEqual(len(uploads), 6)
+        self.assertEqual(len(self.draft["assets"]), 5)
+        self.assertTrue(release.complete(self.draft))
+
+    def test_lost_upload_response_reuses_asset_after_verifying_digest(self):
+        for fault in ("server", "timeout"):
+            with self.subTest(fault=fault):
+                api = self.publication_api()
+                failed = False
+                def flaky(*args):
+                    nonlocal failed
+                    result = api(*args)
+                    if args[:3] == ("api", "--method", "POST") and self.image.name in args[3] and not failed:
+                        failed = True
+                        if fault == "timeout":
+                            raise subprocess.TimeoutExpired(args, 180)
+                        raise subprocess.CalledProcessError(1, args, stderr="HTTP 502")
+                    return result
+                with patch.object(release, "releases", return_value=[]), patch.object(release, "gh", side_effect=flaky), \
+                     patch.object(release.time, "sleep"):
+                    release.publish(self.root, Path(self.temp.name) / fault, "owner/repo", "10", "1", COMMIT)
+                uploads = [c for c in self.calls if c[:3] == ("api", "--method", "POST") and "--input" in c]
+                self.assertEqual(len(uploads), 5)
+                self.assertFalse(any(c[:3] == ("api", "--method", "DELETE") for c in self.calls))
+                self.assertTrue(release.complete(self.draft))
+
+    def test_persistent_server_errors_and_permission_errors_leave_draft_unpublished(self):
+        for status, attempts in ((500, 3), (403, 1)):
+            with self.subTest(status=status):
+                api = self.publication_api()
+                def failing(*args):
+                    if args[:3] == ("api", "--method", "POST") and self.image.name in args[3]:
+                        self.calls.append(args)
+                        raise subprocess.CalledProcessError(1, args, stderr=f"HTTP {status}")
+                    return api(*args)
+                with patch.object(release, "releases", return_value=[]), patch.object(release, "gh", side_effect=failing), \
+                     patch.object(release.time, "sleep") as sleep:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        release.publish(self.root, Path(self.temp.name) / str(status), "owner/repo", "10", "1", COMMIT)
+                uploads = [c for c in self.calls if c[:3] == ("api", "--method", "POST") and self.image.name in c[3]]
+                self.assertEqual(len(uploads), attempts)
+                self.assertEqual(sleep.call_count, attempts - 1)
+                self.assert_not_published_or_pruned()
 
 
 if __name__ == "__main__":

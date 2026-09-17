@@ -245,6 +245,7 @@ jobs:
     if: always() && !cancelled() && needs.build.outputs.built == 'true'
     needs: build
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
