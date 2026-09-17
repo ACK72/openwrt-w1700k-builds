@@ -126,66 +126,80 @@ class ReleaseImage(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid checksum"):
             release.verify_checksums(self.root)
 
-    def test_no_release_is_published_or_pruned_after_upload_failure(self):
-        calls = []
+    def publication_api(self, fault=None):
+        self.calls = []
+        self.draft = record(10, draft=True, assets=[])
         def fake_gh(*args):
-            calls.append(args)
-            if args[:2] == ("release", "upload"):
-                raise subprocess.CalledProcessError(1, args)
-            return ""
-        old = [record(n) for n in range(1, 4)]
-        with patch.object(release, "releases", side_effect=[old, old + [record(10, draft=True)]]), \
-             patch.object(release, "gh", side_effect=fake_gh):
+            self.calls.append(args)
+            if args[:3] == ("api", "--method", "POST"):
+                if args[3] == "repos/owner/repo/releases":
+                    return json.dumps(self.draft)
+                self.assertTrue(args[3].startswith("https://uploads.github.com/repos/owner/repo/releases/10/assets?name="))
+                if fault == "upload":
+                    raise subprocess.CalledProcessError(1, args)
+                path = Path(args[args.index("--input") + 1])
+                asset = {"id": len(self.draft["assets"]) + 100, "name": path.name, "state": "uploaded",
+                         "size": path.stat().st_size, "digest": "sha256:" + release.sha256(path)}
+                if fault == "digest":
+                    asset["digest"] = "sha256:" + "0" * 64
+                self.draft["assets"].append(asset)
+                return json.dumps(asset)
+            if args[:3] == ("api", "--method", "PATCH"):
+                self.assertEqual(args[3], "repos/owner/repo/releases/10")
+                self.assertIn("target_commitish=main", args)
+                self.draft["draft"] = False
+                return json.dumps(self.draft)
+            if args[:3] == ("api", "--method", "DELETE"):
+                asset_id = int(args[3].rsplit("/", 1)[1])
+                self.draft["assets"] = [a for a in self.draft["assets"] if a["id"] != asset_id]
+                return ""
+            if args[:2] == ("release", "delete"):
+                return ""
+            self.fail(f"Unexpected API call (draft tags/list lookups are unavailable): {args}")
+        return fake_gh
+
+    def assert_not_published_or_pruned(self):
+        self.assertFalse(any(c[:3] == ("api", "--method", "PATCH")
+                             or c[:2] == ("release", "delete") for c in self.calls))
+
+    def test_no_release_is_published_or_pruned_after_upload_failure(self):
+        with patch.object(release, "releases", return_value=[record(n) for n in range(1, 4)]), \
+             patch.object(release, "gh", side_effect=self.publication_api("upload")):
             with self.assertRaises(subprocess.CalledProcessError):
                 release.publish(self.root, Path(self.temp.name) / "assets", "owner/repo", "10", "1", COMMIT)
-        self.assertTrue(any(c[:2] == ("release", "create") and "--draft" in c for c in calls))
-        self.assertFalse(any(c[:2] in (("release", "edit"), ("release", "delete")) for c in calls))
+        self.assertTrue(any("draft=true" in c for c in self.calls))
+        self.assert_not_published_or_pruned()
 
-    def test_publish_verifies_digests_before_visibility_and_prunes_afterwards(self):
-        calls = []
-        output = Path(self.temp.name) / "assets"
-        new = record(10, draft=True)
-        old = [record(n) for n in range(1, 4)]
-        def fake_gh(*args):
-            calls.append(args)
-            if args[:2] == ("release", "upload"):
-                new["assets"] = [{"name": p.name, "state": "uploaded", "size": p.stat().st_size,
-                                  "digest": "sha256:" + release.sha256(p)} for p in output.iterdir()]
-            if args[0] == "api" and "--method" not in args:
-                # A draft has an ID but no tag; the old /releases/tags lookup fails.
-                self.assertEqual(args[1], "repos/owner/repo/releases/10")
-                return json.dumps(new)
-            if args[:3] == ("api", "--method", "PATCH"):
-                self.assertIn("target_commitish=main", args)
-                new["draft"] = False
-            return ""
-        def listing(_repo):
-            return old if not calls else old + [new]
-        with patch.object(release, "releases", side_effect=listing), patch.object(release, "gh", side_effect=fake_gh):
-            release.publish(self.root, output, "owner/repo", "10", "1", COMMIT)
-        create = next(c for c in calls if c[:2] == ("release", "create"))
-        self.assertEqual(create[create.index("--target") + 1], "main")
+    def test_publish_uses_creation_response_when_release_list_is_stale(self):
+        # The list omits the new release even after publication. This reproduces
+        # the real API failure, as well as the absence of a tag for the draft.
+        with patch.object(release, "releases", return_value=[record(n) for n in range(1, 4)]), \
+             patch.object(release, "gh", side_effect=self.publication_api()):
+            release.publish(self.root, Path(self.temp.name) / "assets", "owner/repo", "10", "1", COMMIT)
+        create = self.calls[0]
+        self.assertIn("target_commitish=main", create)
         self.assertNotIn(COMMIT, create)
-        edit = next(i for i, c in enumerate(calls) if c[:3] == ("api", "--method", "PATCH"))
-        deletion = next(i for i, c in enumerate(calls) if c[:2] == ("release", "delete"))
+        edit = next(i for i, c in enumerate(self.calls) if c[:3] == ("api", "--method", "PATCH"))
+        deletion = next(i for i, c in enumerate(self.calls) if c[:2] == ("release", "delete"))
         self.assertLess(edit, deletion)
-        self.assertEqual(calls[deletion][2], f"{release.PREFIX}1-1")
+        self.assertEqual(self.calls[deletion][2], f"{release.PREFIX}1-1")
+        self.assertEqual(len(self.draft["assets"]), 5)
 
     def test_digest_mismatch_keeps_draft_and_previous_releases(self):
-        calls = []
-        new = record(10, draft=True)
-        def fake_gh(*args):
-            calls.append(args)
-            if args[0] == "api":
-                output = Path(self.temp.name) / "assets"
-                new["assets"] = [{"name": p.name, "state": "uploaded", "size": p.stat().st_size,
-                                  "digest": "sha256:" + "0" * 64} for p in output.iterdir()]
-                return json.dumps(new)
-            return ""
-        with patch.object(release, "releases", return_value=[new]), patch.object(release, "gh", side_effect=fake_gh):
+        with patch.object(release, "releases", return_value=[]), \
+             patch.object(release, "gh", side_effect=self.publication_api("digest")):
             with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                 release.publish(self.root, Path(self.temp.name) / "assets", "owner/repo", "10", "1", COMMIT)
-        self.assertFalse(any(c[:3] == ("api", "--method", "PATCH") or c[:2] == ("release", "delete") for c in calls))
+        self.assert_not_published_or_pruned()
+
+    def test_resume_replaces_only_incomplete_assets_in_existing_draft(self):
+        fake_gh = self.publication_api()
+        self.draft["assets"] = [{"id": 42, "name": "packages.tar.zst", "state": "uploaded", "size": 1}]
+        with patch.object(release, "releases", return_value=[self.draft]), patch.object(release, "gh", side_effect=fake_gh):
+            release.publish(self.root, Path(self.temp.name) / "assets", "owner/repo", "10", "1", COMMIT)
+        self.assertFalse(any("draft=true" in c for c in self.calls))
+        self.assertIn(("api", "--method", "DELETE", "repos/owner/repo/releases/assets/42"), self.calls)
+        self.assertTrue(release.complete(self.draft))
 
 
 if __name__ == "__main__":

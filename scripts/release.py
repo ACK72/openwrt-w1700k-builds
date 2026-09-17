@@ -12,6 +12,7 @@ import subprocess
 import tarfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 PREFIX = "w1700k-ubi2-oc-"
 TAG = re.compile(r"w1700k-ubi2-oc-[0-9]+-[0-9]+\Z")
@@ -189,29 +190,36 @@ def publish(root, output, repo, run_id, attempt, commit):
         # GITHUB_TOKEN cannot tag a historical commit whose workflow files
         # differ from main (403). A release tag follows main at publication;
         # the checked manifest and notes retain the exact artifact builder SHA.
-        gh("release", "create", tag, "--repo", repo, "--draft", "--target", "main",
-           "--title", title, "--notes-file", str(notes))
-        existing = next((item for item in releases(repo) if item["tag_name"] == tag), None)
-        if not existing:
-            raise RuntimeError("Created draft could not be found")
-    if existing["draft"]:
-        gh("release", "upload", tag, *[str(p) for p in sorted(output.iterdir())], "--repo", repo, "--clobber")
-    # Drafts do not have a published Git tag: /releases/tags/{tag} returns 404.
+        # Use the creation response: release lists may briefly omit new drafts.
+        existing = json.loads(gh("api", "--method", "POST", f"repos/{repo}/releases",
+                                 "-f", f"tag_name={tag}", "-f", "target_commitish=main",
+                                 "-F", "draft=true", "-F", "prerelease=false",
+                                 "-f", f"name={title}", "-F", f"body=@{notes}"))
+    # Drafts have an ID before their Git tag exists. Use that ID for all writes.
     endpoint = f"repos/{repo}/releases/{existing['id']}"
-    current = json.loads(gh("api", endpoint))
-    actual = {a["name"]: a for a in current.get("assets", [])}
-    for path in output.iterdir():
+    actual = {a["name"]: a for a in existing.get("assets", [])}
+    for path in sorted(output.iterdir()):
         asset = actual.get(path.name, {})
+        digest = f"sha256:{sha256(path)}"
+        if existing["draft"] and (asset.get("state") != "uploaded" or asset.get("size") != path.stat().st_size
+                                  or asset.get("digest") != digest):
+            if asset:
+                gh("api", "--method", "DELETE", f"repos/{repo}/releases/assets/{asset['id']}")
+            asset = json.loads(gh("api", "--method", "POST",
+                                  f"https://uploads.github.com/{endpoint}/assets?name={quote(path.name)}",
+                                  "-H", "Content-Type: application/octet-stream", "--input", str(path)))
         if asset.get("state") != "uploaded" or asset.get("size") != path.stat().st_size:
             raise RuntimeError(f"Release asset upload incomplete: {path.name}")
-        if asset.get("digest") != f"sha256:{sha256(path)}":
+        if asset.get("digest") != digest:
             raise RuntimeError(f"Release asset digest mismatch: {path.name}")
-    if current["draft"]:
-        gh("api", "--method", "PATCH", endpoint, "-F", "draft=false", "-F", "prerelease=false",
-           "-f", "target_commitish=main", "-f", "make_latest=true", "-f", f"name={title}", "-F", f"body=@{notes}")
-    items = releases(repo)
-    if not any(item["tag_name"] == tag and complete(item) for item in items):
+    current = existing
+    if existing["draft"]:
+        current = json.loads(gh("api", "--method", "PATCH", endpoint, "-F", "draft=false", "-F", "prerelease=false",
+                                "-f", "target_commitish=main", "-f", "make_latest=true", "-f", f"name={title}", "-F", f"body=@{notes}"))
+    if current["tag_name"] != tag or not complete(current):
         raise RuntimeError("Published release could not be verified; retaining all previous releases")
+    # The mutation response is authoritative even if the list is still stale.
+    items = [item for item in releases(repo) if item["id"] != current["id"]] + [current]
     for old in prune_candidates(items):
         gh("release", "delete", old["tag_name"], "--repo", repo, "--cleanup-tag", "--yes")
     print(f"https://github.com/{repo}/releases/tag/{tag}")
