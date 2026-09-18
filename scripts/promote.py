@@ -15,10 +15,15 @@ spec.loader.exec_module(stack)
 
 
 def select_candidate(repo):
-    runs = json.loads(release.gh("api", f"repos/{repo}/actions/workflows/build.yml/runs?branch=main&per_page=1"))["workflow_runs"]
-    if not runs or runs[0].get("status") != "completed" or runs[0].get("conclusion") != "success":
+    pages = json.loads(release.gh("api", "--paginate", "--slurp",
+                                 f"repos/{repo}/actions/workflows/build.yml/runs?branch=main&per_page=100"))
+    runs = [run for page in pages for run in page["workflow_runs"]]
+    # Rerunning an old run does not give it a new run ID or creation time.
+    # Include every page and order completed attempts by their last state change.
+    latest = max(runs, key=lambda run: (run.get("updated_at", ""), run["id"])) if runs else None
+    if (not latest or any(run.get("status") != "completed" for run in runs)
+            or latest.get("conclusion") != "success"):
         raise ValueError("The latest RC workflow must have completed successfully; a failed, cancelled or pending run blocks promotion")
-    latest = runs[0]
     items = sorted((item for item in release.releases(repo) if release.managed(item)
                     and release.channel(item) == release.RC and not item.get("draft")),
                    key=lambda item: (item.get("published_at") or "", item["id"]), reverse=True)
