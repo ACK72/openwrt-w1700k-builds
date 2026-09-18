@@ -12,7 +12,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-SOURCE_ROOTS = ("tools", "toolchain", "include", "config", "target", "scripts", "package", "feeds")
+SOURCE_ROOTS = ("tools", "toolchain", "include", "config", "target", "scripts", "package", "feeds", "files")
 ROOT_INPUTS = ("Makefile", "rules.mk", "Config.in", ".config", "feeds.conf")
 SCHEMA = 2
 

@@ -53,7 +53,9 @@ SH
 cat > "$test_root/fake-bin/python3" <<'SH'
 #!/usr/bin/env bash
 set -eu
-if [[ $2 == keys ]]; then
+if [[ $1 == */customize.py ]]; then
+    [[ $2 == apply ]]
+elif [[ $2 == keys ]]; then
     echo 'toolchain=test-key'
 else
     exec "$REAL_PYTHON3" "$@"

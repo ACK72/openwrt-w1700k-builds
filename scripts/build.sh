@@ -150,6 +150,7 @@ configure() {
     mapfile -t feed_packages < "$WORK/feed-packages.txt"
     (( ${#feed_packages[@]} > 0 )) || die 'No firmware packages selected'
     ./scripts/feeds install "${feed_packages[@]}" 2>&1 | tee "$LOGS/feeds-install.log"
+    python3 "$ROOT/scripts/customize.py" apply "$OPENWRT" 2>&1 | tee "$LOGS/customizations.log"
     cp "$profile" .config
     printf 'CONFIG_CCACHE_DIR="%s"\n' "$CCACHE_DIR" >> .config
     # Validate Kconfig against the effective request, including builder overrides.
@@ -229,6 +230,7 @@ collect() {
     images=("$target"/*gemtek_w1700k-ubi*sysupgrade.itb)
     (( ${#images[@]} == 1 )) || die 'Expected exactly one W1700K sysupgrade image'
     python3 "$ROOT/scripts/build-meta.py" check-installed "$OPENWRT"
+    python3 "$ROOT/scripts/customize.py" verify "$OPENWRT"
     "$OPENWRT/staging_dir/host/bin/fwtool" -i "$WORK/image-metadata.json" "${images[0]}"
     python3 "$ROOT/scripts/release.py" verify-image "$target" "$WORK/image-metadata.json"
     # Output is owned by this script, but preserve old runs in separate directories.

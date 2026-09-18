@@ -1,0 +1,27 @@
+W1700K firmware customizations
+
+The GitHub upgrade UI and helper are new implementations by
+openwrt-w1700k-builds contributors (2026), licensed GPL-2.0-only.
+The release selection feature was inspired by w1700k/builds.
+
+The six diagnostic scripts in root/etc are imported from:
+https://github.com/w1700k/builds/tree/9449e4ca242ab30278df20940d6654ddc1c102e8/user/default/files/etc
+They retain that repository's GPL-2.0-only license. There were no individual
+copyright notices in these files; existing comments and script logic are
+preserved. Local changes on 2026-09-18 add executable interpreter lines,
+normalize whitespace, and require an explicit opt-in to testgpio.sh.
+They are never run automatically.
+
+The single-wiphy change is a new Apache-2.0 implementation for luci-mod-status.
+LuCI copyright: The LuCI Team and contributors. Its existing notices remain
+unchanged. The problem and earlier workaround are credited to Gilly1970
+in w1700k/builds' 998-single-wiphy.patch and to the reporters of:
+https://github.com/openwrt/luci/issues/7483
+The earlier patch text was not copied because its independent license grant
+was not explicit. The new patch is an exception to this builder's GPL-2.0-only
+default and retains the target component's Apache-2.0 licensing.
+
+Corresponding customization source, patches and build scripts:
+https://github.com/ACK72/openwrt-w1700k-builds
+The exact builder commit, source and feed revisions are retained with each
+build in its Actions artifact's build-manifest.json and feeds.lock.

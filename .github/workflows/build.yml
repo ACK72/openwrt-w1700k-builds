@@ -5,7 +5,7 @@ on:
     - cron: '17 18 * * *'
   push:
     branches: [main]
-    paths: ['.github/workflows/build.yml', '.github/actions/**', 'scripts/**', 'configs/**', 'package/**', 'patches/**']
+    paths: ['.github/workflows/build.yml', '.github/actions/**', 'scripts/**', 'configs/**', 'package/**', 'patches/**', 'LICENSES/**']
   workflow_dispatch:
     inputs:
       runner:

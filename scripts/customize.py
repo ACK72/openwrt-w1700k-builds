@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Install the release UI, diagnostics and a license-compatible LuCI fix."""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = ROOT / 'package/w1700k-custom'
+VIEW = 'htdocs/luci-static/resources/view/attendedsysupgrade/overview.js'
+
+
+def apply(openwrt):
+    luci = openwrt / 'feeds/luci'
+    attended = luci / 'applications/luci-app-attendedsysupgrade'
+    view = attended / VIEW
+    if not view.is_file():
+        raise RuntimeError('Missing LuCI attended sysupgrade source')
+    for patch in sorted((ROOT / 'patches/luci').glob('*.patch')):
+        command = ['git', '-C', str(luci), 'apply', '--whitespace=nowarn']
+        if subprocess.run([*command, '--check', str(patch)], capture_output=True).returncode == 0:
+            subprocess.run([*command, str(patch)], check=True)
+        elif subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode:
+            raise RuntimeError(f'LuCI patch no longer applies: {patch.name}')
+    shutil.copyfile(PACKAGE / 'overview.js', view)
+    # The stock ASU ACL grants upgrade_start to read-only users. Keep firmware
+    # installation in the write scope alongside our authenticated helper.
+    acl_path = attended / 'root/usr/share/rpcd/acl.d/luci-app-attendedsysupgrade.json'
+    acl = json.loads(acl_path.read_text(encoding='utf-8'))
+    scope = acl['luci-app-attendedsysupgrade']
+    methods = scope['read'].get('ubus', {}).get('rpc-sys', [])
+    scope['read']['ubus']['rpc-sys'] = [method for method in methods if method != 'upgrade_start']
+    methods = scope['write'].setdefault('ubus', {}).setdefault('rpc-sys', [])
+    if 'upgrade_start' not in methods:
+        methods.append('upgrade_start')
+    acl_path.write_text(json.dumps(acl, indent=2) + '\n', encoding='utf-8')
+    overlay = openwrt / 'files'
+    shutil.copytree(PACKAGE / 'root', overlay, dirs_exist_ok=True)
+    for script in [overlay / 'usr/libexec/w1700k-upgrade', *(overlay / 'etc').glob('*.sh')]:
+        script.chmod(0o755)
+    licenses = overlay / 'usr/share/licenses/w1700k-custom'
+    licenses.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(PACKAGE / 'NOTICE', licenses / 'NOTICE')
+    for license in ('GPL-2.0', 'Apache-2.0'):
+        shutil.copyfile(ROOT / 'LICENSES' / license, licenses / license)
+    print('Installed authenticated release UI, diagnostics and single-wiphy fix')
+
+
+def verify(openwrt):
+    roots = list((openwrt / 'build_dir').glob('target-*/root-airoha'))
+    if len(roots) != 1:
+        raise RuntimeError('Expected one compiled Airoha root filesystem')
+    root = roots[0]
+    for source in (PACKAGE / 'root').rglob('*'):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(PACKAGE / 'root')
+        target = root / relative
+        if not target.is_file() or source.read_bytes() != target.read_bytes():
+            raise RuntimeError(f'Customization missing or changed in rootfs: {relative}')
+        # Windows fixtures have no POSIX executable bits; release builds run on Linux.
+        if os.name != 'nt' and (relative.suffix == '.sh' or relative.name == 'w1700k-upgrade') and not target.stat().st_mode & 0o111:
+            raise RuntimeError(f'Customization is not executable: {relative}')
+    view = (root / 'www/luci-static/resources/view/attendedsysupgrade/overview.js').read_text(encoding='utf-8')
+    channel = (root / 'www/luci-static/resources/view/status/channel_analysis.js').read_text(encoding='utf-8')
+    if 'ACK72/openwrt-w1700k-builds' not in view or '/usr/libexec/w1700k-upgrade' not in view:
+        raise RuntimeError('Release upgrade view is missing from image rootfs')
+    if 'channelsForRadio' not in channel or 'scanInterface' not in channel:
+        raise RuntimeError('Single-wiphy fix is missing from image rootfs')
+    acl = json.loads((root / 'usr/share/rpcd/acl.d/luci-app-attendedsysupgrade.json').read_text(encoding='utf-8'))
+    if 'upgrade_start' in acl['luci-app-attendedsysupgrade']['read'].get('ubus', {}).get('rpc-sys', []):
+        raise RuntimeError('Read-only users must not be permitted to start firmware upgrades')
+    for name in ('NOTICE', 'GPL-2.0', 'Apache-2.0'):
+        if not (root / 'usr/share/licenses/w1700k-custom' / name).is_file():
+            raise RuntimeError(f'Customization license missing: {name}')
+    print('Verified upgrade UI, executable diagnostics, single-wiphy fix and licenses in rootfs')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('operation', choices=('apply', 'verify'))
+    parser.add_argument('openwrt', type=Path)
+    args = parser.parse_args()
+    globals()[args.operation](args.openwrt.resolve())

@@ -11,3 +11,10 @@ The NPU FDK compatibility patches retain the MIT license and upstream
 copyright notice included in LICENSES/MIT.
 
 The full license text is included in LICENSES/GPL-2.0.
+
+The separately licensed LuCI single-wiphy patch in patches/luci is
+Apache-2.0; its full terms are in LICENSES/Apache-2.0. This does not
+relicense LuCI under the builder's GPL-2.0-only default.
+
+Diagnostic script origins and customization notices are retained in
+package/w1700k-custom/NOTICE and included in the firmware image.

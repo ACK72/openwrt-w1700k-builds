@@ -189,7 +189,7 @@ def keys(openwrt, npu):
     # invalidate a toolchain cache after make defconfig.
     tracked = git(openwrt, "ls-files", "--", *TOOLCHAIN_INPUTS).splitlines()
     source_hash = digest_paths(openwrt, tracked)
-    builder_hash = digest_paths(ROOT, ["scripts", "configs", "package", "patches", ".github"])
+    builder_hash = digest_paths(ROOT, ["scripts", "configs", "package", "patches", ".github", "LICENSES"])
     host_hash = hashlib.sha256((platform.machine() + host).encode()).hexdigest()
     toolchain = hashlib.sha256(
         ("toolchain-v2" + source_hash + host_hash + config_digest(openwrt / ".config", True)).encode()

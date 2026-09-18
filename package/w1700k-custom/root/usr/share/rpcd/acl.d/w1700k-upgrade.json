@@ -1,0 +1,19 @@
+{
+  "luci-app-attendedsysupgrade": {
+    "description": "Authenticated W1700K release upgrades",
+    "read": {
+      "file": {
+        "/usr/libexec/w1700k-upgrade status": ["exec"]
+      },
+      "ubus": {"file": ["exec"]}
+    },
+    "write": {
+      "file": {
+        "/usr/libexec/w1700k-upgrade list": ["exec"],
+        "/usr/libexec/w1700k-upgrade download *": ["exec"],
+        "/usr/libexec/w1700k-upgrade install *": ["exec"]
+      },
+      "ubus": {"file": ["exec"]}
+    }
+  }
+}

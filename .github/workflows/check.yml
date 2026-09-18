@@ -12,6 +12,9 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y shellcheck zstd
       - run: for script in scripts/*.sh tests/*.sh; do bash -n "$script"; done
       - run: shellcheck scripts/*.sh tests/*.sh
+      - run: shellcheck -s sh package/w1700k-custom/root/usr/libexec/w1700k-upgrade
+      - run: for script in package/w1700k-custom/root/etc/*.sh; do sh -n "$script"; done
+      - run: node --check package/w1700k-custom/overview.js && node tests/test-custom-ui.js
       - run: python3 -B -m unittest discover -s tests -v
       - run: for script in tests/*.sh; do bash "$script"; done
       - name: Check Actions syntax
@@ -30,6 +33,7 @@ jobs:
           bash scripts/build.sh prepare
           bash scripts/build.sh npu
           bash scripts/build.sh configure
+          node tests/test-custom-ui.js .work/openwrt/feeds/luci/modules/luci-mod-status/htdocs/luci-static/resources/view/status/channel_analysis.js
       - name: Preserve configuration diagnostics
         if: always()
         uses: actions/upload-artifact@v7.0.1

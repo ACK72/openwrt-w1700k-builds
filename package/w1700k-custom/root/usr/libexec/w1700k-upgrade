@@ -1,0 +1,166 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 openwrt-w1700k-builds contributors
+# Repository-specific replacement for w1700k/builds' GitHub upgrade CGI.
+# All web access uses authenticated rpcd file/exec ACLs, not a public CGI.
+set -eu
+umask 077
+
+REPOSITORY='ACK72/openwrt-w1700k-builds'
+STATE_DIR='/tmp/w1700k-upgrade'
+IMAGE="$STATE_DIR/firmware.itb"
+STATE="$STATE_DIR/state.json"
+MAX_SIZE=134217728
+API="https://api.github.com/repos/$REPOSITORY/releases"
+
+ensure_directory() {
+    [ ! -L "$STATE_DIR" ] || exit 1
+    mkdir -p "$STATE_DIR"
+    [ "$(stat -c '%u' "$STATE_DIR")" = 0 ] || exit 1
+    chmod 700 "$STATE_DIR"
+}
+
+state() {
+    jq -nc --arg status "$1" --arg message "${2:-}" '{status:$status,message:$message}' > "$STATE.new"
+    mv "$STATE.new" "$STATE"
+}
+
+fail() {
+    state error "$1"
+    exit 1
+}
+
+fetch() {
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --connect-timeout 15 --max-time 180 --max-filesize "$MAX_SIZE" \
+        --user-agent 'w1700k-release-upgrade' "$@"
+}
+
+valid_tag() {
+    printf '%s\n' "$1" | grep -Eq '^w1700k-ubi2-oc-[0-9]+-[0-9]+$'
+}
+
+valid_digest() {
+    [ "${#1}" -eq 64 ] && ! printf '%s' "$1" | grep -q '[^a-f0-9]'
+}
+
+valid_keep() { [ "$1" = keep ] || [ "$1" = reset ]; }
+
+check_device() {
+    ubus call system board | jq -e \
+        '.board_name == "gemtek,w1700k-ubi" and .release.target == "airoha/an7581"' >/dev/null ||
+        fail 'This firmware requires a W1700K UBI device.'
+    [ "$(uci -q get 'system.@system[0].compat_version')" = 2.0 ] ||
+        fail 'This firmware requires the UBI2 partition layout.'
+}
+
+check_image() {
+    keep=$1
+    if [ ! -s "$IMAGE" ] || [ -L "$IMAGE" ]; then fail 'No verified firmware is available.'; fi
+    actual=$(sha256sum "$IMAGE")
+    [ "${actual%% *}" = "$digest" ] || fail 'Firmware SHA-256 does not match the release.'
+    [ "$(wc -c < "$IMAGE" | tr -d ' ')" = "$size" ] || fail 'Firmware size does not match the release.'
+    # OpenWrt validates target, image format, compatibility and any image signature.
+    if [ "$keep" = reset ]; then
+        /sbin/sysupgrade -n --test "$IMAGE" > "$STATE_DIR/validation.log" 2>&1 ||
+            fail 'Image compatibility check failed. Use Backup / Flash Firmware to review the image.'
+    else
+        /sbin/sysupgrade --test "$IMAGE" > "$STATE_DIR/validation.log" 2>&1 ||
+            fail 'Image or saved settings are incompatible. Review the image in Backup / Flash Firmware.'
+    fi
+}
+
+release_list() {
+    # Restrict URLs, filenames, tags, sizes and digests before offering an image.
+    jq -ce --arg repo "$REPOSITORY" --argjson max "$MAX_SIZE" '
+        [ .[] | select(.draft == false and .prerelease == false)
+          | select(.tag_name | test("^w1700k-ubi2-oc-[0-9]+-[0-9]+$"))
+          | . as $release
+          | [.assets[] | select(.name | test("^openwrt-airoha-an7581-gemtek_w1700k-ubi-squashfs-sysupgrade-r[0-9]+[.]itb$"))] as $images
+          | select($images | length == 1) | $images[0] as $image
+          | select(($image.digest // "") | test("^sha256:[a-f0-9]{64}$"))
+          | select($image.size > 0 and $image.size <= $max)
+          | select($image.browser_download_url == ("https://github.com/" + $repo + "/releases/download/" + .tag_name + "/" + $image.name))
+          | {tag:.tag_name, title:(.name // .tag_name), published:.published_at,
+             name:$image.name, size:$image.size, sha256:($image.digest | ltrimstr("sha256:")),
+             url:$image.browser_download_url} ] | sort_by(.published) | reverse | .[:3]'
+}
+
+worker() {
+    trap 'cleanup_worker' EXIT
+    trap 'state error "Upgrade operation interrupted."; exit 1' HUP INT TERM
+    case "$1" in
+        list)
+            fetch --output "$STATE_DIR/releases.json" "$API?per_page=30" || fail 'Could not retrieve GitHub releases.'
+            release_list < "$STATE_DIR/releases.json" > "$STATE_DIR/list.json" || fail 'Invalid GitHub release metadata.'
+            jq -nc --slurpfile releases "$STATE_DIR/list.json" '{status:"listed",releases:$releases[0]}' > "$STATE.new"
+            mv "$STATE.new" "$STATE"
+            ;;
+        download)
+            check_device
+            rm -f "$IMAGE" "$STATE_DIR/verified.json"
+            fetch --output "$STATE_DIR/release.json" "$API/tags/$2" || fail 'Could not retrieve the selected release.'
+            jq -s '.' "$STATE_DIR/release.json" | release_list > "$STATE_DIR/selected.json" || fail 'Invalid release metadata.'
+            jq -e --arg tag "$2" 'length == 1 and .[0].tag == $tag' "$STATE_DIR/selected.json" >/dev/null || fail 'No matching, checksummed firmware in this release.'
+            url=$(jq -r '.[0].url' "$STATE_DIR/selected.json")
+            size=$(jq -r '.[0].size' "$STATE_DIR/selected.json")
+            digest=$(jq -r '.[0].sha256' "$STATE_DIR/selected.json")
+            available=$(df -Pk "$STATE_DIR" | awk 'END {print $4}')
+            [ "$available" -gt "$((size / 1024 + 32768))" ] || fail 'Not enough free temporary storage for the image.'
+            fetch --output "$IMAGE.part" "$url" || { rm -f "$IMAGE.part"; fail 'Firmware download failed.'; }
+            mv "$IMAGE.part" "$IMAGE"
+            check_image "$3"
+            jq -c --arg keep "$3" '.[0] + {keep:$keep}' "$STATE_DIR/selected.json" > "$STATE_DIR/verified.json"
+            jq -c '. + {status:"ready"}' "$STATE_DIR/verified.json" > "$STATE.new"
+            mv "$STATE.new" "$STATE"
+            ;;
+        install)
+            check_device
+            [ -f "$STATE_DIR/verified.json" ] || fail 'Download and verify an image first.'
+            digest=$(jq -r '.sha256' "$STATE_DIR/verified.json")
+            size=$(jq -r '.size' "$STATE_DIR/verified.json")
+            if [ "$digest" != "$2" ] || [ "$(jq -r '.keep' "$STATE_DIR/verified.json")" != "$3" ]; then
+                fail 'The selected image or settings changed. Download it again.'
+            fi
+            check_image "$3"
+            jq -c '. + {status:"installing",message:"Installing firmware. Keep the device powered on."}' "$STATE_DIR/verified.json" > "$STATE.new"
+            mv "$STATE.new" "$STATE"
+            sleep 3
+            if [ "$3" = reset ]; then
+                /sbin/sysupgrade -n "$IMAGE" >> "$STATE_DIR/validation.log" 2>&1 || fail 'Firmware installation failed.'
+            else
+                /sbin/sysupgrade "$IMAGE" >> "$STATE_DIR/validation.log" 2>&1 || fail 'Firmware installation failed.'
+            fi
+            ;;
+        *) fail 'Unknown operation.' ;;
+    esac
+}
+
+cleanup_worker() {
+    result=$?
+    if [ "$result" -ne 0 ] && [ "$(jq -r '.status' "$STATE" 2>/dev/null)" = busy ]; then
+        state error 'Firmware operation failed. Check temporary storage and connectivity.'
+    fi
+    rm -f "$IMAGE.part"
+    rmdir "$STATE_DIR/lock"
+}
+
+start() {
+    if ! mkdir "$STATE_DIR/lock" 2>/dev/null; then
+        printf '%s\n' 'An upgrade operation is already running.' >&2
+        exit 1
+    fi
+    state busy 'Working...'
+    "$0" _worker "$@" </dev/null > "$STATE_DIR/worker.log" 2>&1 &
+    printf '%s\n' '{"status":"busy"}'
+}
+
+ensure_directory
+case "${1:-}" in
+    list) [ "$#" -eq 1 ]; start list ;;
+    download) [ "$#" -eq 3 ]; valid_tag "$2"; valid_keep "$3"; start download "$2" "$3" ;;
+    install) [ "$#" -eq 3 ]; valid_digest "$2"; valid_keep "$3"; start install "$2" "$3" ;;
+    status) [ "$#" -eq 1 ]; if [ -f "$STATE" ]; then cat "$STATE"; else printf '%s\n' '{"status":"idle"}'; fi ;;
+    _worker) shift; worker "$@" ;;
+    *) printf '%s\n' 'Usage: w1700k-upgrade list|status|download TAG keep|reset|install SHA256 keep|reset' >&2; exit 1 ;;
+esac
