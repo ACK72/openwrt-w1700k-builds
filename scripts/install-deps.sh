@@ -7,4 +7,6 @@ set -Eeuo pipefail
 sudo apt-get update
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 mapfile -t packages < "$ROOT/configs/build-packages.txt"
-sudo apt-get install -y --no-install-recommends "${packages[@]}"
+# SquashFS is only used to inspect upstream metadata. Keep it out of the
+# compiler dependency list so adding/updating this helper preserves toolchains.
+sudo apt-get install -y --no-install-recommends "${packages[@]}" squashfs-tools

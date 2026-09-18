@@ -194,13 +194,20 @@ def keys(openwrt, npu):
     toolchain = hashlib.sha256(
         ("toolchain-v2" + source_hash + host_hash + config_digest(openwrt / ".config", True)).encode()
     ).hexdigest()
-    build = hashlib.sha256((toolchain + config_digest(openwrt / ".config")).encode()).hexdigest()
+    # Feed-list changes require a new image, but only a changed kernel identity
+    # invalidates kernel/package products. Both keep the compiler/toolchain cache.
+    vermagic = (openwrt / "files/etc/vermagic.txt").read_text().strip()
+    if not re.fullmatch(r"[a-f0-9]{32}", vermagic):
+        raise ValueError("Missing or invalid official kernel vermagic")
+    distfeeds = digest_paths(openwrt, ["files/etc/vermagic.txt", "files/etc/apk/repositories.d/distfeeds.list"])
+    build = hashlib.sha256((toolchain + config_digest(openwrt / ".config") + vermagic).encode()).hexdigest()
     state = {
         "openwrt": git(openwrt, "rev-parse", "HEAD"),
         "npu": git(npu, "rev-parse", "HEAD"),
         "feeds": feeds, "builder": builder_hash, "toolchain": toolchain,
         "host": host_hash, "build": build,
         "config": digest_paths(openwrt, [".config"]), "channel": "ubi2-oc",
+        "distfeeds": distfeeds, "vermagic": vermagic,
     }
     fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
     state["fingerprint"] = fingerprint
@@ -217,6 +224,7 @@ def manifest(openwrt, npu, output):
         state["builder_commit"] = "uncommitted (see builder content hash)"
     state["source_date_epoch"] = git(openwrt, "show", "-s", "--format=%ct", "HEAD")
     state["built_at"] = datetime.now(timezone.utc).isoformat()
+    state["official_distfeeds"] = json.loads((openwrt.parent / "distfeeds.json").read_text(encoding="utf-8"))
     state["changelog"] = git(openwrt, "log", "-20", "--format=%h %s", "--abbrev=10", "HEAD").splitlines()
     state["npu_compiler"] = subprocess.check_output(["clang-18", "--version"], text=True).strip()
     state["npu_patches"] = {

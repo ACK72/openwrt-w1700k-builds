@@ -1,5 +1,7 @@
 """Regression tests for incremental reuse without hiding changed build inputs."""
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -105,6 +107,41 @@ class SourceTimestamps(unittest.TestCase):
 
 
 class CacheKeys(unittest.TestCase):
+    def test_distfeeds_changes_preserve_toolchain_and_only_vermagic_discards_kernel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in ("scripts", "configs", "package", "patches", ".github", "LICENSES"):
+                (root / name).mkdir()
+            openwrt = root / ".work/openwrt"
+            (openwrt / "feeds").mkdir(parents=True)
+            (openwrt / "Makefile").write_text("source")
+            (openwrt / ".config").write_text('CONFIG_GCC_VERSION="14"\n')
+            vermagic = openwrt / "files/etc/vermagic.txt"
+            distfeeds = openwrt / "files/etc/apk/repositories.d/distfeeds.list"
+            distfeeds.parent.mkdir(parents=True)
+            vermagic.write_text("a" * 32 + "\n")
+            distfeeds.write_text("official feeds A\n")
+
+            def state():
+                with mock.patch.object(meta, "ROOT", root), \
+                        mock.patch.object(meta, "git", side_effect=lambda path, *args: "Makefile" if args[0] == "ls-files" else "a" * 40), \
+                        mock.patch.object(meta.subprocess, "check_output", return_value="host-tools"), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    meta.keys(openwrt, root / "npu")
+                return json.loads((openwrt.parent / "build-state.json").read_text())
+
+            first = state()
+            distfeeds.write_text("official feeds B\n")
+            second = state()
+            self.assertEqual(first["toolchain"], second["toolchain"])
+            self.assertEqual(first["build"], second["build"])
+            self.assertNotEqual(first["fingerprint"], second["fingerprint"])
+            vermagic.write_text("b" * 32 + "\n")
+            third = state()
+            self.assertEqual(second["toolchain"], third["toolchain"])
+            self.assertNotEqual(second["build"], third["build"])
+            self.assertNotEqual(second["fingerprint"], third["fingerprint"])
+
     def test_new_unselected_feed_package_does_not_discard_build_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".config"
@@ -230,6 +267,19 @@ class CacheReservation(unittest.TestCase):
             self.assertFalse(prune.reserve("npu", self.root, "w1700k-v2-Linux-X64-npu-new"))
         run.assert_not_called()
         self.assertFalse((self.root / ".work/cache-budget.json").exists())
+
+    def test_shared_distfeeds_cache_preserves_build_cache_before_restore(self):
+        key = "w1700k-v2-shared-distfeeds-new"
+        old = {"id": 1, "key": "w1700k-v2-Linux-X64-build-old",
+               "ref": "refs/heads/main", "size_in_bytes": prune.BUDGET}
+        with mock.patch.object(prune, "list_caches", return_value=[old]), \
+                mock.patch.object(prune, "upload_bound", return_value=100_000_000), \
+                mock.patch.object(prune.subprocess, "run") as run:
+            self.assertFalse(prune.reserve("distfeeds", self.root, key))
+        run.assert_not_called()
+        with mock.patch.object(prune, "list_caches", return_value=[]), \
+                mock.patch.object(prune, "upload_bound", return_value=100_000_000):
+            self.assertTrue(prune.reserve("distfeeds", self.root, key))
 
     def test_api_failure_disables_upload_instead_of_ignoring_budget(self):
         with mock.patch.object(sys, "argv", ["prune-caches.py", "reserve", "build", ".",

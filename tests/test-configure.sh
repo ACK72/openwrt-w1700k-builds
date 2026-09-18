@@ -55,7 +55,11 @@ cat > "$test_root/fake-bin/python3" <<'SH'
 set -eu
 if [[ $1 == */customize.py ]]; then
     [[ $2 == apply ]]
+elif [[ $1 == */distfeeds.py ]]; then
+    [[ $2 == install ]]
+    echo distfeeds-installed > "$4/distfeeds-installed"
 elif [[ $2 == keys ]]; then
+    [[ -f $3/distfeeds-installed ]]
     echo 'toolchain=test-key'
 else
     exec "$REAL_PYTHON3" "$@"

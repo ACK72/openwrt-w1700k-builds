@@ -130,6 +130,11 @@ build_npu() {
     python3 "$ROOT/scripts/build-meta.py" install-npu "$OPENWRT" "$NPU" "$CACHE/npu"
 }
 
+distfeeds() {
+    python3 "$ROOT/scripts/distfeeds.py" resolve "$WORK/distfeeds-source.json"
+    python3 "$ROOT/scripts/distfeeds.py" prepare "$WORK/distfeeds-source.json" "$CACHE/distfeeds"
+}
+
 configure() {
     local profile feeds_file
     local feed_packages=()
@@ -151,6 +156,7 @@ configure() {
     (( ${#feed_packages[@]} > 0 )) || die 'No firmware packages selected'
     ./scripts/feeds install "${feed_packages[@]}" 2>&1 | tee "$LOGS/feeds-install.log"
     python3 "$ROOT/scripts/customize.py" apply "$OPENWRT" 2>&1 | tee "$LOGS/customizations.log"
+    python3 "$ROOT/scripts/distfeeds.py" install "$CACHE/distfeeds" "$OPENWRT" 2>&1 | tee "$LOGS/distfeeds.log"
     cp "$profile" .config
     printf 'CONFIG_CCACHE_DIR="%s"\n' "$CCACHE_DIR" >> .config
     # Validate Kconfig against the effective request, including builder overrides.
@@ -231,6 +237,7 @@ collect() {
     (( ${#images[@]} == 1 )) || die 'Expected exactly one W1700K sysupgrade image'
     python3 "$ROOT/scripts/build-meta.py" check-installed "$OPENWRT"
     python3 "$ROOT/scripts/customize.py" verify "$OPENWRT"
+    python3 "$ROOT/scripts/distfeeds.py" verify "$OPENWRT"
     "$OPENWRT/staging_dir/host/bin/fwtool" -i "$WORK/image-metadata.json" "${images[0]}"
     python3 "$ROOT/scripts/release.py" verify-image "$target" "$WORK/image-metadata.json"
     # Output is owned by this script, but preserve old runs in separate directories.
@@ -242,6 +249,9 @@ collect() {
     find "$target" -maxdepth 1 -type f -exec cp -t "$dest/firmware" {} +
     cp "$OPENWRT/.config" "$dest/openwrt.config"
     cp "$WORK/feeds.lock" "$dest/feeds.lock"
+    cp "$WORK/distfeeds.json" "$dest/distfeeds-source.json"
+    cp "$OPENWRT/files/etc/apk/repositories.d/distfeeds.list" "$dest/distfeeds.list"
+    cp "$OPENWRT/files/etc/vermagic.txt" "$dest/vermagic.txt"
     cp "$WORK/image-metadata.json" "$dest/image-metadata.json"
     cp "$OPENWRT/public-key.pem" "$dest/public-key.pem"
     "$OPENWRT/scripts/diffconfig.sh" > "$dest/config.diff"
@@ -260,6 +270,7 @@ collect() {
 case ${1:-all} in
     prepare) prepare ;;
     npu) build_npu ;;
+    distfeeds) distfeeds ;;
     configure) configure ;;
     restore) restore_build ;;
     snapshot) save_build build ;;
@@ -267,6 +278,6 @@ case ${1:-all} in
     toolchain) toolchain ;;
     compile) compile ;;
     collect) cd "$OPENWRT"; collect ;;
-    all) prepare; build_npu; configure; restore_build; download; toolchain; compile; cd "$OPENWRT"; collect; save_build build ;;
-    *) die 'Usage: bash scripts/build.sh [all|prepare|npu|configure|restore|download|toolchain|compile|collect|snapshot]' ;;
+    all) prepare; distfeeds; build_npu; configure; restore_build; download; toolchain; compile; cd "$OPENWRT"; collect; save_build build ;;
+    *) die 'Usage: bash scripts/build.sh [all|prepare|distfeeds|npu|configure|restore|download|toolchain|compile|collect|snapshot]' ;;
 esac

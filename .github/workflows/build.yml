@@ -82,6 +82,25 @@ jobs:
           df -h .
       - name: Install build dependencies
         run: bash scripts/install-deps.sh
+      - name: Pin the official snapshot image
+        id: official
+        run: python3 scripts/distfeeds.py resolve .work/distfeeds-source.json >> "$GITHUB_OUTPUT"
+      - name: Restore extracted official feeds across runner architectures
+        id: distfeeds-cache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .cache/distfeeds
+          key: ${{ steps.official.outputs.cache-key }}
+      - name: Extract or validate the pinned official feeds
+        run: python3 scripts/distfeeds.py prepare .work/distfeeds-source.json .cache/distfeeds
+      - name: Save the small extracted feed cache
+        if: steps.distfeeds-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: ./.github/actions/save-cache
+        with:
+          kind: distfeeds
+          path: .cache/distfeeds
+          key: ${{ steps.official.outputs.cache-key }}
       - name: Resolve exact source revisions
         id: sources
         run: |
@@ -235,7 +254,7 @@ jobs:
           path: .cache/ccache
           key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Retain only caches whose replacement was successfully saved
-        if: always() && steps.needed.outputs.build == 'true'
+        if: always() && steps.official.outcome == 'success'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -243,6 +262,7 @@ jobs:
           TOOLCHAIN_KEY: ${{ steps.keys.outputs.toolchain }}
           BUILD_KEY: ${{ steps.keys.outputs.build }}
           NPU_KEY: ${{ steps.sources.outputs.npu-key }}
+          DISTFEEDS_CACHE_KEY: ${{ steps.official.outputs.cache-key }}
         run: python3 scripts/prune-caches.py
       - name: Upload diagnostic logs
         if: always()
@@ -256,6 +276,10 @@ jobs:
             .work/sources.env
             .work/feeds.lock
             .work/feed-packages.txt
+            .work/distfeeds-source.json
+            .work/distfeeds.json
+            .work/openwrt/files/etc/apk/repositories.d/distfeeds.list
+            .work/openwrt/files/etc/vermagic.txt
             .work/requested.config
             .work/openwrt/feeds.conf
             .work/openwrt/.config

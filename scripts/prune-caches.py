@@ -10,7 +10,8 @@ from urllib.parse import quote
 
 # Decimal GB leaves headroom below either interpretation of GitHub's 10 GB.
 BUDGET = 9_000_000_000
-MANAGED = re.compile(r"w1700k-v2-Linux-(?:X64|ARM64)-(?:dl|ccache|build|toolchain|npu)-")
+MANAGED = re.compile(r"w1700k-v2-(?:Linux-(?:X64|ARM64)-(?:dl|ccache|build|toolchain|npu)|shared-distfeeds)-")
+SHARED_PREFIX = "w1700k-v2-shared"
 
 
 def list_caches(repo, ref=None):
@@ -61,6 +62,8 @@ def reservation_plan(items, reservations, incoming, size, family, ref, budget=BU
 def reserve(kind, path, key):
     env = os.environ
     repo, ref, prefix = env["GH_REPO"], env["GITHUB_REF"], env["CACHE_PREFIX"]
+    if kind == "distfeeds":
+        prefix = SHARED_PREFIX
     family = f"{prefix}-{kind}-"
     if not MANAGED.match(key) or not key.startswith(family):
         raise ValueError("Unexpected cache namespace")
@@ -77,10 +80,9 @@ def reserve(kind, path, key):
     if remove is None:
         print(f"::warning::Skipping {kind} cache: free storage budget cannot accommodate it")
         return False
-    if kind == "npu" and any(item["id"] in remove and not item["key"].startswith(family) for item in items):
-        # NPU is saved before the other caches are restored. Rebuilding this
-        # tiny firmware is preferable to evicting a compiler/kernel snapshot.
-        print("Skipping NPU cache to preserve build caches until restoration")
+    if kind in ("npu", "distfeeds") and any(item["id"] in remove and not item["key"].startswith(family) for item in items):
+        # These small caches are saved before compiler/kernel caches are restored.
+        print(f"Skipping {kind} cache to preserve build caches until restoration")
         return False
     for cache_id in remove:
         subprocess.run(["gh", "api", "--method", "DELETE", f"repos/{repo}/actions/caches/{cache_id}"],
@@ -110,7 +112,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
     allocate = sub.add_parser("reserve")
-    allocate.add_argument("kind", choices=("npu", "toolchain", "build", "dl", "ccache"))
+    allocate.add_argument("kind", choices=("npu", "toolchain", "build", "dl", "ccache", "distfeeds"))
     allocate.add_argument("path", type=Path)
     allocate.add_argument("key")
     args = parser.parse_args()
@@ -132,7 +134,10 @@ def main():
                     "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}-{run}",
                     "npu": f"{prefix}-npu-{env['NPU_KEY']}"}
     items = list_caches(repo, ref)
-    for cache_id in candidates(items, prefix, replacements, ref):
+    remove = candidates(items, prefix, replacements, ref)
+    if env.get("DISTFEEDS_CACHE_KEY"):
+        remove += candidates(items, SHARED_PREFIX, {"distfeeds": env["DISTFEEDS_CACHE_KEY"]}, ref)
+    for cache_id in remove:
         subprocess.run(["gh", "api", "--method", "DELETE", f"repos/{repo}/actions/caches/{cache_id}"], check=True)
         print(f"Removed superseded cache {cache_id}")
     current = list_caches(repo)
