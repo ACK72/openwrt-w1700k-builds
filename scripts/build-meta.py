@@ -200,19 +200,21 @@ def keys(openwrt, npu):
     if not re.fullmatch(r"[a-f0-9]{32}", vermagic):
         raise ValueError("Missing or invalid official kernel vermagic")
     distfeeds = digest_paths(openwrt, ["files/etc/vermagic.txt", "files/etc/apk/repositories.d/distfeeds.list"])
-    build = hashlib.sha256((toolchain + config_digest(openwrt / ".config") + vermagic).encode()).hexdigest()
+    base_inputs = toolchain + config_digest(openwrt / ".config")
+    build_base = hashlib.sha256(base_inputs.encode()).hexdigest()
+    build = hashlib.sha256((base_inputs + vermagic).encode()).hexdigest()
     state = {
         "openwrt": git(openwrt, "rev-parse", "HEAD"),
         "npu": git(npu, "rev-parse", "HEAD"),
         "feeds": feeds, "builder": builder_hash, "toolchain": toolchain,
         "host": host_hash, "build": build,
         "config": digest_paths(openwrt, [".config"]), "channel": "ubi2-oc",
-        "distfeeds": distfeeds, "vermagic": vermagic,
+        "distfeeds": distfeeds, "vermagic": vermagic, "build_base": build_base,
     }
     fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
     state["fingerprint"] = fingerprint
     (openwrt.parent / "build-state.json").write_text(json.dumps(state, indent=2) + "\n")
-    print(f"toolchain={toolchain}\nbuild={build}\nfingerprint={fingerprint}")
+    print(f"toolchain={toolchain}\nbuild={build}\nbuild-base={build_base}\nfingerprint={fingerprint}")
 
 
 def manifest(openwrt, npu, output):

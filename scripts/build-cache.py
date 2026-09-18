@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -81,11 +82,20 @@ def products(root, kind):
     return [p.relative_to(root).as_posix() for p in paths]
 
 
+def configured_keys(root):
+    path = root.parent / "keys.env"
+    if not path.is_file():
+        return {}
+    return dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line)
+
+
 def save(root, cache, kind, key):
     entries = products(root, kind)
     cache.mkdir(parents=True, exist_ok=True)
     metadata = {"schema": SCHEMA, "kind": kind, "key": key, "workspace": str(root.resolve()),
                 "inputs": source_state(root)}
+    keys = configured_keys(root)
+    metadata.update({name: keys[name] for name in ("toolchain", "build-base") if name in keys})
     # No root signing keys, old configuration, source files, or output images.
     archive = cache / "products.tar.zst"
     subprocess.run(["tar", "--zstd", "-cf", str(archive) + ".tmp", "-C", str(root), *entries],
@@ -102,9 +112,22 @@ def restore(root, cache, kind, key):
         return False
     metadata = json.loads(state.read_text(encoding="utf-8"))
     if any(metadata.get(k) != v for k, v in
-           (("schema", SCHEMA), ("kind", kind), ("key", key), ("workspace", str(root.resolve())))):
+           (("schema", SCHEMA), ("kind", kind), ("workspace", str(root.resolve())))):
         print(f"Ignoring incompatible {kind} snapshot")
         return False
+    toolchain_only = False
+    if metadata.get("key") != key:
+        keys = configured_keys(root)
+        base = keys.get("build-base", "")
+        # A pre-distfeeds snapshot's key is exactly build-base. New snapshots
+        # record both identities. A changed vermagic must never restore targets.
+        legacy = metadata.get("key") == base
+        compatible = (metadata.get("build-base") == base
+                      and metadata.get("toolchain") == keys.get("toolchain"))
+        if kind != "build" or not re.fullmatch(r"[a-f0-9]{64}", base) or not (legacy or compatible):
+            print(f"Ignoring incompatible {kind} snapshot")
+            return False
+        toolchain_only = True
     # Cache products can contain absolute paths, so relocation is a cache miss.
     # Restore before download, which otherwise builds fresh flock/zstd and then
     # has their products replaced by an older snapshot.
@@ -114,10 +137,16 @@ def restore(root, cache, kind, key):
             raise RuntimeError(f"Unexpected build directory symlink: {target}")
         if target.exists():
             shutil.rmtree(target)
-    subprocess.run(["tar", "--zstd", "-xf", str(archive), "-C", str(root)], check=True)
+    command = ["tar", "--zstd", "-xf", str(archive), "-C", str(root)]
+    if toolchain_only:
+        command += ["--wildcards", "build_dir/host", "staging_dir/host",
+                    "build_dir/toolchain-*", "staging_dir/toolchain-*"]
+    subprocess.run(command, check=True)
+    restored_kind = "toolchain" if toolchain_only else kind
+    products(root, restored_kind)
     count = restore_mtimes(root, metadata["inputs"])
-    print(f"Restored {kind} products and {count} unchanged input timestamps")
-    return True
+    print(f"Restored {restored_kind} products and {count} unchanged input timestamps")
+    return restored_kind
 
 
 def main():
@@ -130,8 +159,10 @@ def main():
     args = parser.parse_args()
     if args.operation == "save":
         save(args.root, args.cache, args.kind, args.key)
-    elif restore(args.root, args.cache, args.kind, args.key):
-        (args.root.parent / "cache-restored").write_text(args.kind, encoding="utf-8")
+    else:
+        restored_kind = restore(args.root, args.cache, args.kind, args.key)
+        if restored_kind:
+            (args.root.parent / "cache-restored").write_text(restored_kind, encoding="utf-8")
 
 
 if __name__ == "__main__":

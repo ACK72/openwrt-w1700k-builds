@@ -130,7 +130,7 @@ def main():
     run = f"{env['GITHUB_RUN_ID']}-{env['GITHUB_RUN_ATTEMPT']}"
     replacements = {"dl": f"{prefix}-dl-{run}",
                     "ccache": f"{prefix}-ccache-{env['TOOLCHAIN_KEY']}-{run}",
-                    "build": f"{prefix}-build-{env['BUILD_KEY']}-{run}",
+                    "build": f"{prefix}-build-{env['BUILD_BASE_KEY']}-{env['BUILD_KEY']}-{run}",
                     "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}-{run}",
                     "npu": f"{prefix}-npu-{env['NPU_KEY']}"}
     items = list_caches(repo, ref)

@@ -81,6 +81,29 @@ class SourceTimestamps(unittest.TestCase):
             {"schema": 2, "kind": "build", "key": "key", "workspace": "/old/workspace"}))
         self.assertFalse(cache.restore(self.root, snapshot, "build", "key"))
 
+    def test_changed_vermagic_restores_only_toolchain_from_compatible_snapshot(self):
+        self.root = self.root / "openwrt"
+        self.root.mkdir()
+        snapshot = self.root / "cache"
+        snapshot.mkdir()
+        (snapshot / "products.tar.zst").write_bytes(b"fixture")
+        base, toolchain = "a" * 64, "b" * 64
+        (self.root.parent / "keys.env").write_text(f"build-base={base}\ntoolchain={toolchain}\n")
+        self.addCleanup((self.root.parent / "keys.env").unlink)
+        for old in ({"key": base}, {"key": "old-build", "build-base": base, "toolchain": toolchain}):
+            metadata = {"schema": 2, "kind": "build", "workspace": str(self.root.resolve()), "inputs": {}, **old}
+            (snapshot / "state.json").write_text(json.dumps(metadata))
+            with mock.patch.object(cache.subprocess, "run") as run, mock.patch.object(cache, "products") as products:
+                self.assertEqual(cache.restore(self.root, snapshot, "build", "new-build"), "toolchain")
+            self.assertEqual(run.call_args.args[0][-5:], ["--wildcards", "build_dir/host", "staging_dir/host",
+                                                        "build_dir/toolchain-*", "staging_dir/toolchain-*"])
+            products.assert_called_once_with(self.root, "toolchain")
+        metadata["build-base"] = "c" * 64
+        (snapshot / "state.json").write_text(json.dumps(metadata))
+        with mock.patch.object(cache.subprocess, "run") as run:
+            self.assertFalse(cache.restore(self.root, snapshot, "build", "new-build"))
+        run.assert_not_called()
+
     @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("zstd"), "requires Linux tar/zstd")
     def test_real_snapshot_roundtrip_preserves_products_and_new_sources(self):
         snapshot = self.root / "snapshot"
@@ -104,6 +127,28 @@ class SourceTimestamps(unittest.TestCase):
         self.assertTrue(cache.restore(self.root, snapshot, "toolchain", "toolchain-key"))
         self.assertTrue((self.root / "staging_dir/toolchain-test/bin/compiler").is_file())
         self.assertFalse((self.root / "build_dir/target-test").exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("zstd"), "requires Linux tar/zstd")
+    def test_real_toolchain_extraction_from_legacy_full_snapshot_excludes_targets(self):
+        self.root = self.root / "openwrt"
+        self.root.mkdir()
+        base = "a" * 64
+        snapshot = self.root / "snapshot"
+        for name in ("build_dir/host/tool", "staging_dir/host/bin/tool", "build_dir/toolchain-test/compiler",
+                     "staging_dir/toolchain-test/bin/compiler", "build_dir/target-test/kernel.o",
+                     "staging_dir/target-test/usr/lib/libtest.so", "staging_dir/hostpkg/bin/helper"):
+            path = self.root / name
+            path.parent.mkdir(parents=True)
+            path.write_text(name)
+        cache.save(self.root, snapshot, "build", base)
+        (self.root.parent / "keys.env").write_text(f"build-base={base}\ntoolchain={'b' * 64}\n")
+        self.addCleanup((self.root.parent / "keys.env").unlink)
+        self.assertEqual(cache.restore(self.root, snapshot, "build", "new-vermagic-build"), "toolchain")
+        self.assertTrue((self.root / "build_dir/toolchain-test/compiler").is_file())
+        self.assertTrue((self.root / "staging_dir/host/bin/tool").is_file())
+        self.assertFalse((self.root / "build_dir/target-test").exists())
+        self.assertFalse((self.root / "staging_dir/target-test").exists())
+        self.assertFalse((self.root / "staging_dir/hostpkg").exists())
 
 
 class CacheKeys(unittest.TestCase):
@@ -140,6 +185,7 @@ class CacheKeys(unittest.TestCase):
             third = state()
             self.assertEqual(second["toolchain"], third["toolchain"])
             self.assertNotEqual(second["build"], third["build"])
+            self.assertEqual(second["build_base"], third["build_base"])
             self.assertNotEqual(second["fingerprint"], third["fingerprint"])
 
     def test_new_unselected_feed_package_does_not_discard_build_state(self):

@@ -167,8 +167,11 @@ jobs:
         uses: actions/cache/restore@v6.1.0
         with:
           path: .cache/build
-          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-
+          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build-base }}-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build-base }}-${{ steps.keys.outputs.build }}-
+            ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-
+            ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build-base }}-
       - name: Restore compatible toolchain when no full build state exists
         if: steps.needed.outputs.build == 'true' && inputs.clean != true && steps.buildcache.outputs.cache-matched-key == ''
         uses: actions/cache/restore@v6.1.0
@@ -236,7 +239,7 @@ jobs:
         with:
           kind: build
           path: .cache/build
-          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build-base }}-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Save reusable downloads
         if: always() && steps.dl.outcome == 'success'
         continue-on-error: true
@@ -261,6 +264,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TOOLCHAIN_KEY: ${{ steps.keys.outputs.toolchain }}
           BUILD_KEY: ${{ steps.keys.outputs.build }}
+          BUILD_BASE_KEY: ${{ steps.keys.outputs.build-base }}
           NPU_KEY: ${{ steps.sources.outputs.npu-key }}
           DISTFEEDS_CACHE_KEY: ${{ steps.official.outputs.cache-key }}
         run: python3 scripts/prune-caches.py
