@@ -10,9 +10,9 @@ OPENWRT="$WORK/openwrt"
 NPU="$WORK/npu"
 OUT="$ROOT/artifacts"
 LOGS="$ROOT/logs"
-OPENWRT_REPO=${OPENWRT_REPO:-https://github.com/ACK72/openwrt.git}
-OPENWRT_REF=${OPENWRT_REF:-ubi2-oc}
-NPU_REPO=${NPU_REPO:-https://github.com/ACK72/airoha-npu-fdk.git}
+OPENWRT_REPO=${OPENWRT_REPO:-}
+OPENWRT_REF=${OPENWRT_REF:-w1700k-oc-rc}
+NPU_REPO=${NPU_REPO:-}
 NPU_REF=${NPU_REF:-main}
 CONFIG_FILE=${CONFIG_FILE:-$ROOT/configs/w1700k.config}
 export CCACHE_COMPILERCHECK=content
@@ -85,6 +85,8 @@ npu_key() {
 
 prepare() {
     local key
+    OPENWRT_REPO=${OPENWRT_REPO:-$(python3 "$ROOT/scripts/repositories.py" openwrt)}
+    NPU_REPO=${NPU_REPO:-$(python3 "$ROOT/scripts/repositories.py" airoha-npu-fdk)}
     checkout_source "$OPENWRT_REPO" "$OPENWRT_REF" "$OPENWRT" full
     checkout_source "$NPU_REPO" "$NPU_REF" "$NPU"
     for patch_file in "$ROOT"/patches/npu/*.patch; do
@@ -158,6 +160,11 @@ configure() {
     python3 "$ROOT/scripts/customize.py" apply "$OPENWRT" 2>&1 | tee "$LOGS/customizations.log"
     python3 "$ROOT/scripts/distfeeds.py" install "$CACHE/distfeeds" "$OPENWRT" 2>&1 | tee "$LOGS/distfeeds.log"
     cp "$profile" .config
+    if grep -q '@BUILDER_RELEASES_URL@' .config; then
+        local release_url
+        release_url=$(python3 "$ROOT/scripts/repositories.py" builder)
+        sed -i "s|@BUILDER_RELEASES_URL@|$release_url/releases|g" .config
+    fi
     printf 'CONFIG_CCACHE_DIR="%s"\n' "$CCACHE_DIR" >> .config
     # Validate Kconfig against the effective request, including builder overrides.
     cp .config "$WORK/requested.config"

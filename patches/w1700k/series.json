@@ -1,0 +1,10 @@
+{
+  "base": "e304e64c26e026127d5ef26ec3360f7bdc92f69c",
+  "description": "W1700K patches, applied after the complete fanboy ubi2-oc stack.",
+  "patches": [
+    {"file": "0001-hostapd-omit-MLO-link-ID-for-non-MLO-STA-VLAN-bindin.patch", "original": "9daeb623743a701821fda2c2c049298154183137"},
+    {"file": "0002-wifi-add-mt76-patches-to-improve-6-GHz-EHT320-perfor.patch", "original": "0a4696e1fd21129120b947b4378275d4002e1b6a"},
+    {"file": "0003-kernel-add-backports-for-EIP93-fixes.patch", "original": "5bb8b4d8807dffe0789ba46bdeebabcd9a7a27b6"},
+    {"file": "0004-package-bump-mt76-and-hostapd-releases-after-backpor.patch", "original": "3700cffc4fc64e6a68fa1016831f8ba7405ce103"}
+  ]
+}

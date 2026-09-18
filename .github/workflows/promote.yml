@@ -1,0 +1,32 @@
+name: Promote W1700K OC RC to stable
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# The same group as build.yml prevents RC composition/publication and promotion
+# from modifying the source branches or releases at the same time.
+concurrency:
+  group: w1700k-release
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Promote the latest successful RC without rebuilding
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OPENWRT_SSH_KEY: ${{ secrets.OPENWRT_SSH_KEY }}
+        run: python3 scripts/promote.py .work/promotion

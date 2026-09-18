@@ -9,7 +9,7 @@
 'require fs';
 'require ui';
 
-const repository = 'ACK72/openwrt-w1700k-builds';
+const repository = '@BUILDER_REPOSITORY@';
 const helper = '/usr/libexec/w1700k-upgrade';
 const boardInfo = rpc.declare({ object: 'system', method: 'board' });
 
@@ -77,6 +77,8 @@ return view.extend({
 	confirm: function(image) {
 		ui.showModal(_('Install verified firmware'), [
 			E('p', {}, image.name),
+			E('p', { 'class': 'alert-message warning', 'style': image.prerelease ? '' : 'display:none' },
+				_('You selected an RC image. This is a test release that has not been promoted to stable.')),
 			E('p', {}, _('SHA-256 and device compatibility checks passed.')),
 			E('code', { 'style': 'overflow-wrap:anywhere' }, image.sha256),
 			E('p', {}, image.keep === 'keep' ? _('Current settings will be kept.') : _('Current settings will be erased.')),
@@ -104,17 +106,24 @@ return view.extend({
 			throw new Error(_('Unexpected release list.'));
 		if (!result.releases.length)
 			throw new Error(_('No compatible published releases were found.'));
-		const select = E('select', { 'class': 'cbi-input-select' }, result.releases.map((release, i) =>
-			E('option', { 'value': i }, release.title)));
+		const releases = result.releases.slice().sort((a, b) => Number(!!a.prerelease) - Number(!!b.prerelease));
+		const warning = E('p', { 'class': 'alert-message warning',
+			'style': releases[0].prerelease ? '' : 'display:none' },
+			_('You selected an RC image. This is a test release that has not been promoted to stable.'));
+		const select = E('select', { 'class': 'cbi-input-select', 'change': function() {
+			warning.style.display = releases[Number(this.value)].prerelease ? '' : 'none';
+		} }, releases.map((release, i) =>
+			E('option', { 'value': i }, (release.prerelease ? '[RC] ' : '[Stable] ') + release.title)));
 		const keep = E('input', { 'type': 'checkbox', 'checked': true });
 		ui.showModal(_('Available W1700K releases'), [
 			E('p', {}, select),
+			warning,
 			E('p', {}, E('label', {}, [keep, ' ', _('Keep current settings')])),
 			E('p', {}, _('Back up your settings before upgrading.')),
 			E('div', { 'class': 'right' }, [
 				E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Cancel')),
 				' ', E('button', { 'class': 'btn cbi-button-positive', 'disabled': this.readonly,
-					'click': ui.createHandlerFn(this, () => this.download(result.releases[Number(select.value)], keep.checked))
+					'click': ui.createHandlerFn(this, () => this.download(releases[Number(select.value)], keep.checked))
 				}, _('Download and verify'))
 			])
 		]);

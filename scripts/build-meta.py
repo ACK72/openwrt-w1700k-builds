@@ -208,7 +208,7 @@ def keys(openwrt, npu):
         "npu": git(npu, "rev-parse", "HEAD"),
         "feeds": feeds, "builder": builder_hash, "toolchain": toolchain,
         "host": host_hash, "build": build,
-        "config": digest_paths(openwrt, [".config"]), "channel": "ubi2-oc",
+        "config": digest_paths(openwrt, [".config"]), "channel": "w1700k-oc-rc",
         "distfeeds": distfeeds, "vermagic": vermagic, "build_base": build_base,
     }
     fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
@@ -220,6 +220,10 @@ def keys(openwrt, npu):
 def manifest(openwrt, npu, output):
     state = json.loads((openwrt.parent / "build-state.json").read_text())
     state["build_type"] = "release"
+    stack_file = openwrt.parent / "source-stack.json"
+    state["source_stack"] = json.loads(stack_file.read_text(encoding="utf-8"))
+    if state["source_stack"]["source"] != state["openwrt"]:
+        raise ValueError("Build source differs from the composed RC")
     try:
         state["builder_commit"] = git(ROOT, "rev-parse", "--verify", "HEAD")
     except subprocess.CalledProcessError:

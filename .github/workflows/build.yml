@@ -1,4 +1,4 @@
-name: Release W1700K ubi2-oc
+name: Build W1700K OC RC
 
 on:
   schedule:
@@ -27,11 +27,37 @@ permissions:
 
 # Serialize both host architectures, including publication and retention.
 concurrency:
-  group: w1700k-release-${{ github.ref }}
+  group: w1700k-release
   cancel-in-progress: false
 
 jobs:
+  compose:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      source: ${{ steps.stack.outputs.source }}
+      artifact-name: source-stack-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compose official main, fanboy ubi2-oc and W1700K patches
+        id: stack
+        env:
+          OPENWRT_SSH_KEY: ${{ secrets.OPENWRT_SSH_KEY }}
+        run: |
+          test -n "$OPENWRT_SSH_KEY" || { echo 'Configure the source deploy key in OPENWRT_SSH_KEY first.' >&2; exit 1; }
+          python3 scripts/source-stack.py .work/source-stack .work/source-stack.json --publish
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: source-stack-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .work/source-stack.json
+          retention-days: 90
+          if-no-files-found: error
+
   clean-drafts:
+    needs: compose
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -49,14 +75,14 @@ jobs:
 
   build:
     if: github.ref == 'refs/heads/main'
-    needs: clean-drafts
+    needs: [compose, clean-drafts]
     runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 350
     permissions:
       contents: read
       actions: write
     env:
-      OPENWRT_REF: ubi2-oc
+      OPENWRT_REF: ${{ needs.compose.outputs.source }}
       NPU_REF: main
       CCACHE_MAXSIZE: 3G
     outputs:
@@ -69,10 +95,15 @@ jobs:
           persist-credentials: false
       - name: Identify host cache namespace
         run: echo "CACHE_PREFIX=w1700k-v2-${RUNNER_OS}-${RUNNER_ARCH}" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: ${{ needs.compose.outputs.artifact-name }}
+          path: .work
       - name: Validate release builder
         run: |
-          python3 -B -m unittest discover -s tests -v
-          for script in tests/*.sh; do bash "$script"; done
+          for script in scripts/*.sh; do bash -n "$script"; done
+          python3 -m compileall -q scripts
+          node --check package/w1700k-custom/overview.js
       - name: Reclaim space only when needed
         run: |
           available=$(df --output=avail -BG . | tail -1 | tr -dc '0-9')
@@ -202,7 +233,7 @@ jobs:
           kind: toolchain
           path: .cache/toolchain
           key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Compile release firmware
+      - name: Compile RC firmware
         if: steps.needed.outputs.build == 'true'
         run: bash scripts/build.sh compile
       - name: Validate firmware and preserve build provenance
@@ -277,6 +308,7 @@ jobs:
             logs/
             .work/openwrt/logs/
             .work/build-state.json
+            .work/source-stack.json
             .work/sources.env
             .work/feeds.lock
             .work/feed-packages.txt
@@ -292,7 +324,7 @@ jobs:
           retention-days: 7
 
   publish:
-    if: always() && !cancelled() && needs.build.outputs.built == 'true'
+    if: needs.build.result == 'success' && needs.build.outputs.built == 'true'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -306,7 +338,7 @@ jobs:
         with:
           name: ${{ needs.build.outputs.artifact-name }}
           path: release-payload
-      - name: Publish complete release and retain the latest three
+      - name: Publish RC prerelease and retain one image per channel
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

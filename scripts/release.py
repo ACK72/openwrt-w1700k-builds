@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate W1700K images, publish complete releases, then retain the newest three."""
+"""Publish validated RC images and retain one complete release per channel."""
 import argparse
 import hashlib
 import json
@@ -13,14 +13,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
-PREFIX = "w1700k-ubi2-oc-"
-TAG = re.compile(r"w1700k-ubi2-oc-[0-9]+-[0-9]+\Z")
+RC = "w1700k-oc-rc"
+STABLE = "w1700k-oc"
+PREFIX = RC + "-"
+TAG = re.compile(r"(w1700k-oc-rc|w1700k-oc|w1700k-ubi2-oc)-[0-9]+-[0-9]+\Z")
 DEVICE = "gemtek_w1700k-ubi"
 SUPPORTED_DEVICE = "gemtek,w1700k-ubi"
 TARGET = "airoha/an7581"
 MARKER = "<!-- w1700k-release:v1 -->"
 IMAGE_PREFIX = "openwrt-airoha-an7581-gemtek_w1700k-ubi-squashfs-sysupgrade-"
-RELEASE_IMAGE = re.compile(re.escape(IMAGE_PREFIX) + r"r[0-9]+\.itb\Z")
+RELEASE_IMAGE = re.compile(re.escape(IMAGE_PREFIX) + r"(w1700k-oc-rc|w1700k-oc)-r[0-9]+\.itb\Z")
+LEGACY_IMAGE = re.compile(re.escape(IMAGE_PREFIX) + r"r[0-9]+\.itb\Z")
+PROVENANCE = re.compile(r"<!-- w1700k-build:(\{[^\n]+\}) -->")
 
 
 def firmware_revision(root):
@@ -98,7 +102,9 @@ def prepare(root, output):
     # OpenWrt has already installed the selected packages in the FIT rootfs.
     # Renaming must preserve the validated image bytes, including fwtool metadata.
     revision = firmware_revision(root).split("-", 1)[0]
-    shutil.copy2(image, output / f"{IMAGE_PREFIX}{revision}.itb")
+    if manifest.get("channel") != RC:
+        raise ValueError("Only RC builds may be published automatically")
+    shutil.copy2(image, output / f"{IMAGE_PREFIX}{RC}-{revision}.itb")
     return manifest
 
 
@@ -152,16 +158,42 @@ def managed(release):
     return bool(TAG.fullmatch(release.get("tag_name", "")) and MARKER in (release.get("body") or ""))
 
 
+def channel(release):
+    match = TAG.fullmatch(release.get("tag_name", ""))
+    return (RC if match[1] == RC else STABLE) if match else None
+
+
+def provenance(release):
+    matches = PROVENANCE.findall(release.get("body") or "")
+    if len(matches) != 1:
+        raise ValueError("Missing or ambiguous build provenance")
+    data = json.loads(matches[0])
+    for name in ("builder_commit", "source"):
+        if not re.fullmatch(r"[a-f0-9]{40}", data.get(name, "")):
+            raise ValueError("Invalid build provenance commit")
+    for name in ("run_id", "build_attempt"):
+        if not re.fullmatch(r"[0-9]+", data.get(name, "")):
+            raise ValueError("Invalid build provenance run")
+    if not re.fullmatch(r"w1700k-oc-rc-source-[0-9]+-[0-9]+", data.get("source_tag", "")):
+        raise ValueError("Missing immutable source snapshot")
+    return data
+
+
 def complete(release):
     assets = {a["name"]: a for a in release.get("assets", []) if a.get("state") == "uploaded" and a.get("size", 0) > 0}
-    single_image = (len(release.get("assets", [])) == 1 and len(assets) == 1
-                    and bool(RELEASE_IMAGE.fullmatch(next(iter(assets)))))
-    # Count the previous multi-asset releases during migration so retention
-    # still keeps three working versions, rather than accumulating old ones.
-    legacy = (all(name in assets for name in ("SHA256SUMS", "packages.tar.zst", "public-key.pem"))
+    names = list(assets)
+    image_match = RELEASE_IMAGE.fullmatch(names[0]) if len(names) == 1 else None
+    single_image = (len(release.get("assets", [])) == 1 and image_match is not None
+                    and image_match[1] == channel(release)
+                    and bool(re.fullmatch(r"sha256:[a-f0-9]{64}", assets[names[0]].get("digest", ""))))
+    # Preserve one working legacy stable until the first manual promotion.
+    legacy = release.get("tag_name", "").startswith("w1700k-ubi2-oc-") and (
+              (len(assets) == 1 and bool(LEGACY_IMAGE.fullmatch(names[0]))) or
+              (all(name in assets for name in ("SHA256SUMS", "packages.tar.zst", "public-key.pem"))
               and ("build-info.tar.gz" in assets or "build-manifest.json" in assets)
-              and len([name for name in assets if name.endswith("-sysupgrade.itb")]) == 1)
-    return (managed(release) and not release.get("draft") and not release.get("prerelease")
+              and len([name for name in assets if name.endswith("-sysupgrade.itb")]) == 1))
+    return (managed(release) and not release.get("draft")
+            and release.get("prerelease") == (channel(release) == RC)
             and (single_image or legacy))
 
 
@@ -176,15 +208,18 @@ def clean_drafts(repo):
 
 def already_published(items, fingerprint):
     marker = f"<!-- fingerprint:{fingerprint} -->"
-    return any(complete(item) and marker in item["body"] for item in items)
+    builder = os.environ.get("GITHUB_SHA")
+    return any(complete(item) and channel(item) == RC and marker in item["body"]
+               and (not builder or provenance(item)["builder_commit"] == builder) for item in items)
 
 
-def prune_candidates(items, keep=3):
+def prune_candidates(items, keep=1):
     # Never remove drafts, unrelated tags, or an older working image before a
     # new release is complete. The workflow serializes publication across hosts.
     items = sorted((item for item in items if complete(item)),
                    key=lambda item: (item.get("published_at") or "", item["id"]), reverse=True)
-    return items[keep:]
+    return [item for kind in (STABLE, RC)
+            for item in [value for value in items if channel(value) == kind][keep:]]
 
 
 def release_notes(root, manifest, repo, run_id):
@@ -193,11 +228,12 @@ def release_notes(root, manifest, repo, run_id):
     if built_at.tzinfo is None:
         raise ValueError("Build timestamp must include a timezone")
     date = built_at.astimezone(timezone(timedelta(hours=9))).strftime("%Y.%m.%d")
-    title = f"ubi2-oc_{date}_{revision}"
+    title = f"{RC}_{date}_{revision}"
     changes = "\n".join("    " + line for line in manifest["changelog"])
     notes = (
         f"## {title}\n\n{changes}\n\n"
         f"{MARKER}\n<!-- fingerprint:{manifest['fingerprint']} -->\n"
+        f"<!-- w1700k-build:{json.dumps(manifest['release_provenance'], sort_keys=True)} -->\n"
     )
     return title, notes
 
@@ -210,12 +246,31 @@ def publish(root, output, repo, run_id, attempt, commit):
     manifest = prepare(root, output)
     if manifest.get("builder_commit") != commit:
         raise ValueError("Artifact was produced by a different builder commit")
+    stack = manifest.get("source_stack", {})
+    if stack.get("source") != manifest.get("openwrt") or stack.get("builder_commit") != commit:
+        raise ValueError("Artifact does not match the composed source stack")
+    manifest["release_provenance"] = {
+        "run_id": run_id, "build_attempt": attempt, "builder_commit": commit,
+        "source": manifest["openwrt"], "source_tag": stack.get("source_tag"),
+        "upstream": stack.get("upstream"), "fanboy": stack.get("fanboy"),
+        "patch_digest": stack.get("patch_digest"),
+    }
     tag = f"{PREFIX}{run_id}-{attempt}"
-    notes = output.parent / "release-notes.md"
     title, body = release_notes(root, manifest, repo, run_id)
+    provenance({"body": body})
+    current = stage_release(output, repo, tag, title, body, RC)
+    current = finish_release(repo, current, title, body, RC)
+    prune(repo, current)
+    print(f"https://github.com/{repo}/releases/tag/{tag}")
+
+
+def stage_release(output, repo, tag, title, body, kind):
+    if kind not in (RC, STABLE):
+        raise ValueError("Invalid release channel")
+    notes = output.parent / "release-notes.md"
     notes.write_text(body, encoding="utf-8")
     existing = next((item for item in releases(repo) if item["tag_name"] == tag), None)
-    if existing and (not managed(existing) or f"<!-- fingerprint:{manifest['fingerprint']} -->" not in existing["body"]):
+    if existing and (not managed(existing) or provenance(existing) != provenance({"body": body})):
         raise ValueError("Refusing to modify a release with a different identity")
     if not existing:
         # GITHUB_TOKEN cannot tag a historical commit whose workflow files
@@ -224,7 +279,8 @@ def publish(root, output, repo, run_id, attempt, commit):
         # Use the creation response: release lists may briefly omit new drafts.
         existing = json.loads(gh("api", "--method", "POST", f"repos/{repo}/releases",
                                  "-f", f"tag_name={tag}", "-f", "target_commitish=main",
-                                 "-F", "draft=true", "-F", "prerelease=false",
+                                 "-F", "draft=true", "-F", f"prerelease={str(kind == RC).lower()}",
+                                 "-f", "make_latest=false",
                                  "-f", f"name={title}", "-F", f"body=@{notes}"))
     # Drafts have an ID before their Git tag exists. Use that ID for all writes.
     endpoint = f"repos/{repo}/releases/{existing['id']}"
@@ -232,6 +288,7 @@ def publish(root, output, repo, run_id, attempt, commit):
     expected_names = {path.name for path in output.iterdir()}
     if any(name not in expected_names for name in actual):
         raise ValueError("Release contains unexpected assets; refusing to publish")
+    verified = []
     for path in sorted(output.iterdir()):
         asset = actual.get(path.name, {})
         digest = f"sha256:{sha256(path)}"
@@ -241,17 +298,41 @@ def publish(root, output, repo, run_id, attempt, commit):
             raise RuntimeError(f"Release asset upload incomplete: {path.name}")
         if asset.get("digest") != digest:
             raise RuntimeError(f"Release asset digest mismatch: {path.name}")
+        verified.append(asset)
+    existing["assets"] = verified
+    return existing
+
+
+def finish_release(repo, existing, title, body, kind):
+    endpoint = f"repos/{repo}/releases/{existing['id']}"
     current = existing
     if existing["draft"]:
-        current = json.loads(gh("api", "--method", "PATCH", endpoint, "-F", "draft=false", "-F", "prerelease=false",
-                                "-f", "target_commitish=main", "-f", "make_latest=true", "-f", f"name={title}", "-F", f"body=@{notes}"))
-    if current["tag_name"] != tag or not complete(current):
+        try:
+            current = json.loads(gh("api", "--method", "PATCH", endpoint, "-F", "draft=false",
+                                    "-F", f"prerelease={str(kind == RC).lower()}",
+                                    "-f", "target_commitish=main", "-f", f"make_latest={str(kind == STABLE).lower()}",
+                                    "-f", f"name={title}", "-f", f"body={body}"))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # A lost response is not evidence that the server rejected publication.
+            current = json.loads(gh("api", endpoint))
+    if not publication_matches(existing, current):
         raise RuntimeError("Published release could not be verified; retaining all previous releases")
+    return current
+
+
+def publication_matches(expected, current):
+    def identity(item):
+        return sorted((a["name"], a["size"], a.get("digest")) for a in item.get("assets", []))
+    return (current["id"] == expected["id"] and current["tag_name"] == expected["tag_name"]
+            and complete(current) and identity(current) == identity(expected)
+            and provenance(current) == provenance(expected))
+
+
+def prune(repo, current):
     # The mutation response is authoritative even if the list is still stale.
     items = [item for item in releases(repo) if item["id"] != current["id"]] + [current]
     for old in prune_candidates(items):
         gh("release", "delete", old["tag_name"], "--repo", repo, "--cleanup-tag", "--yes")
-    print(f"https://github.com/{repo}/releases/tag/{tag}")
 
 
 def main():

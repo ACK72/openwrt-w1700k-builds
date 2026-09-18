@@ -6,7 +6,7 @@
 set -eu
 umask 077
 
-REPOSITORY='ACK72/openwrt-w1700k-builds'
+REPOSITORY='@BUILDER_REPOSITORY@'
 STATE_DIR='/tmp/w1700k-upgrade'
 IMAGE="$STATE_DIR/firmware.itb"
 STATE="$STATE_DIR/state.json"
@@ -40,7 +40,7 @@ fetch() {
 }
 
 valid_tag() {
-    printf '%s\n' "$1" | grep -Eq '^w1700k-ubi2-oc-[0-9]+-[0-9]+$'
+    printf '%s\n' "$1" | grep -Eq '^w1700k-oc(-rc)?-[0-9]+-[0-9]+$'
 }
 
 valid_digest() {
@@ -76,17 +76,24 @@ check_image() {
 release_list() {
     # Restrict URLs, filenames, tags, sizes and digests before offering an image.
     jq -ce --arg repo "$REPOSITORY" --argjson max "$MAX_SIZE" '
-        [ .[] | select(.draft == false and .prerelease == false)
-          | select(.tag_name | test("^w1700k-ubi2-oc-[0-9]+-[0-9]+$"))
+        [ .[] | select(.draft == false)
+          | select(.tag_name | test("^w1700k-oc(-rc)?-[0-9]+-[0-9]+$"))
           | . as $release
-          | [.assets[] | select(.name | test("^openwrt-airoha-an7581-gemtek_w1700k-ubi-squashfs-sysupgrade-r[0-9]+[.]itb$"))] as $images
+          | (.tag_name | startswith("w1700k-oc-rc-")) as $rc
+          | select(.prerelease == $rc)
+          | (if $rc then "w1700k-oc-rc" else "w1700k-oc" end) as $channel
+          | [.assets[] | select(.state == "uploaded")
+             | select(.name | test("^openwrt-airoha-an7581-gemtek_w1700k-ubi-squashfs-sysupgrade-" + $channel + "-r[0-9]+[.]itb$"))] as $images
           | select($images | length == 1) | $images[0] as $image
           | select(($image.digest // "") | test("^sha256:[a-f0-9]{64}$"))
           | select($image.size > 0 and $image.size <= $max)
           | select($image.browser_download_url == ("https://github.com/" + $repo + "/releases/download/" + .tag_name + "/" + $image.name))
           | {tag:.tag_name, title:(.name // .tag_name), published:.published_at,
+             channel:$channel, prerelease:$rc,
              name:$image.name, size:$image.size, sha256:($image.digest | ltrimstr("sha256:")),
-             url:$image.browser_download_url} ] | sort_by(.published) | reverse | .[:3]'
+             url:$image.browser_download_url} ]
+        | group_by(.channel) | map(sort_by(.published) | last)
+        | sort_by(.prerelease)'
 }
 
 worker() {

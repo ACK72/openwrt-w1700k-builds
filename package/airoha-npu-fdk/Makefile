@@ -17,8 +17,8 @@ STRIP:=:
 define Package/airoha-en7581-mt7996-npu-firmware
   SECTION:=firmware
   CATEGORY:=Firmware
-  TITLE:=Airoha AN7581/MT7996 NPU firmware built from ACK72 FDK
-  URL:=https://github.com/ACK72/airoha-npu-fdk
+  TITLE:=Airoha AN7581/MT7996 NPU firmware built from source
+  URL:=https://github.com/hurryman2212/airoha-npu-fdk
   DEPENDS:=@TARGET_airoha_an7581
 endef
 

@@ -1,0 +1,37 @@
+From 3700cffc4fc64e6a68fa1016831f8ba7405ce103 Mon Sep 17 00:00:00 2001
+From: ACK72 <acikom72@gmail.com>
+Date: Thu, 17 Sep 2026 01:43:52 +0900
+Subject: [PATCH 4/4] package: bump mt76 and hostapd releases after backports
+
+Increase mt76 PKG_RELEASE from 1 to 2 and hostapd PKG_RELEASE from 2 to 3 to identify package builds containing the imported fixes.
+---
+ package/kernel/mt76/Makefile              | 2 +-
+ package/network/services/hostapd/Makefile | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
+index 753a4b581a..2265a8fec8 100644
+--- a/package/kernel/mt76/Makefile
++++ b/package/kernel/mt76/Makefile
+@@ -1,7 +1,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=mt76
+-PKG_RELEASE=1
++PKG_RELEASE=2
+ 
+ PKG_LICENSE:=BSD-3-Clause-Clear
+ PKG_LICENSE_FILES:=
+diff --git a/package/network/services/hostapd/Makefile b/package/network/services/hostapd/Makefile
+index 1d6fc3e2f8..c9b6c972d4 100644
+--- a/package/network/services/hostapd/Makefile
++++ b/package/network/services/hostapd/Makefile
+@@ -5,7 +5,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=hostapd
+-PKG_RELEASE:=2
++PKG_RELEASE:=3
+ 
+ PKG_SOURCE_URL:=https://w1.fi/hostap.git
+ PKG_SOURCE_PROTO:=git

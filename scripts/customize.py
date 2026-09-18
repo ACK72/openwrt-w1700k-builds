@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from repositories import builder_repository
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / 'package/w1700k-custom'
@@ -13,6 +14,10 @@ VIEW = 'htdocs/luci-static/resources/view/attendedsysupgrade/overview.js'
 RUNTIME_COMMANDS = ('sh', 'ls', 'awk', 'chmod', 'mkdir', 'mv', 'rm', 'rmdir',
                     'jq', 'curl', 'grep', 'sha256sum', 'wc', 'tr', 'df', 'sleep',
                     'ubus', 'uci', 'sysupgrade', 'devmem', 'cat')
+
+
+def rendered(source):
+    return source.read_bytes().replace(b'@BUILDER_REPOSITORY@', builder_repository().encode())
 
 
 def apply(openwrt):
@@ -27,7 +32,7 @@ def apply(openwrt):
             subprocess.run([*command, str(patch)], check=True)
         elif subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode:
             raise RuntimeError(f'LuCI patch no longer applies: {patch.name}')
-    shutil.copyfile(PACKAGE / 'overview.js', view)
+    view.write_bytes(rendered(PACKAGE / 'overview.js'))
     # The stock ASU ACL grants upgrade_start to read-only users. Keep firmware
     # installation in the write scope alongside our authenticated helper.
     acl_path = attended / 'root/usr/share/rpcd/acl.d/luci-app-attendedsysupgrade.json'
@@ -41,6 +46,8 @@ def apply(openwrt):
     acl_path.write_text(json.dumps(acl, indent=2) + '\n', encoding='utf-8')
     overlay = openwrt / 'files'
     shutil.copytree(PACKAGE / 'root', overlay, dirs_exist_ok=True)
+    helper = overlay / 'usr/libexec/w1700k-upgrade'
+    helper.write_bytes(rendered(PACKAGE / 'root/usr/libexec/w1700k-upgrade'))
     for script in [overlay / 'usr/libexec/w1700k-upgrade', *(overlay / 'etc').glob('*.sh')]:
         script.chmod(0o755)
     licenses = overlay / 'usr/share/licenses/w1700k-custom'
@@ -65,14 +72,14 @@ def verify(openwrt):
             continue
         relative = source.relative_to(PACKAGE / 'root')
         target = root / relative
-        if not target.is_file() or source.read_bytes() != target.read_bytes():
+        if not target.is_file() or rendered(source) != target.read_bytes():
             raise RuntimeError(f'Customization missing or changed in rootfs: {relative}')
         # Windows fixtures have no POSIX executable bits; release builds run on Linux.
         if os.name != 'nt' and (relative.suffix == '.sh' or relative.name == 'w1700k-upgrade') and not target.stat().st_mode & 0o111:
             raise RuntimeError(f'Customization is not executable: {relative}')
     view = (root / 'www/luci-static/resources/view/attendedsysupgrade/overview.js').read_text(encoding='utf-8')
     channel = (root / 'www/luci-static/resources/view/status/channel_analysis.js').read_text(encoding='utf-8')
-    if 'ACK72/openwrt-w1700k-builds' not in view or '/usr/libexec/w1700k-upgrade' not in view:
+    if builder_repository() not in view or '/usr/libexec/w1700k-upgrade' not in view:
         raise RuntimeError('Release upgrade view is missing from image rootfs')
     if 'channelsForRadio' not in channel or 'scanInterface' not in channel:
         raise RuntimeError('Single-wiphy fix is missing from image rootfs')
