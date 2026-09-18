@@ -26,7 +26,7 @@ Gemtek W1700K용 `ubi2-oc` 커스텀 펌웨어입니다. OpenWrt, Airoha NPU 펌
 
 `w1700k/builds`의 `ubi2-oc` 패키지 구성을 사용합니다. LuCI, NPU·Wi-Fi 7·MLO·팬 제어, 파일 관리자, 웹 터미널, 속도 측정, 패키지 관리와 업그레이드 도구가 이미지에 포함됩니다. 별도 패키지 파일을 합치거나 설치할 필요가 없습니다.
 
-펌웨어 업데이트에는 이 저장소의 ITB를 사용하세요. 공개 snapshot 저장소의 커널 모듈(`kmod`)과 외부 Attended Sysupgrade 서버가 만드는 이미지는 이 커스텀 펌웨어와 호환되지 않을 수 있습니다.
+펌웨어와 포함 패키지는 이 저장소의 ITB로 함께 업데이트하세요. 공개 snapshot 저장소의 커널 모듈(`kmod`)과 외부 Attended Sysupgrade 서버의 이미지는 이 커스텀 펌웨어와 호환되지 않을 수 있습니다.
 
 문제가 생기면 [Issues](https://github.com/ACK72/openwrt-w1700k-builds/issues)에 릴리즈 이름, 기기 버전, 증상과 재현 방법을 남겨 주세요. 로그의 비밀번호·개인정보는 제거해 주세요.
 

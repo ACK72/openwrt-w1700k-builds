@@ -5,7 +5,7 @@ on:
     - cron: '17 18 * * *'
   push:
     branches: [main]
-    paths: ['.github/workflows/build.yml', 'scripts/**', 'configs/**', 'package/**', 'patches/**']
+    paths: ['.github/workflows/build.yml', '.github/actions/**', 'scripts/**', 'configs/**', 'package/**', 'patches/**']
   workflow_dispatch:
     inputs:
       runner:
@@ -98,8 +98,9 @@ jobs:
         run: bash scripts/build.sh npu
       - name: Save paired NPU firmware
         if: steps.npu.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6.1.0
+        uses: ./.github/actions/save-cache
         with:
+          kind: npu
           path: .cache/npu
           key: ${{ env.CACHE_PREFIX }}-npu-${{ steps.sources.outputs.npu-key }}
       - name: Resolve feeds and validate release configuration
@@ -174,8 +175,9 @@ jobs:
         run: bash scripts/build.sh toolchain
       - name: Save successful toolchain before firmware compilation
         if: steps.tools.outcome == 'success' && steps.restored.outputs.kind == 'none'
-        uses: actions/cache/save@v6.1.0
+        uses: ./.github/actions/save-cache
         with:
+          kind: toolchain
           path: .cache/toolchain
           key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Compile release firmware
@@ -211,22 +213,25 @@ jobs:
       - name: Save successful incremental build state
         if: steps.snapshot.outcome == 'success'
         continue-on-error: true
-        uses: actions/cache/save@v6.1.0
+        uses: ./.github/actions/save-cache
         with:
+          kind: build
           path: .cache/build
           key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Save reusable downloads
         if: always() && steps.dl.outcome == 'success'
         continue-on-error: true
-        uses: actions/cache/save@v6.1.0
+        uses: ./.github/actions/save-cache
         with:
+          kind: dl
           path: .cache/dl
           key: ${{ env.CACHE_PREFIX }}-dl-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Save compiler cache, including clean builds
         if: always() && steps.tools.outcome == 'success'
         continue-on-error: true
-        uses: actions/cache/save@v6.1.0
+        uses: ./.github/actions/save-cache
         with:
+          kind: ccache
           path: .cache/ccache
           key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Retain only caches whose replacement was successfully saved

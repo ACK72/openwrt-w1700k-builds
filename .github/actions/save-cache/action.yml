@@ -1,0 +1,30 @@
+name: Save cache within the free storage budget
+description: Account for existing caches and reserve space before upload
+inputs:
+  path:
+    required: true
+    description: Cache directory
+  key:
+    required: true
+    description: Immutable cache key
+  kind:
+    required: true
+    description: Cache family
+runs:
+  using: composite
+  steps:
+    - name: Reserve cache storage
+      id: budget
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+        CACHE_PATH: ${{ inputs.path }}
+        CACHE_KEY: ${{ inputs.key }}
+        CACHE_KIND: ${{ inputs.kind }}
+      run: python3 scripts/prune-caches.py reserve "$CACHE_KIND" "$CACHE_PATH" "$CACHE_KEY"
+    - uses: actions/cache/save@v6.1.0
+      if: steps.budget.outputs.save == 'true'
+      with:
+        path: ${{ inputs.path }}
+        key: ${{ inputs.key }}

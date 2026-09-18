@@ -1,10 +1,12 @@
 """Regression tests for incremental reuse without hiding changed build inputs."""
 import importlib.util
+import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -132,6 +134,52 @@ class CacheKeys(unittest.TestCase):
 
 
 class CacheRetention(unittest.TestCase):
+    def item(self, number, kind, size, ref="refs/heads/main", host="X64"):
+        return {"id": number, "key": f"w1700k-v2-Linux-{host}-{kind}-{number}",
+                "size_in_bytes": size, "ref": ref, "last_accessed_at": str(number)}
+
+    def plan(self, items, size, reservations=None):
+        return prune.reservation_plan(items, reservations or {}, "w1700k-v2-Linux-X64-build-new",
+                                      size, "w1700k-v2-Linux-X64-build-", "refs/heads/main")
+
+    def test_current_real_sizes_require_replacing_old_snapshot_before_upload(self):
+        items = [self.item(1, "build", 5_021_524_373), self.item(2, "dl", 1_545_716_047),
+                 self.item(3, "ccache", 707_094_988)]
+        remove = self.plan(items, 5_200_000_000)
+        self.assertEqual(remove, [1])
+        self.assertLess(sum(i["size_in_bytes"] for i in items if i["id"] not in remove) + 5_200_000_000,
+                        prune.BUDGET)
+
+    def test_no_eviction_when_all_cache_generations_fit(self):
+        self.assertEqual(self.plan([self.item(1, "build", 1_000_000_000)], 1_000_000_000), [])
+
+    def test_pending_uploads_are_counted_even_when_rest_listing_is_stale(self):
+        reservations = {"w1700k-v2-Linux-X64-dl-new": 5_000_000_000}
+        self.assertIsNone(self.plan([], 5_000_000_000, reservations))
+
+    def test_confirmed_upload_is_not_double_counted_or_evicted(self):
+        item = self.item(1, "build", 5_000_000_000)
+        reservations = {item["key"]: 5_100_000_000}
+        self.assertEqual(self.plan([item], 3_000_000_000, reservations), [])
+        self.assertIsNone(self.plan([item], 5_000_000_000, reservations))
+
+    def test_architectures_share_budget_but_unrelated_and_other_branch_caches_are_preserved(self):
+        arm = self.item(1, "build", 5_000_000_000, host="ARM64")
+        self.assertEqual(self.plan([arm], 5_000_000_000), [1])
+        arm["ref"] = "refs/heads/topic"
+        self.assertIsNone(self.plan([arm], 5_000_000_000))
+        arm["ref"], arm["key"] = "refs/heads/main", "unrelated-cache"
+        self.assertIsNone(self.plan([arm], 5_000_000_000))
+
+    def test_oversized_cache_skips_upload_without_evicting_anything(self):
+        self.assertIsNone(self.plan([self.item(1, "build", 1)], prune.BUDGET + 1))
+
+    def test_upload_bound_accounts_for_metadata_and_compression_expansion(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "archive.zst").write_bytes(os.urandom(1000))
+            self.assertGreater(prune.upload_bound(root), 1000 + 64 * 1024**2)
+
     def test_never_deletes_last_good_cache_when_new_upload_is_missing(self):
         items = [{"id": 1, "key": "ours-build-old", "ref": "refs/heads/main"}]
         self.assertEqual(prune.candidates(items, "ours", {"build": "ours-build-new"}, "refs/heads/main"), [])
@@ -142,6 +190,55 @@ class CacheRetention(unittest.TestCase):
             (3, "other-build-old", "refs/heads/main"), (4, "ours-build-old", "refs/heads/topic"),
             (5, "ours-toolchain-old", "refs/heads/main"))]
         self.assertEqual(prune.candidates(items, "ours", {"build": "ours-build-new"}, "refs/heads/main"), [1])
+
+
+class CacheReservation(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        previous = Path.cwd()
+        os.chdir(self.root)
+        self.addCleanup(os.chdir, previous)
+        self.env = mock.patch.dict(os.environ, {
+            "GH_REPO": "owner/repo", "GITHUB_REF": "refs/heads/main",
+            "CACHE_PREFIX": "w1700k-v2-Linux-X64", "GITHUB_OUTPUT": str(self.root / "output"),
+        })
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def test_replaces_old_snapshot_and_records_pending_upload(self):
+        key = "w1700k-v2-Linux-X64-build-new"
+        old = {"id": 1, "key": "w1700k-v2-Linux-X64-build-old",
+               "ref": "refs/heads/main", "size_in_bytes": 5_000_000_000}
+        with mock.patch.object(prune, "list_caches", return_value=[old]), \
+                mock.patch.object(prune, "upload_bound", return_value=5_100_000_000), \
+                mock.patch.object(prune.subprocess, "run") as run:
+            self.assertTrue(prune.reserve("build", self.root, key))
+        run.assert_called_once_with(
+            ["gh", "api", "--method", "DELETE", "repos/owner/repo/actions/caches/1"],
+            check=True, timeout=60)
+        self.assertEqual(json.loads((self.root / ".work/cache-budget.json").read_text()),
+                         {key: 5_100_000_000})
+
+    def test_early_npu_upload_preserves_build_cache_before_restore(self):
+        old = {"id": 1, "key": "w1700k-v2-Linux-X64-build-old",
+               "ref": "refs/heads/main", "size_in_bytes": prune.BUDGET}
+        with mock.patch.object(prune, "list_caches", return_value=[old]), \
+                mock.patch.object(prune, "upload_bound", return_value=100_000_000), \
+                mock.patch.object(prune.subprocess, "run") as run:
+            self.assertFalse(prune.reserve("npu", self.root, "w1700k-v2-Linux-X64-npu-new"))
+        run.assert_not_called()
+        self.assertFalse((self.root / ".work/cache-budget.json").exists())
+
+    def test_api_failure_disables_upload_instead_of_ignoring_budget(self):
+        with mock.patch.object(sys, "argv", ["prune-caches.py", "reserve", "build", ".",
+                                            "w1700k-v2-Linux-X64-build-new"]), \
+                mock.patch.object(prune, "list_caches", side_effect=OSError("API unavailable")), \
+                mock.patch.object(prune.subprocess, "run") as run:
+            prune.main()
+        run.assert_not_called()
+        self.assertEqual((self.root / "output").read_text(), "save=false\n")
 
 
 if __name__ == "__main__":
