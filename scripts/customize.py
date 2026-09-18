@@ -10,6 +10,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / 'package/w1700k-custom'
 VIEW = 'htdocs/luci-static/resources/view/attendedsysupgrade/overview.js'
+RUNTIME_COMMANDS = ('sh', 'ls', 'awk', 'chmod', 'mkdir', 'mv', 'rm', 'rmdir',
+                    'jq', 'curl', 'grep', 'sha256sum', 'wc', 'tr', 'df', 'sleep',
+                    'ubus', 'uci', 'sysupgrade', 'devmem', 'cat')
 
 
 def apply(openwrt):
@@ -53,6 +56,10 @@ def verify(openwrt):
     if len(roots) != 1:
         raise RuntimeError('Expected one compiled Airoha root filesystem')
     root = roots[0]
+    for command in RUNTIME_COMMANDS:
+        paths = [root / directory / command for directory in ('bin', 'sbin', 'usr/bin', 'usr/sbin')]
+        if not any(path.is_file() or path.is_symlink() for path in paths):
+            raise RuntimeError(f'Customization runtime command missing from rootfs: {command}')
     for source in (PACKAGE / 'root').rglob('*'):
         if not source.is_file():
             continue

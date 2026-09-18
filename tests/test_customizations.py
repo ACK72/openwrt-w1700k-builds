@@ -41,6 +41,9 @@ class Customizations(unittest.TestCase):
         channel = image / 'www/luci-static/resources/view/status/channel_analysis.js'
         channel.parent.mkdir(parents=True)
         channel.write_text('channelsForRadio scanInterface')
+        (image / 'bin').mkdir()
+        for command in custom.RUNTIME_COMMANDS:
+            (image / 'bin' / command).write_bytes(b'fixture executable')
         return image
 
     def test_imports_executable_tools_and_license_notices(self):
@@ -65,6 +68,13 @@ class Customizations(unittest.TestCase):
         image = self.image()
         (image / 'www/luci-static/resources/view/status/channel_analysis.js').write_text('old channel view')
         with self.assertRaisesRegex(RuntimeError, 'Single-wiphy'):
+            custom.verify(self.root)
+
+    def test_missing_runtime_tool_blocks_release(self):
+        self.install()
+        image = self.image()
+        (image / 'bin/curl').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'runtime command missing.*curl'):
             custom.verify(self.root)
 
     def test_patch_drift_is_fatal_instead_of_silently_ignored(self):

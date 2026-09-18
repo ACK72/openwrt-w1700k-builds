@@ -56,7 +56,8 @@ esac
 esac
 ''')
         self.script('sleep', 'exit 0\n')
-        self.script('stat', 'echo 0\n')
+        self.script('stat', 'echo "stat is not installed on the router" >&2; exit 127\n')
+        self.script('ls', 'printf "drwx------ 2 %s 0 4096 Sep 18 00:00 state\\n" "${STATE_OWNER:-0}"\n')
         text = HELPER.read_text().replace("STATE_DIR='/tmp/w1700k-upgrade'", f"STATE_DIR='{self.state.as_posix()}'")
         # Git Bash prepends its system tools when importing a Windows PATH.
         # Resolve the mock directory inside the shell so no real curl is used.
@@ -171,6 +172,13 @@ esac
                                 text=True, capture_output=True, timeout=3)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('already running', result.stderr)
+
+    def test_state_directory_owned_by_another_user_is_rejected(self):
+        self.env['STATE_OWNER'] = '1000'
+        result = subprocess.run(['bash', str(self.helper), 'list'], env=self.env,
+                                text=True, capture_output=True, timeout=3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.state / 'lock').exists())
 
 
 if __name__ == '__main__':

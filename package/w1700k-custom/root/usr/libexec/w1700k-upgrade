@@ -16,7 +16,10 @@ API="https://api.github.com/repos/$REPOSITORY/releases"
 ensure_directory() {
     [ ! -L "$STATE_DIR" ] || exit 1
     mkdir -p "$STATE_DIR"
-    [ "$(stat -c '%u' "$STATE_DIR")" = 0 ] || exit 1
+    # The reference BusyBox configuration omits stat; ls -n reports numeric IDs.
+    # Only read the owner field of this fixed directory, never a filename.
+    # shellcheck disable=SC2012
+    [ "$(ls -nd "$STATE_DIR" | awk '{print $3}')" = 0 ] || exit 1
     chmod 700 "$STATE_DIR"
 }
 
