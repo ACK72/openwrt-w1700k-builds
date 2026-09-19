@@ -13,10 +13,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLCHAIN_INPUTS = (
-    "tools", "toolchain", "include", "config", "target/Config.in", "target/Makefile",
-    "target/linux/Makefile", "target/linux/airoha", "target/linux/generic", "scripts",
-    "Makefile", "rules.mk", "Config.in", ".config",
+    "tools", "toolchain", "include", "scripts", "Makefile", "rules.mk",
+    "target/Config.in", "target/Makefile", "target/linux/Makefile",
+    "target/linux/airoha/Makefile", "target/linux/airoha/an7581/target.mk",
 )
+KERNEL_INPUTS = ("target/linux/airoha", "target/linux/generic", "package/kernel/linux")
 PACKAGE = "airoha-en7581-mt7996-npu-firmware"
 BINARIES = ("en7581_MT7996_npu_rv32.bin", "en7581_MT7996_npu_data.bin")
 REQUIRED_CONFIG = (
@@ -60,15 +61,61 @@ def read_config(path):
     return values
 
 
-def config_digest(path, toolchain=False):
+def config_digest(path, toolchain=False, symbols=None):
     """Package selection and release labels do not change compiler binaries."""
     values = read_config(path)
-    ignored = ("CONFIG_VERSION_", "CONFIG_PACKAGE_") if toolchain else ("CONFIG_VERSION_",)
+    ignored = ("CONFIG_VERSION_", "CONFIG_PACKAGE_") if toolchain and symbols is None else ("CONFIG_VERSION_",)
     # Feeds frequently add unselected packages. An absent boolean and an
     # explicitly disabled boolean are equivalent after make defconfig.
     values = {key: value for key, value in values.items()
               if value != "n" and not key.startswith(ignored)}
+    if toolchain:
+        # Kernel runtime options and userspace configuration do not change the
+        # compiler. Kernel source selection still changes exported libc headers.
+        values = {key: value for key, value in values.items()
+                  if not key.startswith(("CONFIG_BUSYBOX_", "CONFIG_DEFAULT_"))
+                  and (not key.startswith("CONFIG_KERNEL_") or key.startswith("CONFIG_KERNEL_GIT_"))
+                  and (symbols is None or key in symbols)}
     return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+
+def toolchain_inputs(openwrt):
+    tracked = git(openwrt, "ls-files", "--", *TOOLCHAIN_INPUTS,
+                  "target/linux/generic/kernel-*").splitlines()
+    # kernel-headers overrides PATCH_DIR with toolchain/kernel-headers/patches.
+    # Runtime target patches are not applied to the toolchain's exported headers.
+    target = (openwrt / "target/linux/airoha/Makefile").read_text()
+    versions = re.findall(r"^KERNEL_(?:TESTING_)?PATCHVER\s*:?=\s*(\S+)", target, re.M)
+    tracked = [name for name in tracked if not name.startswith("target/linux/generic/kernel-")
+               or name.rsplit("kernel-", 1)[1] in versions]
+    return tracked
+
+
+def kernel_inputs(openwrt):
+    tracked = git(openwrt, "ls-files", "--", *KERNEL_INPUTS).splitlines()
+    versions = {name.rsplit("kernel-", 1)[1] for name in toolchain_inputs(openwrt)
+                if name.startswith("target/linux/generic/kernel-")}
+    return [name for name in tracked if not (match := re.search(
+        r"/(?:backport|pending|hack|patches|files|config|kernel)-(\d+\.\d+)(?:/|$)", name))
+        or match[1] in versions]
+
+
+def toolchain_symbols(openwrt, tracked):
+    symbols = set()
+    for name in tracked:
+        path = openwrt / name
+        if path.is_symlink() or path.suffix in (".patch", ".gz", ".xz"):
+            continue
+        text = path.read_text(errors="replace")
+        symbols.update(re.findall(r"\bCONFIG_[A-Za-z0-9_]+", text))
+        symbols.update("CONFIG_" + item for item in re.findall(
+            r"^\s*(?:menuconfig|config)\s+([A-Za-z0-9_]+)", text, re.M))
+    # Computed Make variable names and generated target identities.
+    symbols.update(key for key in read_config(openwrt / ".config")
+                   if key.startswith(("CONFIG_TARGET_", "CONFIG_GCC_", "CONFIG_BINUTILS_",
+                                      "CONFIG_LIBC_", "CONFIG_MUSL_", "CONFIG_TOOLCHAIN_",
+                                      "CONFIG_KERNEL_GIT_")))
+    return symbols
 
 
 def target_packages(openwrt):
@@ -187,12 +234,13 @@ def keys(openwrt, npu):
     )
     # Use tracked inputs only: generated conf binaries and pycache must not
     # invalidate a toolchain cache after make defconfig.
-    tracked = git(openwrt, "ls-files", "--", *TOOLCHAIN_INPUTS).splitlines()
+    tracked = toolchain_inputs(openwrt)
     source_hash = digest_paths(openwrt, tracked)
-    builder_hash = digest_paths(ROOT, ["scripts", "configs", "package", "patches", ".github", "LICENSES"])
+    builder_hash = digest_paths(ROOT, ["scripts", "configs", "package", "patches", ".github", "LICENSES", "containers"])
     host_hash = hashlib.sha256((platform.machine() + host).encode()).hexdigest()
+    tool_config = config_digest(openwrt / ".config", True, toolchain_symbols(openwrt, tracked))
     toolchain = hashlib.sha256(
-        ("toolchain-v2" + source_hash + host_hash + config_digest(openwrt / ".config", True)).encode()
+        ("toolchain-v3" + source_hash + host_hash + tool_config).encode()
     ).hexdigest()
     # Feed-list changes require a new image, but only a changed kernel identity
     # invalidates kernel/package products. Both keep the compiler/toolchain cache.
@@ -202,7 +250,8 @@ def keys(openwrt, npu):
     distfeeds = digest_paths(openwrt, ["files/etc/vermagic.txt", "files/etc/apk/repositories.d/distfeeds.list"])
     base_inputs = toolchain + config_digest(openwrt / ".config")
     build_base = hashlib.sha256(base_inputs.encode()).hexdigest()
-    build = hashlib.sha256((base_inputs + vermagic).encode()).hexdigest()
+    kernel_hash = digest_paths(openwrt, kernel_inputs(openwrt))
+    build = hashlib.sha256(("build-v3" + base_inputs + kernel_hash + vermagic).encode()).hexdigest()
     state = {
         "openwrt": git(openwrt, "rev-parse", "HEAD"),
         "npu": git(npu, "rev-parse", "HEAD"),
@@ -210,6 +259,8 @@ def keys(openwrt, npu):
         "host": host_hash, "build": build,
         "config": digest_paths(openwrt, [".config"]), "channel": "w1700k-oc-rc",
         "distfeeds": distfeeds, "vermagic": vermagic, "build_base": build_base,
+        "toolchain_source": source_hash, "toolchain_config": tool_config,
+        "kernel_source": kernel_hash, "environment": os.environ.get("BUILD_ENVIRONMENT", "local"),
     }
     fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
     state["fingerprint"] = fingerprint

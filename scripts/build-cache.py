@@ -8,14 +8,13 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 from pathlib import Path
 
 SOURCE_ROOTS = ("tools", "toolchain", "include", "config", "target", "scripts", "package", "feeds", "files")
 ROOT_INPUTS = ("Makefile", "rules.mk", "Config.in", ".config", "feeds.conf")
-SCHEMA = 2
+SCHEMA = 3
 
 
 def signature(path):
@@ -70,16 +69,24 @@ def restore_mtimes(root, previous):
     return restored
 
 
+def product_paths(root, kind):
+    return sorted(path for name in ("build_dir", "staging_dir") for path in (root / name).glob("*")
+                  if (path.name == "host" or path.name.startswith("toolchain-")) == (kind == "toolchain"))
+
+
 def products(root, kind):
-    if kind == "build":
-        paths = [root / "build_dir", root / "staging_dir"]
-    else:
-        paths = [root / "build_dir/host", root / "staging_dir/host"]
-        paths += sorted(root.glob("build_dir/toolchain-*"))
-        paths += sorted(root.glob("staging_dir/toolchain-*"))
-    if len(paths) < (2 if kind == "build" else 4) or any(not p.is_dir() or p.is_symlink() for p in paths):
+    paths = product_paths(root, kind)
+    required = ("host", "toolchain-") if kind == "toolchain" else ("target-",)
+    if any(not any(p.parent.name == directory and p.name.startswith(prefix) and p.is_dir()
+                   and not p.is_symlink() for p in paths)
+           for directory in ("build_dir", "staging_dir") for prefix in required):
         raise RuntimeError("Incomplete build products; refusing to save cache")
     return [p.relative_to(root).as_posix() for p in paths]
+
+
+def file_digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
 def configured_keys(root):
@@ -101,6 +108,7 @@ def save(root, cache, kind, key):
     subprocess.run(["tar", "--zstd", "-cf", str(archive) + ".tmp", "-C", str(root), *entries],
                    check=True, env={**os.environ, "ZSTD_CLEVEL": "3", "ZSTD_NBTHREADS": "2"})
     os.replace(str(archive) + ".tmp", archive)
+    metadata["sha256"] = file_digest(archive)
     (cache / "state.json").write_text(json.dumps(metadata), encoding="utf-8")
     print(f"Saved {kind} cache: {archive.stat().st_size / 1024**2:.0f} MiB")
 
@@ -110,43 +118,39 @@ def restore(root, cache, kind, key):
     archive = cache / "products.tar.zst"
     if not state.is_file() or not archive.is_file():
         return False
-    metadata = json.loads(state.read_text(encoding="utf-8"))
+    try:
+        metadata = json.loads(state.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        print(f"Ignoring damaged {kind} metadata")
+        return False
     if any(metadata.get(k) != v for k, v in
            (("schema", SCHEMA), ("kind", kind), ("workspace", str(root.resolve())))):
         print(f"Ignoring incompatible {kind} snapshot")
         return False
-    toolchain_only = False
     if metadata.get("key") != key:
-        keys = configured_keys(root)
-        base = keys.get("build-base", "")
-        # A pre-distfeeds snapshot's key is exactly build-base. New snapshots
-        # record both identities. A changed vermagic must never restore targets.
-        legacy = metadata.get("key") == base
-        compatible = (metadata.get("build-base") == base
-                      and metadata.get("toolchain") == keys.get("toolchain"))
-        if kind != "build" or not re.fullmatch(r"[a-f0-9]{64}", base) or not (legacy or compatible):
-            print(f"Ignoring incompatible {kind} snapshot")
-            return False
-        toolchain_only = True
+        print(f"Ignoring incompatible {kind} snapshot")
+        return False
+    if metadata.get("sha256") != file_digest(archive):
+        print(f"Ignoring damaged {kind} snapshot")
+        return False
     # Cache products can contain absolute paths, so relocation is a cache miss.
     # Restore before download, which otherwise builds fresh flock/zstd and then
     # has their products replaced by an older snapshot.
-    for name in ("build_dir", "staging_dir"):
-        target = root / name
+    # Each archive owns disjoint children. Restoring targets must never remove
+    # or overwrite the separately restored, longer-lived compiler installation.
+    for target in product_paths(root, kind):
         if target.is_symlink():
-            raise RuntimeError(f"Unexpected build directory symlink: {target}")
-        if target.exists():
+            target.unlink()
+        elif target.is_dir():
             shutil.rmtree(target)
+        else:
+            target.unlink()
     command = ["tar", "--zstd", "-xf", str(archive), "-C", str(root)]
-    if toolchain_only:
-        command += ["--wildcards", "build_dir/host", "staging_dir/host",
-                    "build_dir/toolchain-*", "staging_dir/toolchain-*"]
     subprocess.run(command, check=True)
-    restored_kind = "toolchain" if toolchain_only else kind
-    products(root, restored_kind)
+    products(root, kind)
     count = restore_mtimes(root, metadata["inputs"])
-    print(f"Restored {restored_kind} products and {count} unchanged input timestamps")
-    return restored_kind
+    print(f"Restored {kind} products and {count} unchanged input timestamps")
+    return kind
 
 
 def main():

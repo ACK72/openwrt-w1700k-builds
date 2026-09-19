@@ -9,8 +9,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 # Decimal GB leaves headroom below either interpretation of GitHub's 10 GB.
-BUDGET = 9_000_000_000
-MANAGED = re.compile(r"w1700k-v2-(?:Linux-(?:X64|ARM64)-(?:dl|ccache|build|toolchain|npu)|shared-distfeeds)-")
+BUDGET = 9_700_000_000
+MANAGED = re.compile(r"w1700k-v[23]-(?:Linux-(?:X64|ARM64)-(?:dl|ccache|build|toolchain|npu)|shared-distfeeds)-")
 SHARED_PREFIX = "w1700k-v2-shared"
 
 
@@ -48,7 +48,8 @@ def reservation_plan(items, reservations, incoming, size, family, ref, budget=BU
     eligible = sorted((item for item in items
                        if item["ref"] == ref and MANAGED.match(item["key"])
                        and item["key"] not in reservations and item["key"] != incoming),
-                      key=lambda item: (not item["key"].startswith(family),
+                      key=lambda item: ("w1700k-v3-Linux-ARM64-" in item["key"],
+                                        not item["key"].startswith(family),
                                         item.get("last_accessed_at", ""), item["id"]))
     remove = []
     for item in eligible:
@@ -71,6 +72,10 @@ def reserve(kind, path, key):
     reservations = json.loads(ledger.read_text()) if ledger.exists() else {}
     items = list_caches(repo)
     if any(item["key"] == key and item["ref"] == ref for item in items):
+        # Protect an already-restored immutable toolchain just like a new upload.
+        reservations[key] = 0
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text(json.dumps(reservations))
         print(f"Cache already exists: {key}")
         return False
     size = upload_bound(path)
@@ -130,14 +135,18 @@ def main():
     run = f"{env['GITHUB_RUN_ID']}-{env['GITHUB_RUN_ATTEMPT']}"
     replacements = {"dl": f"{prefix}-dl-{run}",
                     "ccache": f"{prefix}-ccache-{env['TOOLCHAIN_KEY']}-{run}",
-                    "build": f"{prefix}-build-{env['BUILD_BASE_KEY']}-{env['BUILD_KEY']}-{run}",
-                    "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}-{run}",
+                    "build": f"{prefix}-build-{env['BUILD_KEY']}-{run}",
+                    "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}",
                     "npu": f"{prefix}-npu-{env['NPU_KEY']}"}
     items = list_caches(repo, ref)
     remove = candidates(items, prefix, replacements, ref)
+    if any(item["key"] == replacements["build"] for item in items):
+        # Retire incompatible architecture/schema generations only after an ARM
+        # target snapshot has actually been uploaded, not merely reserved.
+        remove += [item["id"] for item in items if item["key"].startswith("w1700k-v2-Linux-")]
     if env.get("DISTFEEDS_CACHE_KEY"):
         remove += candidates(items, SHARED_PREFIX, {"distfeeds": env["DISTFEEDS_CACHE_KEY"]}, ref)
-    for cache_id in remove:
+    for cache_id in sorted(set(remove)):
         subprocess.run(["gh", "api", "--method", "DELETE", f"repos/{repo}/actions/caches/{cache_id}"], check=True)
         print(f"Removed superseded cache {cache_id}")
     current = list_caches(repo)

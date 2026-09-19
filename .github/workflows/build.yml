@@ -5,14 +5,13 @@ on:
     - cron: '17 18 * * *'
   push:
     branches: [main]
-    paths: ['.github/workflows/build.yml', '.github/actions/**', 'scripts/**', 'configs/**', 'package/**', 'patches/**', 'LICENSES/**']
+    paths: ['.github/workflows/build.yml', '.github/actions/**', 'scripts/**', 'configs/**', 'package/**', 'patches/**', 'LICENSES/**', 'containers/**', '.dockerignore']
   workflow_dispatch:
     inputs:
-      runner:
-        description: Build host (independent caches per architecture)
-        default: ubuntu-24.04
-        type: choice
-        options: [ubuntu-24.04, ubuntu-24.04-arm]
+      refresh_environment:
+        description: Refresh Ubuntu build dependencies and invalidate affected toolchains
+        default: false
+        type: boolean
       force:
         description: Build another release even if these inputs are already published
         default: false
@@ -25,15 +24,38 @@ on:
 permissions:
   contents: read
 
-# Serialize both host architectures, including publication and retention.
+# Serialize environment refresh, cache publication, RC builds and stable promotion.
 concurrency:
   group: w1700k-release
   cancel-in-progress: false
 
 jobs:
+  environment:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Authenticate environment registry
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Resolve or build the persistent ARM64 environment
+        id: image
+        env:
+          REFRESH_ENVIRONMENT: ${{ inputs.refresh_environment || false }}
+        run: bash scripts/build-environment.sh
+
   compose:
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     outputs:
       source: ${{ steps.stack.outputs.source }}
@@ -59,7 +81,7 @@ jobs:
   clean-drafts:
     needs: compose
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
     permissions:
       contents: write
@@ -75,16 +97,27 @@ jobs:
 
   build:
     if: github.ref == 'refs/heads/main'
-    needs: [compose, clean-drafts]
-    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    needs: [environment, compose, clean-drafts]
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 350
+    container:
+      image: ${{ needs.environment.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
     permissions:
       contents: read
       actions: write
+      packages: write
     env:
       OPENWRT_REF: ${{ needs.compose.outputs.source }}
       NPU_REF: main
       CCACHE_MAXSIZE: 3G
+      BUILD_ENVIRONMENT: ${{ needs.environment.outputs.image }}
+      CLEAN_BUILD: ${{ inputs.clean || false }}
     outputs:
       built: ${{ steps.firmware.outcome == 'success' }}
       artifact-name: ${{ steps.collect.outputs.artifact-name }}
@@ -94,7 +127,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Identify host cache namespace
-        run: echo "CACHE_PREFIX=w1700k-v2-${RUNNER_OS}-${RUNNER_ARCH}" >> "$GITHUB_ENV"
+        run: echo "CACHE_PREFIX=w1700k-v3-Linux-ARM64" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ needs.compose.outputs.artifact-name }}
@@ -111,12 +144,14 @@ jobs:
             sudo rm -rf /usr/local/lib/android /usr/share/dotnet
           fi
           df -h .
-      - name: Install build dependencies
-        run: bash scripts/install-deps.sh
+      - name: Authenticate recovery storage
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: echo "$REGISTRY_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
       - name: Pin the official snapshot image
         id: official
         run: python3 scripts/distfeeds.py resolve .work/distfeeds-source.json >> "$GITHUB_OUTPUT"
-      - name: Restore extracted official feeds across runner architectures
+      - name: Restore extracted official feeds
         id: distfeeds-cache
         uses: actions/cache/restore@v6.1.0
         with:
@@ -174,42 +209,46 @@ jobs:
       - name: Restore source downloads
         if: steps.needed.outputs.build == 'true'
         id: dl
+        continue-on-error: true
         uses: actions/cache/restore@v6.1.0
         with:
           path: .cache/dl
           key: ${{ env.CACHE_PREFIX }}-dl-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ${{ env.CACHE_PREFIX }}-dl-
-            dl-v1-
       - name: Restore compiler cache
         if: steps.needed.outputs.build == 'true' && inputs.clean != true
         id: ccache
+        continue-on-error: true
         uses: actions/cache/restore@v6.1.0
         with:
           path: .cache/ccache
           key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-
-            ${{ env.CACHE_PREFIX }}-ccache-
-            ccache-v1-${{ runner.os }}-${{ runner.arch }}-
-      - name: Restore compatible kernel and package build state
+      - name: Restore compatible toolchain
         if: steps.needed.outputs.build == 'true' && inputs.clean != true
-        id: buildcache
-        uses: actions/cache/restore@v6.1.0
-        with:
-          path: .cache/build
-          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build-base }}-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build-base }}-${{ steps.keys.outputs.build }}-
-            ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-
-            ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build-base }}-
-      - name: Restore compatible toolchain when no full build state exists
-        if: steps.needed.outputs.build == 'true' && inputs.clean != true && steps.buildcache.outputs.cache-matched-key == ''
+        id: toolcache
+        continue-on-error: true
         uses: actions/cache/restore@v6.1.0
         with:
           path: .cache/toolchain
-          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-
+          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}
+      - name: Restore compatible kernel and package build state
+        if: steps.needed.outputs.build == 'true' && inputs.clean != true
+        id: buildcache
+        continue-on-error: true
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .cache/build
+          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-
+      - name: Recover initial compiler cache when Actions has no copy
+        if: steps.needed.outputs.build == 'true' && inputs.clean != true && steps.ccache.outputs.cache-matched-key == ''
+        run: python3 scripts/cache-seed.py restore ccache '${{ steps.keys.outputs.toolchain }}' .cache/ccache
+      - name: Recover initial source downloads when Actions has no copy
+        if: steps.needed.outputs.build == 'true' && steps.dl.outputs.cache-matched-key == ''
+        run: python3 scripts/cache-seed.py restore dl '${{ steps.keys.outputs.toolchain }}' .cache/dl
       - name: Restore build products before make download
         if: steps.needed.outputs.build == 'true'
         id: restored
@@ -227,12 +266,16 @@ jobs:
         id: tools
         run: bash scripts/build.sh toolchain
       - name: Save successful toolchain before firmware compilation
-        if: steps.tools.outcome == 'success' && steps.restored.outputs.kind == 'none'
+        if: steps.tools.outcome == 'success'
         uses: ./.github/actions/save-cache
         with:
           kind: toolchain
           path: .cache/toolchain
-          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}
+      - name: Preserve the compatible toolchain recovery artifact
+        if: steps.tools.outcome == 'success'
+        continue-on-error: true
+        run: python3 scripts/cache-seed.py publish toolchain '${{ steps.keys.outputs.toolchain }}' .cache/toolchain
       - name: Compile RC firmware
         if: steps.needed.outputs.build == 'true'
         run: bash scripts/build.sh compile
@@ -258,6 +301,20 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 14
+      - name: Save compiler cache, including clean builds
+        if: always() && steps.tools.outcome == 'success'
+        continue-on-error: true
+        uses: ./.github/actions/save-cache
+        with:
+          kind: ccache
+          path: .cache/ccache
+          key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Preserve initial compiler and download recovery artifacts
+        if: steps.firmware.outcome == 'success'
+        continue-on-error: true
+        run: |
+          python3 scripts/cache-seed.py publish ccache '${{ steps.keys.outputs.toolchain }}' .cache/ccache
+          python3 scripts/cache-seed.py publish dl '${{ steps.keys.outputs.toolchain }}' .cache/dl
       - name: Snapshot successful kernel and package build state
         if: steps.firmware.outcome == 'success'
         id: snapshot
@@ -270,7 +327,7 @@ jobs:
         with:
           kind: build
           path: .cache/build
-          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build-base }}-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Save reusable downloads
         if: always() && steps.dl.outcome == 'success'
         continue-on-error: true
@@ -279,14 +336,6 @@ jobs:
           kind: dl
           path: .cache/dl
           key: ${{ env.CACHE_PREFIX }}-dl-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Save compiler cache, including clean builds
-        if: always() && steps.tools.outcome == 'success'
-        continue-on-error: true
-        uses: ./.github/actions/save-cache
-        with:
-          kind: ccache
-          path: .cache/ccache
-          key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Retain only caches whose replacement was successfully saved
         if: always() && steps.official.outcome == 'success'
         continue-on-error: true
@@ -308,6 +357,7 @@ jobs:
             logs/
             .work/openwrt/logs/
             .work/build-state.json
+            .work/cache-budget.json
             .work/source-stack.json
             .work/sources.env
             .work/feeds.lock
@@ -326,7 +376,7 @@ jobs:
   publish:
     if: needs.build.result == 'success' && needs.build.outputs.built == 'true'
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
     permissions:
       contents: write

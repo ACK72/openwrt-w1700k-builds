@@ -29,6 +29,9 @@ export RECURSIVE_DEP_IS_ERROR=1
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 [[ $(uname -s) == Linux ]] || die 'Use Ubuntu 24.04, a Linux VM, or WSL2 on an ext4 filesystem.'
+if [[ ${GITHUB_ACTIONS:-false} == true ]]; then
+    [[ $(uname -m) == aarch64 ]] || die 'CI builds require an ARM64 host.'
+fi
 [[ $ROOT != *' '* ]] || die 'OpenWrt requires a workspace path without spaces.'
 mkdir -p "$WORK" "$CACHE" "$OUT" "$LOGS" "$CCACHE_DIR"
 
@@ -177,7 +180,19 @@ run_make() {
     local name=$1
     shift
     local start=$SECONDS status=0
+    {
+        echo "phase=$name jobs=$JOBS download_jobs=$DOWNLOAD_JOBS date=$(date -u +%FT%TZ)"
+        uname -a
+        lscpu || true
+        free -h || true
+        df -h "$ROOT"
+        echo "environment=${BUILD_ENVIRONMENT:-local}"
+    } >> "$LOGS/environment.log"
+    (command -v vmstat >/dev/null && exec vmstat 30) >> "$LOGS/resources.log" &
+    local monitor=$!
     make -C "$OPENWRT" -j"$JOBS" "$@" 2>&1 | tee "$LOGS/$name.log" || status=$?
+    kill "$monitor" 2>/dev/null || true
+    wait "$monitor" 2>/dev/null || true
     printf '%s\t%s\t%s\n' "$name" "$((SECONDS-start))" "$status" >> "$LOGS/timings.tsv"
     return "$status"
 }
@@ -185,11 +200,19 @@ run_make() {
 restore_build() {
     local kind key
     rm -f "$WORK/cache-restored"
-    for kind in build toolchain; do
+    [[ ${CLEAN_BUILD:-false} != true ]] || return 0
+    for kind in toolchain build; do
         key=$(sed -n "s/^${kind}=//p" "$WORK/keys.env")
         [[ $key =~ ^[a-f0-9]{64}$ ]] || die 'Run configure before restoring build state'
         python3 "$ROOT/scripts/build-cache.py" restore "$kind" "$OPENWRT" "$CACHE/$kind" "$key"
-        [[ ! -f $WORK/cache-restored ]] || break
+        if [[ $kind == toolchain && ! -f $WORK/cache-restored ]]; then
+            if [[ ${GITHUB_ACTIONS:-false} == true ]]; then
+                python3 "$ROOT/scripts/cache-seed.py" restore toolchain "$key" "$CACHE/toolchain"
+                python3 "$ROOT/scripts/build-cache.py" restore toolchain "$OPENWRT" "$CACHE/toolchain" "$key"
+            fi
+            # Target state depends on a complete compatible compiler installation.
+            [[ -f $WORK/cache-restored ]] || break
+        fi
     done
 }
 

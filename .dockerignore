@@ -1,0 +1,6 @@
+*
+!containers/
+!containers/build-environment.Dockerfile
+!configs/
+!configs/build-packages.txt
+
