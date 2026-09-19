@@ -178,6 +178,15 @@ def restore(root, cache, kind, key):
     command = ["tar", "--zstd", "-xf", str(archive), "-C", str(root)]
     subprocess.run(command, check=True)
     products(root, kind)
+    if kind == "build":
+        # Package host builds can install into staging_dir/host (e.g. fwtool),
+        # while their installed stamps live in hostpkg. The immutable toolchain
+        # snapshot predates those installs. Keep compiled package objects, but
+        # let OpenWrt reinstall host packages into both prefixes on restoration.
+        stamps = list((root / "staging_dir/hostpkg/stamp").glob(".*_installed"))
+        for stamp in stamps:
+            stamp.unlink()
+        print(f"Scheduled {len(stamps)} host package reinstalls from cached products")
     count = restore_mtimes(root, metadata["inputs"])
     (root.parent / f"restored-downloads-{kind}.json").write_text(
         json.dumps(metadata.get("downloads", {})), encoding="utf-8")
