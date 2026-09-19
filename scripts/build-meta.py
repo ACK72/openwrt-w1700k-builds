@@ -271,7 +271,8 @@ def keys(openwrt, npu):
     base_inputs = toolchain + config_digest(openwrt / ".config") + bootstrap
     build_base = hashlib.sha256(base_inputs.encode()).hexdigest()
     kernel_hash = digest_paths(openwrt, kernel_inputs(openwrt))
-    build = hashlib.sha256(("build-v3" + base_inputs + kernel_hash + vermagic).encode()).hexdigest()
+    host_rx_patch = digest_paths(ROOT, ["patches/mt76"])
+    build = hashlib.sha256(("build-v3" + base_inputs + kernel_hash + vermagic + host_rx_patch).encode()).hexdigest()
     state = {
         "openwrt": git(openwrt, "rev-parse", "HEAD"),
         "npu": ("linux-firmware:" + stock_npu_info(openwrt)["version"]
@@ -282,6 +283,7 @@ def keys(openwrt, npu):
         "config": digest_paths(openwrt, [".config"]), "channel": "w1700k-oc-rc",
         "distfeeds": distfeeds, "vermagic": vermagic, "build_base": build_base,
         "toolchain_source": source_hash, "toolchain_config": tool_config,
+        "mt76_rx_patch": host_rx_patch,
         "kernel_source": kernel_hash, "go_bootstrap": bootstrap,
         "environment": os.environ.get("BUILD_ENVIRONMENT", "local"),
     }

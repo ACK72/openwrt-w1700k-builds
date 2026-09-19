@@ -6,21 +6,6 @@ argument of __builtin_assume_aligned when building with -Werror.
 Cast only the address passed to the builtin. The receiving pointers and all
 actual packet reads/writes retain their original volatile qualification.
 
-diff --git a/src/an7581/services/wifi/mt7996_fragment_queue_consumer.c b/src/an7581/services/wifi/mt7996_fragment_queue_consumer.c
-index 2c916f2..d5b6e11 100644
---- a/src/an7581/services/wifi/mt7996_fragment_queue_consumer.c
-+++ b/src/an7581/services/wifi/mt7996_fragment_queue_consumer.c
-@@ -205,8 +205,8 @@ static enum npu_runtime_result forward_fragment(
-   uint16_t packet_id = (uint16_t)entry->packet_id;
- 
-   packet_words = __builtin_assume_aligned(
--      consumer->packet_cached_memory +
--          (uint32_t)packet_id * NPU_WIFI_MT7996_PACKET_QUEUE_PACKET_SIZE,
-+      (const void *)(consumer->packet_cached_memory +
-+          (uint32_t)packet_id * NPU_WIFI_MT7996_PACKET_QUEUE_PACKET_SIZE),
-       sizeof(uint32_t));
-   delivery = (struct npu_wifi_mt7996_packet_delivery){
-       .source_device_address = packet_device_address(consumer, packet_id),
 diff --git a/src/an7581/services/wifi/mt7996_packet_control.c b/src/an7581/services/wifi/mt7996_packet_control.c
 index b60b512..ba0a8bb 100644
 --- a/src/an7581/services/wifi/mt7996_packet_control.c

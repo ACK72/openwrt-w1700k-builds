@@ -106,6 +106,10 @@ prepare() {
         fi
     done
     fi
+    if [[ $NPU_SOURCE == fdk && -d $ROOT/patches/mt76 ]]; then
+        cp "$ROOT"/patches/mt76/*.patch "$OPENWRT/package/kernel/mt76/patches/"
+        sed -i 's/^PKG_RELEASE:=.*/PKG_RELEASE:=3/' "$OPENWRT/package/kernel/mt76/Makefile"
+    fi
     mkdir -p "$CACHE/dl" "$CACHE/npu"
     if [[ -L $OPENWRT/dl ]]; then
         [[ $(readlink -f "$OPENWRT/dl") == "$CACHE/dl" ]] || die 'Unexpected dl symlink'

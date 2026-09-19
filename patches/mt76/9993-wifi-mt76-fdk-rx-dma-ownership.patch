@@ -1,0 +1,401 @@
+diff --git a/airoha_offload.h b/airoha_offload.h
+index 4d23cbb..06e9656 100644
+--- a/airoha_offload.h
++++ b/airoha_offload.h
+@@ -76,7 +76,7 @@ static inline void airoha_ppe_dev_check_skb(struct airoha_ppe_dev *dev,
+ #define NPU_RX_DMA_DESC_CUR_LEN_MASK	GENMASK(14, 1)
+ #define NPU_RX_DMA_DESC_DONE_MASK	BIT(0)
+ /* INFO */
+-#define NPU_RX_DMA_PKT_COUNT_MASK	GENMASK(31, 28)
++#define NPU_RX_DMA_PKT_COUNT_MASK	GENMASK(31, 29)
+ #define NPU_RX_DMA_PKT_ID_MASK		GENMASK(28, 26)
+ #define NPU_RX_DMA_SRC_PORT_MASK	GENMASK(25, 21)
+ #define NPU_RX_DMA_CRSN_MASK		GENMASK(20, 16)
+@@ -94,7 +94,8 @@ struct airoha_npu_rx_dma_desc {
+ 	u32 info;
+ 	u32 data;
+ 	u32 addr;
+-	u64 rsv;
++	u32 host_magic;
++	u32 host_capacity;
+ } __packed;
+ 
+ /* CTRL */
+diff --git a/mac80211.c b/mac80211.c
+index 2280cc0..a343801 100644
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1139,7 +1139,17 @@ int mt76_get_survey(struct ieee80211_hw *hw, int idx,
+ 	int phy_idx = 0;
+ 	int ret = 0;
+ 
+-	mutex_lock(&dev->mutex);
++	if (mt76_npu_device_active(dev)) {
++		if (!mutex_trylock(&dev->mutex))
++			return -EBUSY;
++		if (test_bit(MT76_RESET, &dev->phy.state) ||
++		    test_bit(MT76_MCU_RESET, &dev->phy.state)) {
++			mutex_unlock(&dev->mutex);
++			return -EBUSY;
++		}
++	} else {
++		mutex_lock(&dev->mutex);
++	}
+ 
+ 	for (phy_idx = 0; phy_idx < ARRAY_SIZE(dev->phys); phy_idx++) {
+ 		sband = NULL;
+@@ -1992,7 +2002,17 @@ int mt76_get_antenna(struct ieee80211_hw *hw, int radio_idx, u32 *tx_ant,
+ 	struct mt76_dev *dev = phy->dev;
+ 	int i;
+ 
+-	mutex_lock(&dev->mutex);
++	if (mt76_npu_device_active(dev)) {
++		if (!mutex_trylock(&dev->mutex))
++			return -EBUSY;
++		if (test_bit(MT76_RESET, &dev->phy.state) ||
++		    test_bit(MT76_MCU_RESET, &dev->phy.state)) {
++			mutex_unlock(&dev->mutex);
++			return -EBUSY;
++		}
++	} else {
++		mutex_lock(&dev->mutex);
++	}
+ 	*tx_ant = 0;
+ 	for (i = 0; i < ARRAY_SIZE(dev->phys); i++)
+ 		if (dev->phys[i] && dev->phys[i]->hw == hw)
+diff --git a/mt76.h b/mt76.h
+index 1d8da72..415287b 100644
+--- a/mt76.h
++++ b/mt76.h
+@@ -259,6 +259,7 @@ struct mt76_queue {
+ 	int buf_size;
+ 	bool stopped;
+ 	bool blocked;
++	bool npu_rx_failed;
+ 
+ 	u8 buf_offset;
+ 	u16 flags;
+diff --git a/mt7996/mac.c b/mt7996/mac.c
+index 6f07d7d..066af09 100644
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2317,6 +2317,21 @@ mt7996_mac_reset_vif_iter(void *data, u8 *mac, struct ieee80211_vif *vif)
+ 	rcu_read_unlock();
+ }
+ 
++static void mt7996_npu_recovery_failed(struct mt7996_dev *dev)
++{
++	struct mt7996_phy *phy;
++
++	dev->recovery.failed = true;
++	set_bit(MT76_MCU_RESET, &dev->mphy.state);
++	mt7996_for_each_phy(dev, phy)
++		set_bit(MT76_RESET, &phy->mt76->state);
++	mt76_npu_disable_irqs(&dev->mt76);
++	ieee80211_stop_queues(mt76_hw(dev));
++	wake_up(&dev->mt76.mcu.wait);
++	dev_err(dev->mt76.dev,
++		"NPU recovery quarantined; buffers retained, reboot required\n");
++}
++
+ static void
+ mt7996_mac_full_reset(struct mt7996_dev *dev)
+ {
+@@ -2337,6 +2352,15 @@ mt7996_mac_full_reset(struct mt7996_dev *dev)
+ 
+ 	mt76_abort_scan(&dev->mt76);
+ 
++	if (mt76_npu_device_active(&dev->mt76)) {
++		/* A chip reset is not an NPU DMA reset. The shared NPU has no
++		 * verified full-reset handshake; retain its buffers and stop once.
++		 * Never free tokens beneath a timed-out DMA or loop MCU reloads. */
++		mt7996_npu_hw_stop(dev);
++		mt7996_npu_recovery_failed(dev);
++		return;
++	}
++
+ 	mutex_lock(&dev->mt76.mutex);
+ 	for (i = 0; i < 10; i++) {
+ 		if (!mt7996_mac_restart(dev))
+@@ -2393,6 +2417,8 @@ void mt7996_mac_reset_work(struct work_struct *work)
+ 
+ 	dev = container_of(work, struct mt7996_dev, reset_work);
+ 	hw = mt76_hw(dev);
++	if (dev->recovery.failed)
++		return;
+ 
+ 	/* chip full reset */
+ 	if (dev->recovery.restart) {
+@@ -2406,6 +2432,8 @@ void mt7996_mac_reset_work(struct work_struct *work)
+ 			dev->recovery.wm_reset_count++;
+ 
+ 		mt7996_mac_full_reset(dev);
++		if (dev->recovery.failed)
++			return;
+ 
+ 		/* enable mcu irq */
+ 		mt7996_irq_enable(dev, MT_INT_MCU_CMD);
+@@ -2431,7 +2459,10 @@ void mt7996_mac_reset_work(struct work_struct *work)
+ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
+ 		mtk_wed_device_stop(&dev->mt76.mmio.wed);
+ 
+-	mt7996_npu_hw_stop(dev);
++	if (mt7996_npu_hw_stop(dev)) {
++		mt7996_npu_recovery_failed(dev);
++		return;
++	}
+ 	ieee80211_stop_queues(mt76_hw(dev));
+ 
+ 	set_bit(MT76_RESET, &dev->mphy.state);
+@@ -2503,7 +2534,11 @@ void mt7996_mac_reset_work(struct work_struct *work)
+ 				     MT_INT_TX_RX_DONE_EXT);
+ 	}
+ 
+-	__mt7996_npu_hw_init(dev);
++	if (__mt7996_npu_hw_init(dev)) {
++		mt7996_npu_recovery_failed(dev);
++		mutex_unlock(&dev->mt76.mutex);
++		return;
++	}
+ 
+ 	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
+ 	mt7996_for_each_phy(dev, phy)
+diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
+index 571dc0d..80a31f7 100644
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -493,6 +493,7 @@ struct mt7996_dev {
+ 		bool hw_full_reset:1;
+ 		bool hw_init_done:1;
+ 		bool restart:1;
++		bool failed:1;
+ 	} recovery;
+ 
+ 	/* protects coredump data */
+diff --git a/npu.c b/npu.c
+index dd954df..9e446b3 100644
+--- a/npu.c
++++ b/npu.c
+@@ -11,8 +11,9 @@
+ #include "dma.h"
+ #include "mt76_connac.h"
+ 
+-#define MT76_NPU_RX_BUF_SIZE	(1800 + \
++#define MT76_NPU_RX_BUF_SIZE	(1920 + \
+ 				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
++#define MT76_NPU_RX_ABI_MAGIC	0x46525831 /* FDK FRX1 atomic packet commit */
+ 
+ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ {
+@@ -32,8 +33,14 @@ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+ 		page = virt_to_head_page(e->buf);
+ 		e->dma_addr[0] = page_pool_get_dma_addr(page) + offset;
+ 
+-		memset(&desc[q->head], 0, sizeof(*desc));
++		desc[q->head].info = 0;
++		desc[q->head].data = 0;
+ 		desc[q->head].addr = e->dma_addr[0];
++		desc[q->head].host_magic = MT76_NPU_RX_ABI_MAGIC;
++		desc[q->head].host_capacity = e->dma_len[0];
++		/* Publish ownership only after the new address and capacity. */
++		dma_wmb();
++		WRITE_ONCE(desc[q->head].ctrl, 0);
+ 
+ 		q->head = (q->head + 1) % q->ndesc;
+ 		q->queued++;
+@@ -53,6 +60,7 @@ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+ 					e->dma_len[0],
+ 					page_pool_get_dma_dir(q->page_pool));
+ 		mt76_put_page_pool_buf(e->buf, false);
++		e->buf = NULL;
+ 		q->tail = (q->tail + 1) % q->ndesc;
+ 		q->queued--;
+ 	}
+@@ -60,57 +68,85 @@ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+ }
+ 
+ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
+-					struct mt76_queue *q,
+-					u32 *info)
++                                        struct mt76_queue *q, u32 *info)
+ {
+ 	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++	u32 controls[7], metadata[7], total = 0;
+ 	int i, nframes, index = q->tail;
+-	struct sk_buff *skb = NULL;
+-
+-	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, desc[index].info);
+-	nframes = max_t(int, nframes, 1);
+-
++	struct sk_buff *skb;
++
++	if (!q->queued)
++		return NULL;
++	controls[0] = READ_ONCE(desc[index].ctrl);
++	if (!(controls[0] & NPU_RX_DMA_DESC_DONE_MASK))
++		return NULL;
++	dma_rmb();
++	metadata[0] = READ_ONCE(desc[index].info);
++	nframes = max_t(int, FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, metadata[0]), 1);
++	if (nframes > q->queued || nframes > ARRAY_SIZE(controls) ||
++	    nframes - 1 > MAX_SKB_FRAGS)
++		return ERR_PTR(-EIO);
++
++	/* FRX1 publishes first DONE last. Validate the complete immutable chain
++	 * before allocating an skb, syncing payload, or transferring any page. */
+ 	for (i = 0; i < nframes; i++) {
+ 		struct mt76_queue_entry *e = &q->entry[index];
+-		int len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK,
+-				    desc[index].ctrl);
+-
+-		if (!FIELD_GET(NPU_RX_DMA_DESC_DONE_MASK, desc[index].ctrl)) {
+-			dev_kfree_skb(skb);
+-			return NULL;
++		u32 len;
++
++		if (i) {
++			controls[i] = READ_ONCE(desc[index].ctrl);
++			if (!(controls[i] & NPU_RX_DMA_DESC_DONE_MASK))
++				return ERR_PTR(-EIO);
++			dma_rmb();
++			metadata[i] = READ_ONCE(desc[index].info);
+ 		}
++		len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, controls[i]);
++		if (!e->buf || !len || len > e->dma_len[0] ||
++		    desc[index].addr != e->dma_addr[0] ||
++		    !!(controls[i] & NPU_RX_DMA_DESC_LAST_MASK) != (i == nframes - 1) ||
++		    FIELD_GET(NPU_RX_DMA_DESC_LEN_MASK, controls[i]) !=
++		    FIELD_GET(NPU_RX_DMA_DESC_LEN_MASK, controls[0]))
++			return ERR_PTR(-EIO);
++		if (nframes > 1 &&
++		    (FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, metadata[i]) != nframes ||
++		     FIELD_GET(NPU_RX_DMA_PKT_ID_MASK, metadata[i]) != i + 1))
++			return ERR_PTR(-EIO);
++		total += len;
++		index = (index + 1) % q->ndesc;
++	}
++	if (total != FIELD_GET(NPU_RX_DMA_DESC_LEN_MASK, controls[0]))
++		return ERR_PTR(-EIO);
+ 
+-		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
+-					e->dma_len[0],
+-					page_pool_get_dma_dir(q->page_pool));
++	index = q->tail;
++	skb = napi_build_skb(q->entry[index].buf, q->buf_size);
++	for (i = 0; i < nframes; i++) {
++		struct mt76_queue_entry *e = &q->entry[index];
++		int len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, controls[i]);
+ 
++		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0], e->dma_len[0],
++					page_pool_get_dma_dir(q->page_pool));
+ 		if (!skb) {
+-			skb = napi_build_skb(e->buf, q->buf_size);
+-			if (!skb)
+-				return NULL;
+-
++			/* OOM drops one complete packet, with every page returned once. */
++			mt76_put_page_pool_buf(e->buf, false);
++		} else if (!i) {
+ 			__skb_put(skb, len);
+ 			skb_reset_mac_header(skb);
+ 			skb_mark_for_recycle(skb);
+ 		} else {
+-			struct skb_shared_info *shinfo = skb_shinfo(skb);
+ 			struct page *page = virt_to_head_page(e->buf);
+-			int nr_frags = shinfo->nr_frags;
+-
+-			if (nr_frags < ARRAY_SIZE(shinfo->frags))
+-				skb_add_rx_frag(skb, nr_frags, page,
+-						e->buf - page_address(page),
+-						len, q->buf_size);
++			skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags, page,
++					e->buf - page_address(page), len, q->buf_size);
+ 		}
+-
+-		*info = desc[index].info;
++		e->buf = NULL;
++		e->dma_addr[0] = 0;
++		e->dma_len[0] = 0;
+ 		index = (index + 1) % q->ndesc;
+ 	}
++	*info = metadata[nframes - 1];
+ 	q->tail = index;
+-	q->queued -= i;
++	q->queued -= nframes;
+ 	Q_WRITE(q, dma_idx, q->tail);
+-
+-	return skb;
++	return skb ? skb : ERR_PTR(-ENOMEM);
+ }
+ 
+ void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
+@@ -147,11 +183,15 @@ static int mt76_npu_rx_poll(struct napi_struct *napi, int budget)
+ 	enum mt76_rxq_id qid = napi - dev->napi;
+ 	struct airoha_npu *npu;
+ 	int done = 0;
++	struct mt76_queue *q = &dev->q_rx[qid];
++
++	if (!budget)
++		return 0;
+ 
+ 	rcu_read_lock();
+ 
+ 	npu = rcu_dereference(dev->mmio.npu);
+-	if (!npu)
++	if (!npu || q->npu_rx_failed)
+ 		goto out;
+ 
+ 	while (done < budget) {
+@@ -161,15 +201,26 @@ static int mt76_npu_rx_poll(struct napi_struct *napi, int budget)
+ 		skb = mt76_npu_dequeue(dev, &dev->q_rx[qid], &info);
+ 		if (!skb)
+ 			break;
++		if (IS_ERR(skb)) {
++			if (PTR_ERR(skb) == -ENOMEM) {
++				done++;
++				continue;
++			}
++			q->npu_rx_failed = true;
++			dev_err(dev->dev, "NPU RX%d invalid committed chain at %u; queue quarantined\n",
++				qid - MT_RXQ_NPU0, q->tail);
++			break;
++		}
+ 
+ 		dev->drv->rx_skb(dev, qid, skb, &info);
+ 		mt76_rx_poll_complete(dev, qid, napi);
+ 		done++;
+ 	}
+ 
+-	mt76_npu_fill_rx_queue(dev, &dev->q_rx[qid]);
++	if (!q->npu_rx_failed)
++		mt76_npu_fill_rx_queue(dev, q);
+ out:
+-	if (done < budget && napi_complete(napi))
++	if (done < budget && napi_complete(napi) && !q->npu_rx_failed)
+ 		dev->drv->rx_poll_complete(dev, qid);
+ 
+ 	rcu_read_unlock();
+@@ -189,7 +240,7 @@ static irqreturn_t mt76_npu_irq_handler(int irq, void *q_instance)
+ 	rcu_read_lock();
+ 
+ 	npu = rcu_dereference(dev->mmio.npu);
+-	if (!npu)
++	if (!npu || q->npu_rx_failed)
+ 		goto out;
+ 
+ 	status = airoha_npu_wlan_get_irq_status(npu, index);
+@@ -279,6 +330,14 @@ int mt76_npu_rx_queue_init(struct mt76_dev *dev, struct mt76_queue *q)
+ 	if (err)
+ 		goto out;
+ 
++	{
++		struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++		int j;
++
++		for (j = 0; j < q->ndesc; j++)
++			desc[j].ctrl = NPU_RX_DMA_DESC_DONE_MASK;
++	}
++
+ 	name = devm_kasprintf(dev->dev, GFP_KERNEL, "mt76-npu.%d", index);
+ 	if (!name) {
+ 		err = -ENOMEM;
