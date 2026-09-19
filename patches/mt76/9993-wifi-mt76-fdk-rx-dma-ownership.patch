@@ -1,5 +1,5 @@
 diff --git a/airoha_offload.h b/airoha_offload.h
-index 4d23cbb..06e9656 100644
+index 4d23cbb..c50c75c 100644
 --- a/airoha_offload.h
 +++ b/airoha_offload.h
 @@ -76,7 +76,7 @@ static inline void airoha_ppe_dev_check_skb(struct airoha_ppe_dev *dev,
@@ -11,16 +11,6 @@ index 4d23cbb..06e9656 100644
  #define NPU_RX_DMA_PKT_ID_MASK		GENMASK(28, 26)
  #define NPU_RX_DMA_SRC_PORT_MASK	GENMASK(25, 21)
  #define NPU_RX_DMA_CRSN_MASK		GENMASK(20, 16)
-@@ -94,7 +94,8 @@ struct airoha_npu_rx_dma_desc {
- 	u32 info;
- 	u32 data;
- 	u32 addr;
--	u64 rsv;
-+	u32 host_magic;
-+	u32 host_capacity;
- } __packed;
- 
- /* CTRL */
 diff --git a/mac80211.c b/mac80211.c
 index 2280cc0..a343801 100644
 --- a/mac80211.c
@@ -282,10 +272,10 @@ index b8006b8..52eeaa4 100644
  unlock:
  	mutex_unlock(&dev->mt76.mutex);
 diff --git a/npu.c b/npu.c
-index dd954df..9e446b3 100644
+index dd954df..4769090 100644
 --- a/npu.c
 +++ b/npu.c
-@@ -11,8 +11,9 @@
+@@ -11,8 +11,12 @@
  #include "dma.h"
  #include "mt76_connac.h"
  
@@ -293,10 +283,13 @@ index dd954df..9e446b3 100644
 +#define MT76_NPU_RX_BUF_SIZE	(1920 + \
  				 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
 +#define MT76_NPU_RX_ABI_MAGIC	0x46525831 /* FDK FRX1 atomic packet commit */
++
++/* Preserve the kernel provider's descriptor layout and reserved field. */
++static_assert(sizeof(struct airoha_npu_rx_dma_desc) == 24);
  
  int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
  {
-@@ -32,8 +33,14 @@ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
+@@ -32,8 +36,14 @@ int mt76_npu_fill_rx_queue(struct mt76_dev *dev, struct mt76_queue *q)
  		page = virt_to_head_page(e->buf);
  		e->dma_addr[0] = page_pool_get_dma_addr(page) + offset;
  
@@ -304,15 +297,15 @@ index dd954df..9e446b3 100644
 +		desc[q->head].info = 0;
 +		desc[q->head].data = 0;
  		desc[q->head].addr = e->dma_addr[0];
-+		desc[q->head].host_magic = MT76_NPU_RX_ABI_MAGIC;
-+		desc[q->head].host_capacity = e->dma_len[0];
++		desc[q->head].rsv = MT76_NPU_RX_ABI_MAGIC |
++				    ((u64)e->dma_len[0] << 32);
 +		/* Publish ownership only after the new address and capacity. */
 +		dma_wmb();
 +		WRITE_ONCE(desc[q->head].ctrl, 0);
  
  		q->head = (q->head + 1) % q->ndesc;
  		q->queued++;
-@@ -53,6 +60,7 @@ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+@@ -53,6 +63,7 @@ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
  					e->dma_len[0],
  					page_pool_get_dma_dir(q->page_pool));
  		mt76_put_page_pool_buf(e->buf, false);
@@ -320,7 +313,7 @@ index dd954df..9e446b3 100644
  		q->tail = (q->tail + 1) % q->ndesc;
  		q->queued--;
  	}
-@@ -60,57 +68,85 @@ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
+@@ -60,57 +71,85 @@ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
  }
  
  static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
@@ -438,7 +431,7 @@ index dd954df..9e446b3 100644
  }
  
  void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
-@@ -147,11 +183,15 @@ static int mt76_npu_rx_poll(struct napi_struct *napi, int budget)
+@@ -147,11 +186,15 @@ static int mt76_npu_rx_poll(struct napi_struct *napi, int budget)
  	enum mt76_rxq_id qid = napi - dev->napi;
  	struct airoha_npu *npu;
  	int done = 0;
@@ -455,7 +448,7 @@ index dd954df..9e446b3 100644
  		goto out;
  
  	while (done < budget) {
-@@ -161,15 +201,26 @@ static int mt76_npu_rx_poll(struct napi_struct *napi, int budget)
+@@ -161,15 +204,26 @@ static int mt76_npu_rx_poll(struct napi_struct *napi, int budget)
  		skb = mt76_npu_dequeue(dev, &dev->q_rx[qid], &info);
  		if (!skb)
  			break;
@@ -484,7 +477,7 @@ index dd954df..9e446b3 100644
  		dev->drv->rx_poll_complete(dev, qid);
  
  	rcu_read_unlock();
-@@ -189,7 +240,7 @@ static irqreturn_t mt76_npu_irq_handler(int irq, void *q_instance)
+@@ -189,7 +243,7 @@ static irqreturn_t mt76_npu_irq_handler(int irq, void *q_instance)
  	rcu_read_lock();
  
  	npu = rcu_dereference(dev->mmio.npu);
@@ -493,7 +486,7 @@ index dd954df..9e446b3 100644
  		goto out;
  
  	status = airoha_npu_wlan_get_irq_status(npu, index);
-@@ -279,6 +330,14 @@ int mt76_npu_rx_queue_init(struct mt76_dev *dev, struct mt76_queue *q)
+@@ -279,6 +333,14 @@ int mt76_npu_rx_queue_init(struct mt76_dev *dev, struct mt76_queue *q)
  	if (err)
  		goto out;
  

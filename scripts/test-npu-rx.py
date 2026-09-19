@@ -6,13 +6,17 @@ source = Path(sys.argv[1])
 text = (source/'npu.c').read_text()
 a=text.index('static struct sk_buff *mt76_npu_dequeue('); b=text.index('\nvoid mt76_npu_check_ppe',a)
 function=text[a:b]
-header=(source/'airoha_offload.h').read_text()
+header_path=source/'airoha_offload.h'
+if len(sys.argv)>2:
+    header_path=Path(sys.argv[2])
+header=header_path.read_text()
 defines='\n'.join(re.findall(r'^#define NPU_RX_DMA_\w+\s+.+$',header,re.M))
 prelude=r'''
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
 typedef uint32_t u32;
+typedef uint64_t u64;
 #define BIT(n) (1U<<(n))
 #define GENMASK(h,l) ((UINT32_MAX>>(31-(h)))&(UINT32_MAX<<(l)))
 #define FIELD_GET(m,v) (((v)&(m))>>__builtin_ctz(m))
@@ -31,7 +35,7 @@ struct sk_buff { struct page *head; struct skb_shared_info info; unsigned len; }
 struct mt76_queue_entry { void *buf; uintptr_t dma_addr[2]; unsigned dma_len[2]; };
 struct mt76_queue { void *desc; struct mt76_queue_entry *entry; int tail,queued,ndesc,buf_size; void *page_pool; };
 struct mt76_dev { void *dma_dev; };
-struct airoha_npu_rx_dma_desc { u32 ctrl,info,data,addr,host_magic,host_capacity; };
+struct airoha_npu_rx_dma_desc { u32 ctrl,info,data,addr; union {u64 rsv;struct {u32 host_magic,host_capacity;};}; };
 static struct page pages[512];
 static unsigned freed[512], syncs, allocations, oom, errors;
 static struct sk_buff skb;

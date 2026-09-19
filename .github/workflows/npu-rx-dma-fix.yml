@@ -123,9 +123,12 @@ jobs:
           make -C .work/openwrt package/kernel/mt76/prepare V=s
           mt76=$(find .work/openwrt/build_dir -type d -name 'mt76-*' | head -n 1)
           test -n "$mt76"
-          CC=clang-18 python3 scripts/test-npu-rx.py "$mt76"
+          header=$(find .work/openwrt/build_dir -path '*/linux-6.18.52/include/linux/soc/airoha/airoha_offload.h' | head -n 1)
+          test -n "$header"
+          CC=clang-18 python3 scripts/test-npu-rx.py "$mt76" "$header"
           mkdir -p logs/mt76-prepared
           cp "$mt76"/npu.c "$mt76"/airoha_offload.h logs/mt76-prepared/
+          cp "$header" logs/mt76-prepared/kernel-airoha_offload.h
       - name: Compile full firmware with fixed FDK RX DMA ownership
         run: bash scripts/build.sh compile
       - name: Collect fixed FDK firmware and record provenance
