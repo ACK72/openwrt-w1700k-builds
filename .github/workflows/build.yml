@@ -140,6 +140,7 @@ jobs:
           for script in scripts/*.sh; do bash -n "$script"; done
           python3 -m compileall -q scripts
           node --check package/w1700k-custom/overview.js
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(uname -m)" = aarch64
           test "$("$GOLANG_BOOTSTRAP_ROOT/bin/go" env GOHOSTOS GOHOSTARCH | paste -sd /)" = linux/arm64
           "$GOLANG_BOOTSTRAP_ROOT/bin/go" version
@@ -242,7 +243,8 @@ jobs:
         uses: actions/cache/restore@v6.1.0
         with:
           path: .cache/toolchain
-          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}
+          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-dl1
+          restore-keys: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}
       - name: Restore compatible kernel and package build state
         if: steps.needed.outputs.build == 'true' && inputs.clean != true
         id: buildcache
@@ -267,6 +269,13 @@ jobs:
           if [[ -f .work/cache-restored ]]; then kind=$(cat .work/cache-restored); fi
           echo "kind=$kind" >> "$GITHUB_OUTPUT"
           echo "Build state restored: $kind" >> "$GITHUB_STEP_SUMMARY"
+      - name: Retire obsolete architecture caches after successful recovery
+        if: steps.restored.outputs.kind != 'none' && steps.restored.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/prune-caches.py retire-legacy
       - name: Download sources in parallel
         if: steps.needed.outputs.build == 'true'
         run: bash scripts/build.sh download
@@ -280,7 +289,7 @@ jobs:
         with:
           kind: toolchain
           path: .cache/toolchain
-          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}
+          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-dl1
       - name: Preserve the compatible toolchain recovery artifact
         if: steps.tools.outcome == 'success'
         continue-on-error: true

@@ -113,14 +113,39 @@ def candidates(items, prefix, replacements, ref):
     return result
 
 
+def legacy_candidates(items, ref):
+    return [item["id"] for item in items if item["ref"] == ref
+            and item["key"].startswith("w1700k-v2-Linux-")]
+
+
+def retire_legacy():
+    # The ARM snapshot has already passed its key, path and checksum checks.
+    # Old architecture caches cannot be restored by this ARM-only workflow.
+    marker = Path(".work/cache-restored")
+    if not marker.is_file() or marker.read_text().strip() not in ("toolchain", "build"):
+        raise ValueError("Verify ARM recovery before retiring old caches")
+    repo, ref = os.environ["GH_REPO"], os.environ["GITHUB_REF"]
+    items = list_caches(repo)
+    remove = legacy_candidates(items, ref)
+    for cache_id in remove:
+        subprocess.run(["gh", "api", "--method", "DELETE", f"repos/{repo}/actions/caches/{cache_id}"],
+                       check=True, timeout=60)
+    freed = sum(item["size_in_bytes"] for item in items if item["id"] in remove)
+    print(f"Retired {len(remove)} obsolete architecture caches ({freed / 1e9:.3f} GB) after ARM recovery")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command")
+    sub.add_parser("retire-legacy")
     allocate = sub.add_parser("reserve")
     allocate.add_argument("kind", choices=("npu", "toolchain", "build", "dl", "ccache", "distfeeds"))
     allocate.add_argument("path", type=Path)
     allocate.add_argument("key")
     args = parser.parse_args()
+    if args.command == "retire-legacy":
+        retire_legacy()
+        return
     if args.command == "reserve":
         try:
             save = reserve(args.kind, args.path, args.key)
@@ -136,14 +161,14 @@ def main():
     replacements = {"dl": f"{prefix}-dl-{run}",
                     "ccache": f"{prefix}-ccache-{env['TOOLCHAIN_KEY']}-{run}",
                     "build": f"{prefix}-build-{env['BUILD_KEY']}-{run}",
-                    "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}",
+                    "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}-dl1",
                     "npu": f"{prefix}-npu-{env['NPU_KEY']}"}
     items = list_caches(repo, ref)
     remove = candidates(items, prefix, replacements, ref)
     if any(item["key"] == replacements["build"] for item in items):
         # Retire incompatible architecture/schema generations only after an ARM
         # target snapshot has actually been uploaded, not merely reserved.
-        remove += [item["id"] for item in items if item["key"].startswith("w1700k-v2-Linux-")]
+        remove += legacy_candidates(items, ref)
     if env.get("DISTFEEDS_CACHE_KEY"):
         remove += candidates(items, SHARED_PREFIX, {"distfeeds": env["DISTFEEDS_CACHE_KEY"]}, ref)
     for cache_id in sorted(set(remove)):
@@ -153,9 +178,16 @@ def main():
     used = sum(item["size_in_bytes"] for item in current)
     message = f"Actions cache storage: {used / 1e9:.3f} GB in {len(current)} entries; upload budget {BUDGET / 1e9:.1f} GB."
     print(message)
+    families = {}
+    for item in current:
+        match = MANAGED.match(item["key"])
+        family = match[0].rstrip("-") if match else "other caches"
+        families[family] = families.get(family, 0) + item["size_in_bytes"]
+    breakdown = "\n".join(f"| {name} | {size / 1e9:.3f} |" for name, size in sorted(families.items()))
+    print(breakdown)
     if env.get("GITHUB_STEP_SUMMARY"):
         with open(env["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
-            summary.write(message + "\n")
+            summary.write(message + "\n\n| Cache family | GB |\n| --- | ---: |\n" + breakdown + "\n")
 
 
 if __name__ == "__main__":

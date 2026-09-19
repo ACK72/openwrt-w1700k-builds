@@ -28,7 +28,22 @@ REQUIRED_CONFIG = (
 
 
 def git(path, *args):
-    return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
+    # Checkout runs as the runner user; the build container runs as root.
+    # Trust only the exact managed repository for this command, never all paths.
+    return subprocess.check_output(["git", "-c", f"safe.directory={path.resolve()}",
+                                    "-C", str(path), *args], text=True).strip()
+
+
+def builder_commit():
+    try:
+        commit = git(ROOT, "rev-parse", "--verify", "HEAD")
+    except subprocess.CalledProcessError:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            raise RuntimeError("Cannot verify the CI builder checkout") from None
+        return "uncommitted (see builder content hash)"
+    if os.environ.get("GITHUB_ACTIONS") == "true" and commit != os.environ.get("GITHUB_SHA"):
+        raise ValueError("Builder checkout does not match the workflow commit")
+    return commit
 
 
 def digest_paths(root, names):
@@ -222,6 +237,7 @@ def install_npu(openwrt, npu, firmware):
 
 
 def keys(openwrt, npu):
+    commit = builder_commit()
     feeds = {
         p.name: git(p, "rev-parse", "HEAD")
         for p in sorted((openwrt / "feeds").iterdir())
@@ -258,7 +274,7 @@ def keys(openwrt, npu):
     state = {
         "openwrt": git(openwrt, "rev-parse", "HEAD"),
         "npu": git(npu, "rev-parse", "HEAD"),
-        "feeds": feeds, "builder": builder_hash, "toolchain": toolchain,
+        "feeds": feeds, "builder": builder_hash, "builder_commit": commit, "toolchain": toolchain,
         "host": host_hash, "build": build,
         "config": digest_paths(openwrt, [".config"]), "channel": "w1700k-oc-rc",
         "distfeeds": distfeeds, "vermagic": vermagic, "build_base": build_base,
@@ -279,10 +295,7 @@ def manifest(openwrt, npu, output):
     state["source_stack"] = json.loads(stack_file.read_text(encoding="utf-8"))
     if state["source_stack"]["source"] != state["openwrt"]:
         raise ValueError("Build source differs from the composed RC")
-    try:
-        state["builder_commit"] = git(ROOT, "rev-parse", "--verify", "HEAD")
-    except subprocess.CalledProcessError:
-        state["builder_commit"] = "uncommitted (see builder content hash)"
+    state["builder_commit"] = builder_commit()
     state["source_date_epoch"] = git(openwrt, "show", "-s", "--format=%ct", "HEAD")
     state["built_at"] = datetime.now(timezone.utc).isoformat()
     state["official_distfeeds"] = json.loads((openwrt.parent / "distfeeds.json").read_text(encoding="utf-8"))

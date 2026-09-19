@@ -18,7 +18,8 @@ def digest(path):
 def reference(kind, key):
     if not re.fullmatch(r"[a-f0-9]{64}", key):
         raise ValueError("Invalid seed compatibility key")
-    return f"ghcr.io/{os.environ['GITHUB_REPOSITORY'].lower()}/build-cache:arm64-v3-{kind}-{key}"
+    revision = "-dl1" if kind == "toolchain" else ""
+    return f"ghcr.io/{os.environ['GITHUB_REPOSITORY'].lower()}/build-cache:arm64-v3-{kind}-{key}{revision}"
 
 
 def resolve(ref):
@@ -35,6 +36,10 @@ def resolve(ref):
 
 def restore(kind, key, destination):
     ref = resolve(reference(kind, key))
+    if not ref and kind == "toolchain":
+        # Older compiler seeds remain usable; the next successful dependency
+        # check creates the new snapshot with verified download timestamps.
+        ref = resolve(reference(kind, key).removesuffix("-dl1"))
     if not ref:
         return False
     destination.parent.mkdir(parents=True, exist_ok=True)

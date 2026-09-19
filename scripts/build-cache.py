@@ -89,6 +89,36 @@ def file_digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def download_state(root):
+    return {p.name: [file_digest(p), p.stat().st_size, p.stat().st_mtime_ns]
+            for p in sorted((root / "dl").glob("*")) if p.is_file() and not p.is_symlink()}
+
+
+def restore_download_mtimes(root):
+    """A freshly fetched, identical tarball must not invalidate restored products."""
+    previous = {}
+    for manifest in root.parent.glob("restored-downloads-*.json"):
+        for name, state in json.loads(manifest.read_text()).items():
+            if Path(name).name != name or "/" in name or "\\" in name:
+                raise ValueError("Invalid download manifest path")
+            previous.setdefault(name, []).append(state)
+    restored = 0
+    for name, states in previous.items():
+        path = root / "dl" / name
+        if not path.is_file() or path.is_symlink():
+            continue
+        digest, size = file_digest(path), path.stat().st_size
+        times = [state[2] for state in states if state[:2] == [digest, size]]
+        if times:
+            # Both snapshots may have used the same archive at different times.
+            # The earliest verified time satisfies both sets of prepared stamps.
+            stamp = min(times)
+            os.utime(path, ns=(stamp, stamp))
+            restored += 1
+    print(f"Restored {restored} checksum-verified download timestamps")
+    return restored
+
+
 def configured_keys(root):
     path = root.parent / "keys.env"
     if not path.is_file():
@@ -100,7 +130,7 @@ def save(root, cache, kind, key):
     entries = products(root, kind)
     cache.mkdir(parents=True, exist_ok=True)
     metadata = {"schema": SCHEMA, "kind": kind, "key": key, "workspace": str(root.resolve()),
-                "inputs": source_state(root)}
+                "inputs": source_state(root), "downloads": download_state(root)}
     keys = configured_keys(root)
     metadata.update({name: keys[name] for name in ("toolchain", "build-base") if name in keys})
     # No root signing keys, old configuration, source files, or output images.
@@ -149,19 +179,26 @@ def restore(root, cache, kind, key):
     subprocess.run(command, check=True)
     products(root, kind)
     count = restore_mtimes(root, metadata["inputs"])
+    (root.parent / f"restored-downloads-{kind}.json").write_text(
+        json.dumps(metadata.get("downloads", {})), encoding="utf-8")
     print(f"Restored {kind} products and {count} unchanged input timestamps")
     return kind
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("save", "restore"))
-    parser.add_argument("kind", choices=("toolchain", "build"))
-    parser.add_argument("root", type=Path)
-    parser.add_argument("cache", type=Path)
-    parser.add_argument("key")
+    sub = parser.add_subparsers(dest="operation", required=True)
+    for operation in ("save", "restore"):
+        command = sub.add_parser(operation)
+        command.add_argument("kind", choices=("toolchain", "build"))
+        command.add_argument("root", type=Path)
+        command.add_argument("cache", type=Path)
+        command.add_argument("key")
+    sub.add_parser("downloads").add_argument("root", type=Path)
     args = parser.parse_args()
-    if args.operation == "save":
+    if args.operation == "downloads":
+        restore_download_mtimes(args.root)
+    elif args.operation == "save":
         save(args.root, args.cache, args.kind, args.key)
     else:
         restored_kind = restore(args.root, args.cache, args.kind, args.key)

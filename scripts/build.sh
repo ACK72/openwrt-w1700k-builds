@@ -211,6 +211,7 @@ run_make() {
 restore_build() {
     local kind key
     rm -f "$WORK/cache-restored"
+    rm -f "$WORK/restored-downloads-toolchain.json" "$WORK/restored-downloads-build.json"
     [[ ${CLEAN_BUILD:-false} != true ]] || return 0
     for kind in toolchain build; do
         key=$(sed -n "s/^${kind}=//p" "$WORK/keys.env")
@@ -236,16 +237,21 @@ save_build() {
 
 download() {
     make -C "$OPENWRT" -j"$DOWNLOAD_JOBS" download 2>&1 | tee "$LOGS/download.log"
+    python3 "$ROOT/scripts/build-cache.py" downloads "$OPENWRT"
 }
 
 toolchain() {
     if [[ -f $WORK/cache-restored ]]; then
-        echo "Using compatible $(cat "$WORK/cache-restored") snapshot; tools will still be dependency-checked by make."
-        return
+        echo "Checking dependencies of restored $(cat "$WORK/cache-restored") products."
     fi
     run_make tools tools/install
     run_make toolchain toolchain/install
-    save_build toolchain
+    # Upgrade snapshots without download metadata once; compatible immutable
+    # snapshots need no repeated compression or upload on subsequent runs.
+    if [[ ! -f $WORK/cache-restored || ! -f $CACHE/toolchain/state.json ]] ||
+       ! python3 -c 'import json,sys; sys.exit("downloads" not in json.load(open(sys.argv[1])))' "$CACHE/toolchain/state.json"; then
+        save_build toolchain
+    fi
 }
 
 compile() {
