@@ -350,7 +350,7 @@ def collect_stock_npu(openwrt, output):
     destination.mkdir(parents=True, exist_ok=True)
     prefix = f"linux-firmware-{info['version']}/"
     wanted = {prefix + "airoha/" + name: name for name in BINARIES}
-    wanted[prefix + "LICENSE.airoha"] = "LICENSE"
+    wanted[prefix + "LICENSES/LICENSE.airoha"] = "LICENSE"
     found = set()
     # Read both paired blobs from the verified original archive in one pass.
     with tarfile.open(archive, mode="r|xz") as source:
@@ -365,12 +365,13 @@ def collect_stock_npu(openwrt, output):
                 installed = roots[0] / "lib/firmware/airoha" / name
                 if installed.read_bytes() != content:
                     raise ValueError(f"Image still contains a replaced NPU blob: {name}")
+                print(f"Verified original NPU blob: {name}")
             (destination / name).write_bytes(content)
             found.add(name)
             if found == set(wanted.values()):
                 break
     if found != set(wanted.values()):
-        raise ValueError("Original archive is missing the paired NPU blobs or license")
+        raise ValueError("Original archive is missing: " + ", ".join(sorted(set(wanted.values()) - found)))
     print("Verified both installed NPU blobs byte-for-byte against the original linux-firmware archive")
 
 
