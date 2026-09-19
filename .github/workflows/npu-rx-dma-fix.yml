@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: w1700k-npu-rx-dma-fix
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:

@@ -76,7 +76,7 @@ index 1d8da72..415287b 100644
  	u8 buf_offset;
  	u16 flags;
 diff --git a/mt7996/mac.c b/mt7996/mac.c
-index 6f07d7d..066af09 100644
+index 6f07d7d..ead9d7f 100644
 --- a/mt7996/mac.c
 +++ b/mt7996/mac.c
 @@ -2317,6 +2317,21 @@ mt7996_mac_reset_vif_iter(void *data, u8 *mac, struct ieee80211_vif *vif)
@@ -101,7 +101,7 @@ index 6f07d7d..066af09 100644
  static void
  mt7996_mac_full_reset(struct mt7996_dev *dev)
  {
-@@ -2337,6 +2352,15 @@ mt7996_mac_full_reset(struct mt7996_dev *dev)
+@@ -2337,6 +2352,16 @@ mt7996_mac_full_reset(struct mt7996_dev *dev)
  
  	mt76_abort_scan(&dev->mt76);
  
@@ -109,7 +109,8 @@ index 6f07d7d..066af09 100644
 +		/* A chip reset is not an NPU DMA reset. The shared NPU has no
 +		 * verified full-reset handshake; retain its buffers and stop once.
 +		 * Never free tokens beneath a timed-out DMA or loop MCU reloads. */
-+		mt7996_npu_hw_stop(dev);
++		/* Quarantine must not reset the source ID pool, even after ACK. */
++		mt7996_npu_hw_stop(dev, false);
 +		mt7996_npu_recovery_failed(dev);
 +		return;
 +	}
@@ -117,7 +118,7 @@ index 6f07d7d..066af09 100644
  	mutex_lock(&dev->mt76.mutex);
  	for (i = 0; i < 10; i++) {
  		if (!mt7996_mac_restart(dev))
-@@ -2393,6 +2417,8 @@ void mt7996_mac_reset_work(struct work_struct *work)
+@@ -2393,6 +2418,8 @@ void mt7996_mac_reset_work(struct work_struct *work)
  
  	dev = container_of(work, struct mt7996_dev, reset_work);
  	hw = mt76_hw(dev);
@@ -126,7 +127,7 @@ index 6f07d7d..066af09 100644
  
  	/* chip full reset */
  	if (dev->recovery.restart) {
-@@ -2406,6 +2432,8 @@ void mt7996_mac_reset_work(struct work_struct *work)
+@@ -2406,6 +2433,8 @@ void mt7996_mac_reset_work(struct work_struct *work)
  			dev->recovery.wm_reset_count++;
  
  		mt7996_mac_full_reset(dev);
@@ -135,19 +136,39 @@ index 6f07d7d..066af09 100644
  
  		/* enable mcu irq */
  		mt7996_irq_enable(dev, MT_INT_MCU_CMD);
-@@ -2431,7 +2459,10 @@ void mt7996_mac_reset_work(struct work_struct *work)
+@@ -2431,7 +2460,10 @@ void mt7996_mac_reset_work(struct work_struct *work)
  	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
  		mtk_wed_device_stop(&dev->mt76.mmio.wed);
  
 -	mt7996_npu_hw_stop(dev);
-+	if (mt7996_npu_hw_stop(dev)) {
++	if (mt7996_npu_hw_stop(dev, true)) {
 +		mt7996_npu_recovery_failed(dev);
 +		return;
 +	}
  	ieee80211_stop_queues(mt76_hw(dev));
  
  	set_bit(MT76_RESET, &dev->mphy.state);
-@@ -2503,7 +2534,11 @@ void mt7996_mac_reset_work(struct work_struct *work)
+@@ -2474,11 +2506,17 @@ void mt7996_mac_reset_work(struct work_struct *work)
+ 		idr_init(&dev->mt76.token);
+ 
+ 		mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+-		mt7996_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE);
++		if (!mt7996_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE) &&
++		    mt76_npu_device_active(&dev->mt76))
++			goto npu_failed;
++	} else if (mt76_npu_device_active(&dev->mt76)) {
++		goto npu_failed;
+ 	}
+ 
+ 	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
+-	mt7996_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE);
++	if (!mt7996_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE) &&
++	    mt76_npu_device_active(&dev->mt76))
++		goto npu_failed;
+ 
+ 	/* enable DMA Rx/Tx and interrupt */
+ 	mt7996_dma_start(dev, false, false);
+@@ -2503,7 +2541,11 @@ void mt7996_mac_reset_work(struct work_struct *work)
  				     MT_INT_TX_RX_DONE_EXT);
  	}
  
@@ -160,8 +181,20 @@ index 6f07d7d..066af09 100644
  
  	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
  	mt7996_for_each_phy(dev, phy)
+@@ -2546,6 +2588,11 @@ void mt7996_mac_reset_work(struct work_struct *work)
+ 					     MT7996_WATCHDOG_TIME);
+ 	dev_info(dev->mt76.dev,"\n%s L1 SER recovery completed.",
+ 		 wiphy_name(dev->mt76.hw->wiphy));
++	return;
++
++npu_failed:
++	mt7996_npu_recovery_failed(dev);
++	mutex_unlock(&dev->mt76.mutex);
+ }
+ 
+ /* firmware coredump */
 diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
-index 571dc0d..80a31f7 100644
+index 571dc0d..8424e2f 100644
 --- a/mt7996/mt7996.h
 +++ b/mt7996/mt7996.h
 @@ -493,6 +493,7 @@ struct mt7996_dev {
@@ -172,6 +205,51 @@ index 571dc0d..80a31f7 100644
  	} recovery;
  
  	/* protects coredump data */
+@@ -1012,7 +1013,7 @@ void mt7996_dma_rro_start(struct mt7996_dev *dev);
+ #ifdef CONFIG_MT7996_NPU
+ int __mt7996_npu_hw_init(struct mt7996_dev *dev);
+ int mt7996_npu_hw_init(struct mt7996_dev *dev);
+-int mt7996_npu_hw_stop(struct mt7996_dev *dev);
++int mt7996_npu_hw_stop(struct mt7996_dev *dev, bool reset_ids);
+ int mt7996_npu_rx_queues_init(struct mt7996_dev *dev);
+ #else
+ static inline int __mt7996_npu_hw_init(struct mt7996_dev *dev)
+@@ -1025,7 +1026,7 @@ static inline int mt7996_npu_hw_init(struct mt7996_dev *dev)
+ 	return 0;
+ }
+ 
+-static inline int mt7996_npu_hw_stop(struct mt7996_dev *dev)
++static inline int mt7996_npu_hw_stop(struct mt7996_dev *dev, bool reset_ids)
+ {
+ 	return 0;
+ }
+diff --git a/mt7996/npu.c b/mt7996/npu.c
+index b8006b8..52eeaa4 100644
+--- a/mt7996/npu.c
++++ b/mt7996/npu.c
+@@ -591,7 +591,7 @@ int mt7996_npu_hw_init(struct mt7996_dev *dev)
+ 	return err;
+ }
+ 
+-int mt7996_npu_hw_stop(struct mt7996_dev *dev)
++int mt7996_npu_hw_stop(struct mt7996_dev *dev, bool reset_ids)
+ {
+ 	struct airoha_npu *npu;
+ 	int i, err = 0;
+@@ -618,11 +618,11 @@ int mt7996_npu_hw_stop(struct mt7996_dev *dev)
+ 		usleep_range(10000, 15000);
+ 	}
+ 
+-	if (!err)
++	if (!err && reset_ids)
+ 		err = mt76_npu_send_msg(npu, 6,
+ 					WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
+ 					0, GFP_KERNEL);
+-	else
++	else if (err)
+ 		dev_err(dev->mt76.dev, "npu stop failed\n");
+ unlock:
+ 	mutex_unlock(&dev->mt76.mutex);
 diff --git a/npu.c b/npu.c
 index dd954df..9e446b3 100644
 --- a/npu.c
