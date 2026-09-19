@@ -1,0 +1,186 @@
+name: Build r36404 with FDK high-load progress fixes
+
+on:
+  push:
+    branches: [diagnostic/npu-high-load-r36404]
+    paths: ['.github/workflows/npu-high-load-fix.yml', 'scripts/**', 'patches/**', 'configs/npu-baseline/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  packages: read
+
+concurrency:
+  group: w1700k-npu-high-load-fix
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/diagnostic/npu-high-load-r36404'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    container:
+      image: ghcr.io/ack72/openwrt-w1700k-builds/build-environment@sha256:be2a253c033ce7ff3c20adc6d2ad0c121b3f7b2aa9f6737acbeaadb792f29652
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      OPENWRT_REF: 20ed53a1d3e75555300f63a0a7c66b9466e7b671
+      NPU_SOURCE: fdk
+      NPU_REF: 5be57de95af81f351c725e68452749f1fc92be72
+      FEEDS_LOCK: configs/npu-baseline/feeds.lock
+      BUILD_ENVIRONMENT: ghcr.io/ack72/openwrt-w1700k-builds/build-environment@sha256:be2a253c033ce7ff3c20adc6d2ad0c121b3f7b2aa9f6737acbeaadb792f29652
+      CACHE_PREFIX: w1700k-v3-Linux-ARM64
+      CCACHE_MAXSIZE: 3G
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate builder and pin original RC metadata
+        id: official
+        run: |
+          for script in scripts/*.sh; do bash -n "$script"; done
+          python3 -m compileall -q scripts
+          test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(uname -m)" = aarch64
+          mkdir -p .work
+          cp configs/npu-baseline/source-stack.json .work/source-stack.json
+          cp configs/npu-baseline/distfeeds-source.json .work/distfeeds-source.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import hashlib, json
+          from pathlib import Path
+          source = json.loads(Path('.work/distfeeds-source.json').read_text())
+          extractor = hashlib.sha256(Path('scripts/distfeeds.py').read_bytes()).hexdigest()[:16]
+          print(f"cache-key=w1700k-v2-shared-distfeeds-{extractor}-{source['sha256']}")
+          PY
+      - name: Authenticate cache recovery storage
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: echo "$REGISTRY_TOKEN" | oras login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Restore the original RC's official feed metadata
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .cache/distfeeds
+          key: ${{ steps.official.outputs.cache-key }}
+      - name: Validate pinned official feed metadata
+        run: python3 scripts/distfeeds.py prepare .work/distfeeds-source.json .cache/distfeeds
+      - name: Prepare exact RC source and fixed FDK firmware
+        run: |
+          bash scripts/build.sh prepare
+          bash scripts/build.sh npu
+          test "$(git -C .work/npu rev-parse HEAD)" = "$NPU_REF"
+          CC=clang-18 python3 .work/npu/tests/test_host_tx_tokens.py
+          CC=clang-18 python3 .work/npu/tests/test_rx_dma.py
+          CC=clang-18 python3 .work/npu/tests/test_completion_progress.py
+          test -e .work/openwrt/package/firmware/airoha-npu-fdk/Makefile
+      - name: Configure the same package feeds and firmware settings
+        id: keys
+        run: |
+          bash scripts/build.sh configure
+          cat .work/keys.env >> "$GITHUB_OUTPUT"
+          cmp configs/npu-baseline/feeds.lock .work/feeds.lock
+      - name: Restore source downloads
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .cache/dl
+          key: ${{ env.CACHE_PREFIX }}-dl-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ env.CACHE_PREFIX }}-dl-
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .cache/ccache
+          key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-
+      - name: Restore compatible toolchain
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .cache/toolchain
+          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-dl1
+          restore-keys: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}
+      - name: Restore compatible kernel and package objects
+        uses: actions/cache/restore@v6.1.0
+        with:
+          path: .cache/build
+          key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-
+      - name: Recover compiler cache if necessary
+        if: steps.ccache.outputs.cache-matched-key == ''
+        run: python3 scripts/cache-seed.py restore ccache '${{ steps.keys.outputs.toolchain }}' .cache/ccache
+      - name: Restore verified build products
+        run: bash scripts/build.sh restore
+      - name: Download pinned firmware sources
+        run: bash scripts/build.sh download
+      - name: Build missing tools and toolchain
+        run: bash scripts/build.sh toolchain
+      - name: Prepare and test the actual patched mt76 source
+        run: |
+          make -C .work/openwrt package/kernel/mt76/prepare V=s
+          mt76=$(find .work/openwrt/build_dir -type d -name 'mt76-*' | head -n 1)
+          test -n "$mt76"
+          header=$(find .work/openwrt/build_dir -path '*/linux-6.18.52/include/linux/soc/airoha/airoha_offload.h' | head -n 1)
+          test -n "$header"
+          CC=clang-18 python3 scripts/test-npu-rx.py "$mt76" "$header"
+          mkdir -p logs/mt76-prepared
+          cp "$mt76"/npu.c "$mt76"/airoha_offload.h logs/mt76-prepared/
+          cp "$header" logs/mt76-prepared/kernel-airoha_offload.h
+      - name: Compile full firmware with FDK high-load progress fixes
+        run: bash scripts/build.sh compile
+      - name: Collect fixed FDK firmware and record provenance
+        id: collect
+        run: |
+          bash scripts/build.sh collect
+          destination=$(cat .work/artifact-path)
+          image=$(find "$destination/firmware" -maxdepth 1 -name '*sysupgrade.itb' -type f)
+          test -n "$image"
+          cp "$image" "$destination/openwrt-airoha-an7581-gemtek_w1700k-ubi-squashfs-sysupgrade-w1700k-oc-rc-r36404-fdk-high-load-fix.itb"
+          python3 - "$destination/build-manifest.json" <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          path = Path(sys.argv[1])
+          data = json.loads(path.read_text())
+          assert data['npu'] == os.environ['NPU_REF']
+          assert data['npu_source'] == 'fdk'
+          data['build_type'] = 'diagnostic'
+          path.write_text(json.dumps(data, indent=2) + '\n')
+          PY
+          mkdir -p "$destination/mt76-patches"
+          cp patches/mt76/*.patch "$destination/mt76-patches/"
+          cp .work/npu/docs/mt7996-rx-dma-contract.md "$destination/"
+          cp .work/npu/docs/mt7996-high-load-progress.md "$destination/"
+          # Preserve original filenames referenced by profiles.json and sha256sums.
+          (cd "$destination" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          echo "path=$destination" >> "$GITHUB_OUTPUT"
+          cat "$destination/build-manifest.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload full firmware with FDK high-load progress fixes
+        if: steps.collect.outcome == 'success'
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: w1700k-r36404-fdk-high-load-fix-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.collect.outputs.path }}
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: fdk-high-load-fix-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            logs/
+            .work/openwrt/logs/
+            .work/build-state.json
+            .work/source-stack.json
+            .work/sources.env
+            .work/feeds.lock
+            .work/requested.config
+            .work/openwrt/.config
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
