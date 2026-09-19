@@ -76,7 +76,7 @@ index 1d8da72..415287b 100644
  	u8 buf_offset;
  	u16 flags;
 diff --git a/mt7996/mac.c b/mt7996/mac.c
-index 6f07d7d..ead9d7f 100644
+index 6f07d7d..d62a734 100644
 --- a/mt7996/mac.c
 +++ b/mt7996/mac.c
 @@ -2317,6 +2317,21 @@ mt7996_mac_reset_vif_iter(void *data, u8 *mac, struct ieee80211_vif *vif)
@@ -87,7 +87,7 @@ index 6f07d7d..ead9d7f 100644
 +{
 +	struct mt7996_phy *phy;
 +
-+	dev->recovery.failed = true;
++	WRITE_ONCE(dev->recovery.failed, true);
 +	set_bit(MT76_MCU_RESET, &dev->mphy.state);
 +	mt7996_for_each_phy(dev, phy)
 +		set_bit(MT76_RESET, &phy->mt76->state);
@@ -193,15 +193,46 @@ index 6f07d7d..ead9d7f 100644
  }
  
  /* firmware coredump */
+@@ -2843,7 +2890,14 @@ void mt7996_mac_work(struct work_struct *work)
+ 					       mac_work.work);
+ 	phy = mphy->priv;
+ 
++	if (READ_ONCE(phy->dev->recovery.failed))
++		return;
++
+ 	mutex_lock(&mphy->dev->mutex);
++	if (READ_ONCE(phy->dev->recovery.failed)) {
++		mutex_unlock(&mphy->dev->mutex);
++		return;
++	}
+ 
+ 	mt76_update_survey(mphy);
+ 	if (++mphy->mac_work_count == 5) {
+diff --git a/mt7996/mcu.c b/mt7996/mcu.c
+index 5ed48e4..8857ab9 100644
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -536,6 +536,11 @@ mt7996_mcu_send_message(struct mt76_dev *mdev, struct sk_buff *skb,
+ 	u32 val;
+ 	u8 seq;
+ 
++	if (READ_ONCE(dev->recovery.failed)) {
++		dev_kfree_skb(skb);
++		return -EIO;
++	}
++
+ 	mt7996_mcu_set_timeout(mdev, cmd);
+ 
+ 	seq = ++dev->mt76.mcu.msg_seq & 0xf;
 diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
-index 571dc0d..8424e2f 100644
+index 571dc0d..be5f3fa 100644
 --- a/mt7996/mt7996.h
 +++ b/mt7996/mt7996.h
 @@ -493,6 +493,7 @@ struct mt7996_dev {
  		bool hw_full_reset:1;
  		bool hw_init_done:1;
  		bool restart:1;
-+		bool failed:1;
++		bool failed;
  	} recovery;
  
  	/* protects coredump data */
