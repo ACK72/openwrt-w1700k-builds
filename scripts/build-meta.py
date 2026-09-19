@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import subprocess
+import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -273,7 +274,9 @@ def keys(openwrt, npu):
     build = hashlib.sha256(("build-v3" + base_inputs + kernel_hash + vermagic).encode()).hexdigest()
     state = {
         "openwrt": git(openwrt, "rev-parse", "HEAD"),
-        "npu": git(npu, "rev-parse", "HEAD"),
+        "npu": ("linux-firmware:" + stock_npu_info(openwrt)["version"]
+                if os.environ.get("NPU_SOURCE") == "linux-firmware" else git(npu, "rev-parse", "HEAD")),
+        "npu_source": os.environ.get("NPU_SOURCE", "fdk"),
         "feeds": feeds, "builder": builder_hash, "builder_commit": commit, "toolchain": toolchain,
         "host": host_hash, "build": build,
         "config": digest_paths(openwrt, [".config"]), "channel": "w1700k-oc-rc",
@@ -300,8 +303,9 @@ def manifest(openwrt, npu, output):
     state["built_at"] = datetime.now(timezone.utc).isoformat()
     state["official_distfeeds"] = json.loads((openwrt.parent / "distfeeds.json").read_text(encoding="utf-8"))
     state["changelog"] = git(openwrt, "log", "-20", "--format=%h %s", "--abbrev=10", "HEAD").splitlines()
-    state["npu_compiler"] = subprocess.check_output(["clang-18", "--version"], text=True).strip()
-    state["npu_patches"] = {
+    stock = state.get("npu_source") == "linux-firmware"
+    state["npu_compiler"] = None if stock else subprocess.check_output(["clang-18", "--version"], text=True).strip()
+    state["npu_patches"] = {} if stock else {
         path.name: hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted((ROOT / "patches/npu").glob("*.patch"))
     }
@@ -309,12 +313,74 @@ def manifest(openwrt, npu, output):
         name: hashlib.sha256((output / "npu" / name).read_bytes()).hexdigest()
         for name in BINARIES
     }
+    if stock:
+        state["npu_upstream"] = stock_npu_info(openwrt)
+        state["build_type"] = "diagnostic"
     (output / "build-manifest.json").write_text(json.dumps(state, indent=2) + "\n")
+
+
+def stock_npu_info(openwrt):
+    directory = openwrt / "package/firmware/linux-firmware"
+    recipe = directory / "airoha.mk"
+    if recipe.read_bytes() != subprocess.check_output(
+            ["git", "-c", f"safe.directory={openwrt.resolve()}", "-C", str(openwrt),
+             "show", "HEAD:package/firmware/linux-firmware/airoha.mk"]):
+        raise ValueError("Stock NPU recipe differs from the pinned OpenWrt source")
+    if (openwrt / "package/firmware/airoha-npu-fdk").exists():
+        raise ValueError("FDK replacement package must not exist in a stock NPU build")
+    makefile = (directory / "Makefile").read_text()
+    version = re.search(r"^PKG_VERSION:=(\d+)$", makefile, re.M)
+    checksum = re.search(r"^PKG_HASH:=([a-f0-9]{64})$", makefile, re.M)
+    if not version or not checksum or f"BuildPackage,{PACKAGE}" not in recipe.read_text():
+        raise ValueError("Unexpected upstream linux-firmware recipe")
+    return {"provider": "linux-firmware", "version": version[1], "archive_sha256": checksum[1],
+            "recipe_sha256": hashlib.sha256(recipe.read_bytes()).hexdigest()}
+
+
+def collect_stock_npu(openwrt, output):
+    info = stock_npu_info(openwrt)
+    archive = openwrt / "dl" / f"linux-firmware-{info['version']}.tar.xz"
+    with archive.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != info["archive_sha256"]:
+            raise ValueError("Original linux-firmware archive checksum mismatch")
+    roots = list((openwrt / "build_dir").glob("target-*/root-airoha"))
+    if len(roots) != 1:
+        raise ValueError("Expected exactly one image rootfs")
+    destination = output / "npu"
+    destination.mkdir(parents=True, exist_ok=True)
+    prefix = f"linux-firmware-{info['version']}/"
+    wanted = {prefix + "airoha/" + name: name for name in BINARIES}
+    wanted[prefix + "LICENSE.airoha"] = "LICENSE"
+    found = set()
+    # Read both paired blobs from the verified original archive in one pass.
+    with tarfile.open(archive, mode="r|xz") as source:
+        for member in source:
+            name = wanted.get(member.name)
+            if name is None:
+                continue
+            if not member.isfile() or not 0 < member.size < 32 * 1024 * 1024:
+                raise ValueError("Invalid original firmware archive member")
+            content = source.extractfile(member).read()
+            if name in BINARIES:
+                installed = roots[0] / "lib/firmware/airoha" / name
+                if installed.read_bytes() != content:
+                    raise ValueError(f"Image still contains a replaced NPU blob: {name}")
+            (destination / name).write_bytes(content)
+            found.add(name)
+            if found == set(wanted.values()):
+                break
+    if found != set(wanted.values()):
+        raise ValueError("Original archive is missing the paired NPU blobs or license")
+    print("Verified both installed NPU blobs byte-for-byte against the original linux-firmware archive")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("check-stock-npu").add_argument("openwrt", type=Path)
+    collect_parser = subparsers.add_parser("collect-stock-npu")
+    collect_parser.add_argument("openwrt", type=Path)
+    collect_parser.add_argument("output", type=Path)
     for command in ("install-npu", "keys", "manifest", "check-config", "feed-packages", "check-installed"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("openwrt", type=Path)
@@ -325,7 +391,11 @@ def main():
             if command != "keys":
                 subparser.add_argument("output", type=Path)
     args = parser.parse_args()
-    if args.command == "check-config":
+    if args.command == "check-stock-npu":
+        print(json.dumps(stock_npu_info(args.openwrt), sort_keys=True))
+    elif args.command == "collect-stock-npu":
+        collect_stock_npu(args.openwrt, args.output)
+    elif args.command == "check-config":
         check_config(args.openwrt, args.profile)
     elif args.command == "check-installed":
         check_installed(args.openwrt)

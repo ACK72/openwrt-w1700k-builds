@@ -14,6 +14,9 @@ OPENWRT_REPO=${OPENWRT_REPO:-}
 OPENWRT_REF=${OPENWRT_REF:-w1700k-oc-rc}
 NPU_REPO=${NPU_REPO:-}
 NPU_REF=${NPU_REF:-main}
+NPU_SOURCE=${NPU_SOURCE:-fdk}
+export NPU_SOURCE
+[[ $NPU_SOURCE == fdk || $NPU_SOURCE == linux-firmware ]] || { echo 'Invalid NPU_SOURCE' >&2; exit 1; }
 CONFIG_FILE=${CONFIG_FILE:-$ROOT/configs/w1700k.config}
 export CCACHE_COMPILERCHECK=content
 export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-3G}
@@ -89,8 +92,9 @@ npu_key() {
 prepare() {
     local key
     OPENWRT_REPO=${OPENWRT_REPO:-$(python3 "$ROOT/scripts/repositories.py" openwrt)}
-    NPU_REPO=${NPU_REPO:-$(python3 "$ROOT/scripts/repositories.py" airoha-npu-fdk)}
     checkout_source "$OPENWRT_REPO" "$OPENWRT_REF" "$OPENWRT" full
+    if [[ $NPU_SOURCE == fdk ]]; then
+    NPU_REPO=${NPU_REPO:-$(python3 "$ROOT/scripts/repositories.py" airoha-npu-fdk)}
     checkout_source "$NPU_REPO" "$NPU_REF" "$NPU"
     for patch_file in "$ROOT"/patches/npu/*.patch; do
         if git -C "$NPU" apply --check "$patch_file"; then
@@ -101,6 +105,7 @@ prepare() {
             die "FDK compatibility patch no longer applies: $patch_file"
         fi
     done
+    fi
     mkdir -p "$CACHE/dl" "$CACHE/npu"
     if [[ -L $OPENWRT/dl ]]; then
         [[ $(readlink -f "$OPENWRT/dl") == "$CACHE/dl" ]] || die 'Unexpected dl symlink'
@@ -109,16 +114,32 @@ prepare() {
     else
         ln -s "$CACHE/dl" "$OPENWRT/dl"
     fi
-    key=$(npu_key)
+    # Preserve the existing compiler-cache configuration in both NPU variants.
+    sed -i 's/export CCACHE_NOCOMPRESS:=true/export CCACHE_COMPRESS:=true/' "$OPENWRT/rules.mk"
+    if [[ $NPU_SOURCE == fdk ]]; then
+        key=$(npu_key)
+    else
+        python3 "$ROOT/scripts/build-meta.py" check-stock-npu "$OPENWRT"
+        key=$(sha256sum "$OPENWRT/package/firmware/linux-firmware/Makefile" "$OPENWRT/package/firmware/linux-firmware/airoha.mk" | sha256sum | cut -d' ' -f1)
+    fi
     {
         echo "openwrt=$(git -C "$OPENWRT" rev-parse HEAD)"
-        echo "npu=$(git -C "$NPU" rev-parse HEAD)"
+        if [[ $NPU_SOURCE == fdk ]]; then
+            echo "npu=$(git -C "$NPU" rev-parse HEAD)"
+        else
+            echo 'npu=linux-firmware'
+        fi
         echo "npu-key=$key"
     } | tee "$WORK/sources.env"
 }
 
 build_npu() {
     local key
+    if [[ $NPU_SOURCE == linux-firmware ]]; then
+        python3 "$ROOT/scripts/build-meta.py" check-stock-npu "$OPENWRT"
+        echo 'Using the unchanged linux-firmware MT7996 NPU package; FDK checkout/build/install skipped.'
+        return
+    fi
     key=$(npu_key)
     if [[ -f $CACHE/npu/source-key && $(cat "$CACHE/npu/source-key") == "$key" ]] &&
        [[ -s $CACHE/npu/debug/firmware.elf && -s $CACHE/npu/debug/firmware.map ]] &&
@@ -305,9 +326,13 @@ collect() {
     cp "$WORK/image-metadata.json" "$dest/image-metadata.json"
     cp "$OPENWRT/public-key.pem" "$dest/public-key.pem"
     "$OPENWRT/scripts/diffconfig.sh" > "$dest/config.diff"
-    cp "$CACHE/npu/"*.bin "$dest/npu/"
-    cp "$NPU/LICENSE" "$dest/npu/LICENSE"
-    cp -r "$CACHE/npu/debug" "$dest/npu/"
+    if [[ $NPU_SOURCE == fdk ]]; then
+        cp "$CACHE/npu/"*.bin "$dest/npu/"
+        cp "$NPU/LICENSE" "$dest/npu/LICENSE"
+        cp -r "$CACHE/npu/debug" "$dest/npu/"
+    else
+        python3 "$ROOT/scripts/build-meta.py" collect-stock-npu "$OPENWRT" "$dest"
+    fi
     python3 "$ROOT/scripts/build-meta.py" manifest "$OPENWRT" "$NPU" "$dest"
     # Packages selected with =y are already installed in the image rootfs.
     # Keep diagnostics in the Actions artifact; releases publish only the ITB.

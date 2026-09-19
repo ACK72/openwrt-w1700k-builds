@@ -1,0 +1,136 @@
+{
+  "schema": 1,
+  "upstream": "b6ba4e9142b7e926dd3822beffdae26de34da98e",
+  "fanboy": "de3344f9e648b461014084052e65eac82fc159a7",
+  "fanboy_base": "b6ba4e9142b7e926dd3822beffdae26de34da98e",
+  "fanboy_result": "751da391d62837f96c102a22bfeae63253fb4cfc",
+  "fanboy_commits": [
+    {
+      "original": "80329004245c6048542d61afe705f28b53e751bc",
+      "applied": "60893050eb6f6c8eba099b7a3295fa8a7fb1733d"
+    },
+    {
+      "original": "05577f0895cae9e198b10dbc5997235cd95b8c76",
+      "applied": "bd16d49612b49f873d82ac06361600940fdf51f8"
+    },
+    {
+      "original": "adec69722b591a3eb828d2cf2725d69bceef69f4",
+      "applied": "a3538ea9f4d17ab5751be2655d6ffd79ee563c45"
+    },
+    {
+      "original": "1c22899c3523f1eb06acdfebf0bd1e94f64b3ab5",
+      "applied": "9f506a6670751b14029c278fc59818402eeb9303"
+    },
+    {
+      "original": "e377518b4ae935c24f25c3d57b6242ea56927c38",
+      "applied": "9a7fc56e8d78fb61b29a8db9ec3b471032519a71"
+    },
+    {
+      "original": "1f9059aab93be47b0a855e9d00efbf9c41b26f7f",
+      "applied": "81fdd8214f8b53570b6a9d5568ca14c38983b030"
+    },
+    {
+      "original": "6ca4044a13792e795e5d74f8396f48dc2a4c4b2a",
+      "applied": "dd5ad6d54ec4a1cb9578cb8f009edec3b02d0438"
+    },
+    {
+      "original": "2897c04a386dbcce742b084ec2fd47386ae1af3c",
+      "applied": "365bbd8f1ec9bcc9ea0a540e3a70bc12c2a38a57"
+    },
+    {
+      "original": "a67b58ffd00200196bd29d81481cc6b272ffe9db",
+      "applied": "8daff74a1a68c21048100cfd43d420e507a9e31a"
+    },
+    {
+      "original": "8c54ebb8c3756f0f0bb825709683a1b67969d726",
+      "applied": "d6162be404527c5fe3d0406053dcc39d7f8fe359"
+    },
+    {
+      "original": "8e25ee3f2e6b2f10202efcbedbdcd056e097e136",
+      "applied": "7499760e75b4fec63416cbe60b82bda57ec8025c"
+    },
+    {
+      "original": "7d60f9b3636223ecfdba6f68449a2e6e32416d19",
+      "applied": "b8e47ff5123ee91c4d74f3c93ae685383f0215c6"
+    },
+    {
+      "original": "3b6c7d728ff96fc6a6afb2c65e33982b452b9005",
+      "applied": "14da82445663e47bed4a478f795d62e57cc8c0d2"
+    },
+    {
+      "original": "586a2fd61052e7a7a5c1ceeda948c0933f76aad7",
+      "applied": "1f4ca2ed312dd3c86bcc54ebc179ebac73f14dcf"
+    },
+    {
+      "original": "69cbd694ea7fc6fc8da3da0daa40d21ef77c42f5",
+      "applied": "c006bb68e923baf1597bc2e7b86f123cc7e37f4c"
+    },
+    {
+      "original": "26bb8e8aac9a2b06cfb084ff85fe64b7ee7fa158",
+      "applied": "7ac5c0176c133e177c9bbc6920143b966bbbe929"
+    },
+    {
+      "original": "c2bdd64d1d1f0af08f97db810945fef18c9a4a2e",
+      "applied": "7070b7f57b4bce1afd302e2539508f570cf0f300"
+    },
+    {
+      "original": "1f6ebdbb2e52b8c3280312caecebef642f6b63a9",
+      "applied": "d8bf94d312d7a36d0d64ee6ac246b841208a841a"
+    },
+    {
+      "original": "90b2db969926e4630c7604cfe5bf60c439d96ce0",
+      "applied": "d081e7e7bee8c3378d36ceb685270f648c83e89f"
+    },
+    {
+      "original": "d26bdf93737881f9d29a08bd7d73d6c9961ec465",
+      "applied": "9e5fe4f93b075bb59175c8009435c599108ec88e"
+    },
+    {
+      "original": "513aa20fe0a6f17022c886578faebd115496b182",
+      "applied": "c24188b245436139eced4b16531ce6e6278aacb2"
+    },
+    {
+      "original": "d261581894676b2e8e74a79d47e52e47ae727eb0",
+      "applied": "caaee59b6820a4029e5544cd26f86497fd47fc19"
+    },
+    {
+      "original": "de3344f9e648b461014084052e65eac82fc159a7",
+      "applied": "751da391d62837f96c102a22bfeae63253fb4cfc"
+    }
+  ],
+  "local_patches": [
+    {
+      "file": "0001-hostapd-omit-MLO-link-ID-for-non-MLO-STA-VLAN-bindin.patch",
+      "original": "9daeb623743a701821fda2c2c049298154183137",
+      "applied": "3e651152be70ef4fd6bba21b1867e2e075a99866",
+      "sha256": "02b8f755f234f70ac0a9d97a1783403b97786300d9cf238f9a64d53544e5a4e0"
+    },
+    {
+      "file": "0002-wifi-add-mt76-patches-to-improve-6-GHz-EHT320-perfor.patch",
+      "original": "0a4696e1fd21129120b947b4378275d4002e1b6a",
+      "applied": "7dce28fad1f952144967ce38b5b3078e45e70834",
+      "sha256": "917a868068e7e7d625a48ba9160ff9ec80c321be1f196a184f19990ff9f5d1b4"
+    },
+    {
+      "file": "0003-kernel-add-backports-for-EIP93-fixes.patch",
+      "original": "5bb8b4d8807dffe0789ba46bdeebabcd9a7a27b6",
+      "applied": "d9ddcc6bafff050c7293c9054409ae32e2473bef",
+      "sha256": "7599b53ba28fddad0ab13ac8f467f47903c71c5c8b5a5119d5438a675cdd2c27"
+    },
+    {
+      "file": "0004-package-bump-mt76-and-hostapd-releases-after-backpor.patch",
+      "original": "3700cffc4fc64e6a68fa1016831f8ba7405ce103",
+      "applied": "20ed53a1d3e75555300f63a0a7c66b9466e7b671",
+      "sha256": "18a8140a0fb9b403b1d94850554316355ee5024a4ff1dd233486a216aa710630"
+    }
+  ],
+  "patch_digest": "3be27406b1f193482c7558a24ab748db9f5eb529858e7e09cbcf23cb49185c5d",
+  "builder_commit": "20fc6b9f8b2591d666d07182d733a7478ec1fccc",
+  "source": "20ed53a1d3e75555300f63a0a7c66b9466e7b671",
+  "previous": {
+    "main": "b6ba4e9142b7e926dd3822beffdae26de34da98e",
+    "ubi2-oc": "de3344f9e648b461014084052e65eac82fc159a7",
+    "w1700k-oc-rc": "20ed53a1d3e75555300f63a0a7c66b9466e7b671"
+  },
+  "source_tag": "w1700k-oc-rc-source-35432580608-1"
+}
