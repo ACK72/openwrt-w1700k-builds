@@ -143,6 +143,13 @@ distfeeds() {
 configure() {
     local profile feeds_file
     local feed_packages=()
+    if [[ -n ${GOLANG_BOOTSTRAP_ROOT:-} ]]; then
+        [[ $GOLANG_BOOTSTRAP_ROOT == /* && $GOLANG_BOOTSTRAP_ROOT != *'"'* ]] || die 'Invalid Go bootstrap path'
+        [[ -x $GOLANG_BOOTSTRAP_ROOT/bin/go && -d $GOLANG_BOOTSTRAP_ROOT/src ]] || die 'External Go bootstrap is incomplete'
+        "$GOLANG_BOOTSTRAP_ROOT/bin/go" version
+    elif [[ $(uname -m) == aarch64 ]]; then
+        die 'ARM64 builds require GOLANG_BOOTSTRAP_ROOT pointing to a compatible native Go installation.'
+    fi
     # Resolve caller-supplied relative paths before entering the source tree.
     profile=$(realpath -e -- "$CONFIG_FILE")
     feeds_file=$(realpath -e -- "${FEEDS_LOCK:-$OPENWRT/feeds.conf.default}")
@@ -169,6 +176,10 @@ configure() {
         sed -i "s|@BUILDER_RELEASES_URL@|$release_url/releases|g" .config
     fi
     printf 'CONFIG_CCACHE_DIR="%s"\n' "$CCACHE_DIR" >> .config
+    if [[ -n ${GOLANG_BOOTSTRAP_ROOT:-} ]]; then
+        printf 'CONFIG_GOLANG_EXTERNAL_BOOTSTRAP_ROOT="%s"\n# CONFIG_GOLANG_BUILD_BOOTSTRAP is not set\n' \
+            "$GOLANG_BOOTSTRAP_ROOT" >> .config
+    fi
     # Validate Kconfig against the effective request, including builder overrides.
     cp .config "$WORK/requested.config"
     make defconfig 2>&1 | tee "$LOGS/defconfig.log"
@@ -238,6 +249,7 @@ toolchain() {
 }
 
 compile() {
+    local status=0
     # Cached package stamps are reusable; previously emitted images/APKs are not.
     # This path is always the builder-owned .work checkout, never a sibling repo.
     [[ ! -L $OPENWRT/bin ]] || die 'Unexpected output directory symlink'
@@ -251,13 +263,15 @@ compile() {
         # Regenerate release identity and the public package key for this run.
         run_make base-files-clean package/base-files/clean
     fi
-    if ! run_make build; then
-        echo 'Parallel build failed; retrying once with one job and full diagnostics.' >&2
-        make -C "$OPENWRT" -j1 V=s 2>&1 | tee "$LOGS/build-retry.log"
-    fi
+    run_make build || status=$?
     if ! "$OPENWRT/staging_dir/host/bin/ccache" -s 2>&1 | tee "$LOGS/ccache.log"; then
-        echo 'WARNING: Could not collect ccache statistics; firmware compilation succeeded.' >&2
+        echo 'WARNING: Could not collect ccache statistics.' >&2
     fi
+    if (( status != 0 )); then
+        echo 'Firmware compilation failed. See build.log and the per-package logs in the diagnostic artifact.' >&2
+        echo 'The complete build will not be repeated serially; compiler and download caches are retained.' >&2
+    fi
+    return "$status"
 }
 
 collect() {

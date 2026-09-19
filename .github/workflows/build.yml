@@ -133,10 +133,19 @@ jobs:
           name: ${{ needs.compose.outputs.artifact-name }}
           path: .work
       - name: Validate release builder
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           for script in scripts/*.sh; do bash -n "$script"; done
           python3 -m compileall -q scripts
           node --check package/w1700k-custom/overview.js
+          test "$(uname -m)" = aarch64
+          test "$("$GOLANG_BOOTSTRAP_ROOT/bin/go" env GOHOSTOS GOHOSTARCH | paste -sd /)" = linux/arm64
+          "$GOLANG_BOOTSTRAP_ROOT/bin/go" version
+          gh --version
+          gh api --paginate --slurp "repos/$GH_REPO/actions/caches?per_page=100" > .work/cache-inventory.json
+          python3 -c 'import json; pages=json.load(open(".work/cache-inventory.json")); print("Cache API verified:", sum(len(p["actions_caches"]) for p in pages), "entries")'
       - name: Reclaim space only when needed
         run: |
           available=$(df --output=avail -BG . | tail -1 | tr -dc '0-9')
@@ -290,7 +299,6 @@ jobs:
             echo "build-attempt=$GITHUB_RUN_ATTEMPT"
           } >> "$GITHUB_OUTPUT"
           cat .work/build-state.json >> "$GITHUB_STEP_SUMMARY"
-          cat logs/timings.tsv >> "$GITHUB_STEP_SUMMARY"
       - name: Upload validated release payload
         if: steps.collect.outcome == 'success'
         id: firmware
@@ -336,6 +344,15 @@ jobs:
           kind: dl
           path: .cache/dl
           key: ${{ env.CACHE_PREFIX }}-dl-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Report build timings even on failure
+        if: always()
+        run: |
+          if [[ -f logs/timings.tsv ]]; then
+            {
+              printf '\n| Phase | Seconds | Exit code |\n| --- | ---: | ---: |\n'
+              awk -F '\t' '{printf "| %s | %s | %s |\n", $1, $2, $3}' logs/timings.tsv
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Retain only caches whose replacement was successfully saved
         if: always() && steps.official.outcome == 'success'
         continue-on-error: true
@@ -358,6 +375,7 @@ jobs:
             .work/openwrt/logs/
             .work/build-state.json
             .work/cache-budget.json
+            .work/cache-inventory.json
             .work/source-stack.json
             .work/sources.env
             .work/feeds.lock

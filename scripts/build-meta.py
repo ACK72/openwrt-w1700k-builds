@@ -248,7 +248,10 @@ def keys(openwrt, npu):
     if not re.fullmatch(r"[a-f0-9]{32}", vermagic):
         raise ValueError("Missing or invalid official kernel vermagic")
     distfeeds = digest_paths(openwrt, ["files/etc/vermagic.txt", "files/etc/apk/repositories.d/distfeeds.list"])
-    base_inputs = toolchain + config_digest(openwrt / ".config")
+    bootstrap_root = read_config(openwrt / ".config").get("CONFIG_GOLANG_EXTERNAL_BOOTSTRAP_ROOT", '""').strip('"')
+    # Host Go changes invalidate package products, not the C/C++ cross-toolchain.
+    bootstrap = digest_paths(Path(bootstrap_root), ["bin", "pkg", "src", "VERSION"]) if bootstrap_root else ""
+    base_inputs = toolchain + config_digest(openwrt / ".config") + bootstrap
     build_base = hashlib.sha256(base_inputs.encode()).hexdigest()
     kernel_hash = digest_paths(openwrt, kernel_inputs(openwrt))
     build = hashlib.sha256(("build-v3" + base_inputs + kernel_hash + vermagic).encode()).hexdigest()
@@ -260,7 +263,8 @@ def keys(openwrt, npu):
         "config": digest_paths(openwrt, [".config"]), "channel": "w1700k-oc-rc",
         "distfeeds": distfeeds, "vermagic": vermagic, "build_base": build_base,
         "toolchain_source": source_hash, "toolchain_config": tool_config,
-        "kernel_source": kernel_hash, "environment": os.environ.get("BUILD_ENVIRONMENT", "local"),
+        "kernel_source": kernel_hash, "go_bootstrap": bootstrap,
+        "environment": os.environ.get("BUILD_ENVIRONMENT", "local"),
     }
     fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
     state["fingerprint"] = fingerprint
