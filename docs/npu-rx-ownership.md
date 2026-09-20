@@ -35,3 +35,19 @@ three actions. Writable sessions now omit the attribute using LuCI's null
 convention. Read-only/denied sessions retain disabled controls and the
 existing backend ACLs are unchanged. The view regression tests exercise all
 three buttons for writable, read-only and denied sessions.
+# GitHub upgrade follow-up
+
+Live testing also found two backend issues after enabling the buttons:
+
+* OpenWrt builds jq without Oniguruma. The release filter now uses ASCII character
+  and exact prefix/suffix checks instead of `test()`, preserving the tag, image,
+  URL and SHA-256 restrictions. Invalid and duplicate assets remain excluded.
+* Returning from BusyBox ash with a background worker and a final builtin
+  `printf` consistently timed out through `rpcd file.exec`, even after the worker
+  had completed. Ending the foreground helper with `exec /bin/echo` returned in
+  about 0.2 seconds in five consecutive device tests. The worker retains its
+  separate stdin/stdout/stderr; operation completion is still polled separately.
+
+`tests/test_upgrade_releases.py` tests the actual helper filter. Its three test
+methods (including malformed metadata cases) also passed using the installed
+router jq, without adding a regex library or expanding web ACLs.
