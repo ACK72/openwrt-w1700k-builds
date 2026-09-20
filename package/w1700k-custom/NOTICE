@@ -21,6 +21,9 @@ The earlier patch text was not copied because its independent license grant
 was not explicit. The new patch is an exception to this builder's GPL-2.0-only
 default and retains the target component's Apache-2.0 licensing.
 
+The missing-wireless-device fix in luci-base is a new Apache-2.0 change
+by ACK72 (2026), retaining the target LuCI component's license.
+
 Corresponding customization source, patches and build scripts:
 Project source and releases: see the firmware's configured release repository.
 The exact builder commit, source and feed revisions are retained with each

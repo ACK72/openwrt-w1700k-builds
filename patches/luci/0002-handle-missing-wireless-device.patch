@@ -1,6 +1,8 @@
 From: ACK72 <ACK72@users.noreply.github.com>
 Subject: [PATCH] luci-base: do not instantiate a missing wireless device
 
+SPDX-License-Identifier: Apache-2.0
+
 A disabled or transitioning wireless interface may have neither a runtime
 ifname nor a synthetic network ID (for example, a list-valued device option
 from wifi-scripts). WifiNetwork.getDevice() must return null in that case,
