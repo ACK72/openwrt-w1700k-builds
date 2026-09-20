@@ -98,7 +98,7 @@ release_list() {
           | select($image.digest | strings | digest)
           | select($image.size | numbers | . > 0 and . <= $max and . == floor)
           | select($image.browser_download_url == ("https://github.com/" + $repo + "/releases/download/" + .tag_name + "/" + $image.name))
-          | {tag:.tag_name, title:(.name // .tag_name), published:.published_at,
+          | {tag:.tag_name, title:(.name // .tag_name), published:.published_at, notes:(.body // ""),
              channel:$channel, prerelease:$rc,
              name:$image.name, size:$image.size, sha256:($image.digest | ltrimstr("sha256:")),
              url:$image.browser_download_url} ]
@@ -181,6 +181,15 @@ start() {
 
 ensure_directory
 case "${1:-}" in
+    info)
+        [ "$#" -eq 1 ]
+        # Prefer immutable squashfs metadata over any overlay copy.
+        if [ -f /rom/usr/share/w1700k/build.json ]; then
+            cat /rom/usr/share/w1700k/build.json
+        elif [ ! -d /rom ] && [ -f /usr/share/w1700k/build.json ]; then
+            cat /usr/share/w1700k/build.json
+        else printf '%s\n' '{}'; fi
+        ;;
     list) [ "$#" -eq 1 ]; start list ;;
     download) [ "$#" -eq 3 ]; valid_tag "$2"; valid_keep "$3"; start download "$2" "$3" ;;
     install) [ "$#" -eq 3 ]; valid_digest "$2"; valid_keep "$3"; start install "$2" "$3" ;;

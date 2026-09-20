@@ -9,7 +9,7 @@ for (const permission of [true, false, null]) {
   // Match LuCI E(): non-null attributes are serialized, including false.
   const E = (tag, attrs, children) => ({ tag, attrs: Object.fromEntries(Object.entries(attrs || {}).filter(([, v]) => v != null)), children });
   const ctx = { view: { extend: o => o }, rpc: { declare: () => () => Promise.resolve({}) }, fs: {},
-    L: { hasViewPermission: () => permission }, _: s => s, E, ui: {
+    L: { hasViewPermission: () => permission }, _: s => s, E, dom: {content: (node, children) => {node.children = children;}}, ui: {
       showModal: (title, nodes) => { modal = nodes; }, hideModal() {}, createHandlerFn: () => () => {}
     } };
   const view = vm.runInNewContext('(function(){' + source + '\n})()', ctx);

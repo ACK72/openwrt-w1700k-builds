@@ -8,10 +8,55 @@
 'require rpc';
 'require fs';
 'require ui';
+'require dom';
 
 const repository = '@BUILDER_REPOSITORY@';
 const helper = '/usr/libexec/w1700k-upgrade';
 const boardInfo = rpc.declare({ object: 'system', method: 'board' });
+
+function releaseBuild(release) {
+	const matches = Array.from(String(release.notes || '').matchAll(/<!-- w1700k-build:(.*?) -->/g));
+	if (matches.length !== 1) return null;
+	try {
+		const build = JSON.parse(matches[0][1]);
+		if (!/^[0-9]+$/.test(build.run_id) || !/^[0-9]+$/.test(build.build_attempt) ||
+			! /^[a-f0-9]{40}$/.test(build.builder_commit) || !/^[a-f0-9]{40}$/.test(build.source)) return null;
+		return build;
+	} catch (_) { return null; }
+}
+
+function buildRelation(installed, release, revision) {
+	const candidate = releaseBuild(release);
+	if (!candidate) return _('Build identity unavailable');
+	if (installed.repository === repository && /^[0-9]+$/.test(installed.run_id || '') &&
+		/^[0-9]+$/.test(installed.build_attempt || '')) {
+		return ['run_id', 'build_attempt', 'builder_commit', 'source'].every(k => installed[k] === candidate[k])
+			? _('Same build as installed') : _('Different build');
+	}
+	const short = String(revision || '').match(/^r[0-9]+-([a-f0-9]{7,40})$/);
+	return short && candidate.source.startsWith(short[1])
+		? _('Same source revision; exact build identity unavailable') : _('Build identity unavailable');
+}
+
+function timeValue(value) {
+	const ms = typeof value === 'string' ? Date.parse(value) : NaN;
+	return Number.isFinite(ms) ? ms : null;
+}
+
+function elapsedText(milliseconds) {
+	const minutes = Math.floor(Math.abs(milliseconds) / 60000);
+	if (!minutes) return _('less than a minute');
+	const days = Math.floor(minutes / 1440), hours = Math.floor(minutes % 1440 / 60);
+	return (days ? days + _('d ') : '') + (hours ? hours + _('h ') : '') + (minutes % 60) + _('m');
+}
+
+function publishedText(value) {
+	const ms = timeValue(value);
+	if (ms === null) return _('Publication time unavailable');
+	const delta = Date.now() - ms;
+	return new Date(ms).toLocaleString() + ' (' + elapsedText(delta) + ' ' +
+		(delta >= 0 ? _('ago') : _('in the future; check the clock')) + ')';
+}
 
 function execute(args) {
 	return fs.exec(helper, args).then(function(result) {
@@ -42,7 +87,7 @@ function pollResult() {
 
 return view.extend({
 	load: function() {
-		return Promise.all([boardInfo(), execute(['status'])]);
+		return Promise.all([boardInfo(), execute(['status']), execute(['info'])]);
 	},
 
 	showError: function(error) {
@@ -107,16 +152,35 @@ return view.extend({
 		if (!result.releases.length)
 			throw new Error(_('No compatible published releases were found.'));
 		const releases = result.releases.slice().sort((a, b) => Number(!!a.prerelease) - Number(!!b.prerelease));
+		const installed = this.installed || {}, revision = ((this.board || {}).release || {}).revision;
+		const details = E('div');
+		const updateDetails = release => {
+			const published = timeValue(release.published);
+			// An RC and its stable promotion share build identity but can have
+			// different publication times. Do not guess which release was installed.
+			const reference = timeValue(installed.build_started_at);
+			const rows = [E('p', {}, buildRelation(installed, release, revision)),
+				E('p', {}, _('Published: ') + publishedText(release.published))];
+			if (reference !== null && published !== null) {
+				const delta = published - reference;
+				rows.push(E('p', {}, _('Compared with the installed build start: ') +
+					(delta === 0 ? _('same time') : elapsedText(delta) + ' ' + (delta > 0 ? _('later') : _('earlier')))));
+			}
+			dom.content(details, rows);
+		};
 		const warning = E('p', { 'class': 'alert-message warning',
 			'style': releases[0].prerelease ? '' : 'display:none' },
 			_('You selected an RC image. This is a test release that has not been promoted to stable.'));
 		const select = E('select', { 'class': 'cbi-input-select', 'change': function() {
 			warning.style.display = releases[Number(this.value)].prerelease ? '' : 'none';
+			updateDetails(releases[Number(this.value)]);
 		} }, releases.map((release, i) =>
 			E('option', { 'value': i }, (release.prerelease ? '[RC] ' : '[Stable] ') + release.title)));
 		const keep = E('input', { 'type': 'checkbox', 'checked': true });
+		updateDetails(releases[0]);
 		ui.showModal(_('Available W1700K releases'), [
 			E('p', {}, select),
+			details,
 			warning,
 			E('p', {}, E('label', {}, [keep, ' ', _('Keep current settings')])),
 			E('p', {}, _('Back up your settings before upgrading.')),
@@ -135,7 +199,9 @@ return view.extend({
 			.catch(error => this.showError(error));
 	},
 
-	render: function([board, current]) {
+	render: function([board, current, installed]) {
+		this.board = board;
+		this.installed = installed || {};
 		this.readonly = !L.hasViewPermission();
 		if (current.status === 'busy') {
 			this.working(_('Waiting for the current firmware operation…'));
@@ -153,6 +219,8 @@ return view.extend({
 		return E('div', {}, [
 			E('h2', {}, _('W1700K Firmware Upgrade')),
 			E('p', {}, (board.release || {}).description || board.model),
+			E('p', {}, _('Installed build: ') + ((installed || {}).run_id ?
+				(installed.run_id + ' / ' + installed.build_attempt) : _('Exact identity not recorded by this older image'))),
 			E('p', {}, E('a', { 'href': 'https://github.com/' + repository + '/releases',
 				'target': '_blank', 'rel': 'noopener noreferrer' }, repository)),
 			E('p', {}, _('Install a published W1700K UBI2 release with its included packages.')),

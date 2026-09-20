@@ -13,7 +13,7 @@ PACKAGE = ROOT / 'package/w1700k-custom'
 VIEW = 'htdocs/luci-static/resources/view/attendedsysupgrade/overview.js'
 RUNTIME_COMMANDS = ('sh', 'ls', 'awk', 'chmod', 'mkdir', 'mv', 'rm', 'rmdir',
                     'jq', 'curl', 'grep', 'sha256sum', 'wc', 'tr', 'df', 'sleep',
-                    'ubus', 'uci', 'sysupgrade', 'devmem', 'cat')
+                    'ubus', 'uci', 'sysupgrade', 'devmem', 'cat', 'timeout', 'ping', 'ip', 'head', 'date')
 
 
 def rendered(source):
@@ -33,6 +33,13 @@ def apply(openwrt):
         elif subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode:
             raise RuntimeError(f'LuCI patch no longer applies: {patch.name}')
     view.write_bytes(rendered(PACKAGE / 'overview.js'))
+    # Keep the upstream dashboard while applying our small presentation fix.
+    for patch in sorted((ROOT / 'patches/flowsense').glob('*.patch')):
+        command = ['git', '-C', str(openwrt), 'apply', '--whitespace=nowarn']
+        if subprocess.run([*command, '--check', str(patch)], capture_output=True).returncode == 0:
+            subprocess.run([*command, str(patch)], check=True)
+        elif subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode:
+            raise RuntimeError(f'FlowSense patch no longer applies: {patch.name}')
     # The stock ASU ACL grants upgrade_start to read-only users. Keep firmware
     # installation in the write scope alongside our authenticated helper.
     acl_path = attended / 'root/usr/share/rpcd/acl.d/luci-app-attendedsysupgrade.json'
@@ -48,7 +55,8 @@ def apply(openwrt):
     shutil.copytree(PACKAGE / 'root', overlay, dirs_exist_ok=True)
     helper = overlay / 'usr/libexec/w1700k-upgrade'
     helper.write_bytes(rendered(PACKAGE / 'root/usr/libexec/w1700k-upgrade'))
-    for script in [overlay / 'usr/libexec/w1700k-upgrade', *(overlay / 'etc').glob('*.sh')]:
+    for script in [overlay / 'usr/libexec/w1700k-upgrade', overlay / 'usr/libexec/npu-jitter-daemon',
+                   *(overlay / 'etc').glob('*.sh'), *(overlay / 'etc/uci-defaults').glob('*')]:
         script.chmod(0o755)
     licenses = overlay / 'usr/share/licenses/w1700k-custom'
     licenses.mkdir(parents=True, exist_ok=True)
@@ -75,12 +83,20 @@ def verify(openwrt):
         if not target.is_file() or rendered(source) != target.read_bytes():
             raise RuntimeError(f'Customization missing or changed in rootfs: {relative}')
         # Windows fixtures have no POSIX executable bits; release builds run on Linux.
-        if os.name != 'nt' and (relative.suffix == '.sh' or relative.name == 'w1700k-upgrade') and not target.stat().st_mode & 0o111:
+        if os.name != 'nt' and (relative.suffix == '.sh' or relative.name in ('w1700k-upgrade', 'npu-jitter-daemon') or 'uci-defaults' in relative.parts) and not target.stat().st_mode & 0o111:
             raise RuntimeError(f'Customization is not executable: {relative}')
     view = (root / 'www/luci-static/resources/view/attendedsysupgrade/overview.js').read_text(encoding='utf-8')
     channel = (root / 'www/luci-static/resources/view/status/channel_analysis.js').read_text(encoding='utf-8')
     if builder_repository() not in view or '/usr/libexec/w1700k-upgrade' not in view:
         raise RuntimeError('Release upgrade view is missing from image rootfs')
+    identity = root / 'usr/share/w1700k/build.json'
+    if not identity.is_file() or identity.read_bytes() != (openwrt / 'files/usr/share/w1700k/build.json').read_bytes():
+        raise RuntimeError('Build identity missing or changed in image rootfs')
+    flowsense = (root / 'www/luci-static/resources/view/airoha_flowsense/status.js').read_text(encoding='utf-8')
+    if 'function latencyState(' not in flowsense or 'cs.latency.detail' not in flowsense:
+        raise RuntimeError('FlowSense mean RTT display is missing from rootfs')
+    if 'npu-monitor.jitter.enabled' not in (root / 'etc/init.d/npu-jitter').read_text():
+        raise RuntimeError('FlowSense sampler opt-out is missing from rootfs')
     if 'channelsForRadio' not in channel or 'scanInterface' not in channel:
         raise RuntimeError('Single-wiphy fix is missing from image rootfs')
     acl = json.loads((root / 'usr/share/rpcd/acl.d/luci-app-attendedsysupgrade.json').read_text(encoding='utf-8'))

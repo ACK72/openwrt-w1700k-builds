@@ -3,7 +3,8 @@
     "description": "Authenticated W1700K release upgrades",
     "read": {
       "file": {
-        "/usr/libexec/w1700k-upgrade status": ["exec"]
+        "/usr/libexec/w1700k-upgrade status": ["exec"],
+        "/usr/libexec/w1700k-upgrade info": ["exec"]
       },
       "ubus": {"file": ["exec"]}
     },

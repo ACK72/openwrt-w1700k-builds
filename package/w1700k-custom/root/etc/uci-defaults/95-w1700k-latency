@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Enable the bundled sampler on first boot; retain an explicit opt-out.
+enabled=$(uci -q get npu-monitor.jitter.enabled)
+if [ -z "$enabled" ]; then
+    uci -q get npu-monitor.jitter >/dev/null || uci set npu-monitor.jitter=jitter
+    uci set npu-monitor.jitter.enabled=1
+    uci commit npu-monitor
+    enabled=1
+fi
+if [ "$enabled" = 1 ]; then
+    /etc/init.d/npu-jitter enable
+    /etc/init.d/npu-jitter start
+fi
+exit 0

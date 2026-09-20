@@ -1,0 +1,87 @@
+From: ACK72
+Subject: [PATCH] flowsense: display sampled mean RTT and unavailable states
+
+SPDX-License-Identifier: Apache-2.0
+
+--- a/package/luci-app-airoha-flowsense/htdocs/luci-static/resources/view/airoha_flowsense/status.js
++++ b/package/luci-app-airoha-flowsense/htdocs/luci-static/resources/view/airoha_flowsense/status.js
+@@ -693,6 +693,23 @@
+ }
+ 
+ /* ── Compass SVG ── */
++// Router-to-target RTT, not the latency of all accelerated flows.
++function latencyState(jitter) {
++	jitter = jitter || {};
++	var average = typeof jitter.avg_ping === 'number' && isFinite(jitter.avg_ping) && jitter.avg_ping >= 0;
++	var age = Date.now() / 1000 - Number(jitter.updated_at || 0);
++	var stale = !jitter.updated_at || age > 3 * (jitter.interval || 5) + 3 || age < -10;
++	var valid = jitter.available === true && average && jitter.samples > 0 && !stale;
++	return {
++		ms: valid ? jitter.avg_ping : 0,
++		label: valid ? jitter.avg_ping.toFixed(1) + 'ms' : (jitter.available === false ? 'N/A' : stale ? 'Stale' : 'No replies'),
++		color: valid ? latencyColor(jitter.avg_ping) : '#888',
++		detail: 'Mean RTT | ' + (jitter.samples || 0) + '/' + (jitter.attempts || 0) +
++			' replies | Loss: ' + (typeof jitter.loss_percent === 'number' ? jitter.loss_percent.toFixed(1) + '%' : 'N/A') +
++			' | ' + (jitter.target || 'No target') + ' | Router-originated probes'
++	};
++}
++
+ function compassState(bypass, hwBuf, jitter, wan, wifi, bridge, mode) {
+ 	bypass = bypass || {}; hwBuf = hwBuf || {}; jitter = jitter || {};
+ 	wan = wan || {}; wifi = wifi || {}; bridge = bridge || {};
+@@ -703,7 +720,8 @@
+ 	var wanMbps   = bypass.wan_mbps || 0;
+ 
+ 	// Latency — jitter daemon pings upstream and works in both router and AP mode
+-	var latMs = jitter.last_ping || 0;
++	var latency = latencyState(jitter);
++	var latMs = latency.ms;
+ 
+ 	// Integrity / errors
+ 	var errCount = 0;
+@@ -739,9 +757,9 @@
+ 	return {
+ 		npuActive:npuActive, hwEnabled:hwEnabled, cpuPct:cpuPct, wanMbps:wanMbps,
+ 		hwBuf:hwBuf, mode:mode,
+-		latMs:latMs, errCount:errCount, eastAlarm:eastAlarm,
++		latMs:latMs, latency:latency, errCount:errCount, eastAlarm:eastAlarm,
+ 		wbDelta:wbDelta, worstSignal:worstSignal,
+-		latColor:latencyColor(latMs),
++		latColor:latency.color,
+ 		eastColor: eastColor
+ 	};
+ }
+@@ -1384,9 +1402,9 @@
+ 	var southSub   = 'PSE Δ: '+hb.pseDelta+' CDM Δ: '+hb.cdmHwfDelta+' | PPE: '+hb.ppePct+'% BND ('+hb.ppeBound+'/'+hb.ppeTotal+')';
+ 
+ 	// West card: Latency
+-	var latVal   = cs.latMs > 0 ? cs.latMs.toFixed(1)+'ms' : (jitter.available===false ? 'N/A' : '---');
++	var latVal   = cs.latency.label;
+ 	var latColor = cs.latColor;
+-	var latSub   = 'Jitter: '+(jitter.jitter||0).toFixed(1)+'ms  |  '+(jitter.samples||0)+' samples  |  '+(jitter.target||'1.1.1.1');
++	var latSub   = cs.latency.detail;
+ 
+ 	function card(title, val, color, sub) {
+ 		return E('div', { 'class': 'compass-card' }, [
+@@ -1448,9 +1466,9 @@
+ 				: 'No connected clients');
+ 	}
+ 
+-	var latVal = cs.latMs > 0 ? cs.latMs.toFixed(1)+'ms' : (jitter.available===false?'N/A':'---');
++	var latVal = cs.latency.label;
+ 	setCard(divs[2], latVal, cs.latColor,
+-		'Jitter: '+(jitter.jitter||0).toFixed(1)+'ms  |  '+(jitter.samples||0)+' samples  |  '+(jitter.target||'1.1.1.1'));
++		cs.latency.detail);
+ 
+ 	var hb = cs.hwBuf || {};
+ 	setCard(divs[3],
+--- a/package/luci-app-airoha-flowsense/root/etc/init.d/npu-jitter
++++ b/package/luci-app-airoha-flowsense/root/etc/init.d/npu-jitter
+@@ -8,6 +8,7 @@
+ PIDFILE=/var/run/npu-jitter.pid
+ 
+ start_service() {
++	[ "$(uci -q get npu-monitor.jitter.enabled)" != 0 ] || return 0
+ 	local target
+ 	# Shipped configs before 2026-07 used an anonymous section ("config jitter"
+ 	# with no name), only addressable as @jitter[0]; newer ones name it. Try

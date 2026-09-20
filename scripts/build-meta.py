@@ -10,6 +10,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from official_npu import BINARIES, stock_npu_info, npu_identity
+from repositories import builder_repository
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLCHAIN_INPUTS = (
@@ -247,7 +248,23 @@ def keys(openwrt):
     fingerprint = hashlib.sha256(json.dumps(state, sort_keys=True).encode()).hexdigest()
     state["fingerprint"] = fingerprint
     (openwrt.parent / "build-state.json").write_text(json.dumps(state, indent=2) + "\n")
+    # Store build identity in the image, outside /etc so restored settings cannot
+    # carry an old firmware identity into a newer image. Promotion preserves it.
+    write_build_identity(openwrt, state)
     print(f"toolchain={toolchain}\nbuild={build}\nbuild-base={build_base}\nfingerprint={fingerprint}")
+
+
+def write_build_identity(openwrt, state):
+    identity = {
+        "repository": builder_repository(),
+        "run_id": os.environ.get("GITHUB_RUN_ID", ""),
+        "build_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+        "builder_commit": state["builder_commit"], "source": state["openwrt"],
+        "build_started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    identity_path = openwrt / "files/usr/share/w1700k/build.json"
+    identity_path.parent.mkdir(parents=True, exist_ok=True)
+    identity_path.write_text(json.dumps(identity, sort_keys=True) + "\n")
 
 
 def manifest(openwrt, output):
