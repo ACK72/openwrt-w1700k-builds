@@ -1,0 +1,29 @@
+From cb165008cecf693bb058032b98ed107afb62507e Mon Sep 17 00:00:00 2001
+From: ACK72 <ACK72@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 00:35:43 +0900
+Subject: [PATCH] airoha: initialize the value used by dedicated PERSTOUT
+ resets
+
+The inherited backport ORs into an uninitialized local in both reset branches. Assign the masked value directly so assert/deassert cannot depend on stack contents or compiler treatment of undefined behavior. This is a correctness fix; cold/warm boot testing is required to establish whether it also explains the observed PCIe link failure.
+---
+ ...clk-en7523-add-support-for-dedicated-PCIe-PERSTOUT-r.patch | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/target/linux/airoha/patches-6.18/609-02-clk-en7523-add-support-for-dedicated-PCIe-PERSTOUT-r.patch b/target/linux/airoha/patches-6.18/609-02-clk-en7523-add-support-for-dedicated-PCIe-PERSTOUT-r.patch
+index b204f27593..c46236367d 100644
+--- a/target/linux/airoha/patches-6.18/609-02-clk-en7523-add-support-for-dedicated-PCIe-PERSTOUT-r.patch
++++ b/target/linux/airoha/patches-6.18/609-02-clk-en7523-add-support-for-dedicated-PCIe-PERSTOUT-r.patch
+@@ -71,9 +71,9 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
+ +
+ +	/* For PCIC reset logic is inverted, 0:assert 1:deassert*/
+ +	if (addr == REG_NP_SCU_PCIC)
+-+		val |= assert ? 0 : BIT(id % RST_NR_PER_BANK);
+++		val = assert ? 0 : BIT(id % RST_NR_PER_BANK);
+ +	else
+-+		val |= assert ? BIT(id % RST_NR_PER_BANK) : 0;
+++		val = assert ? BIT(id % RST_NR_PER_BANK) : 0;
+  
+  	regmap_update_bits(rst_data->map, addr, BIT(id % RST_NR_PER_BANK),
+ -			   assert ? BIT(id % RST_NR_PER_BANK) : 0);
+-- 
+2.55.0.windows.3

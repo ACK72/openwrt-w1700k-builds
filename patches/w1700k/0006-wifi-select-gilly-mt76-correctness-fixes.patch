@@ -1,0 +1,329 @@
+From 26b5f3cc390ad4ed165e7602ac3196ee79d9c05f Mon Sep 17 00:00:00 2001
+From: ACK72 <ACK72@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 00:35:43 +0900
+Subject: [PATCH] wifi: select six mt76 correctness fixes from the Gilly W1700K
+ stack
+
+Preserve original patch authorship and keep the ACK72 mt76 source, official NPU firmware and hardware offload enabled. Cover remap IRQ exclusion, WCID status/cleanup ordering, disassociation queue choice, NPU BA timer refresh and the EAPOL NULL station guard.
+
+Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/0aa0666de1366b69d5d73d98c19809affc1f76ed/openwrt-patches
+---
+ package/kernel/mt76/Makefile                  |  2 +-
+ ...96-reg_lock-irqsave-prevent-AP-panic.patch | 88 +++++++++++++++++++
+ ...wcid-check-in-mt76_tx_status_skb_add.patch | 45 ++++++++++
+ ...ardown-ordering-in-mt76_reset_device.patch | 27 ++++++
+ ...ueue-assignment-for-disassoc-packets.patch | 37 ++++++++
+ ...fresh-tx-agg-timer-under-npu-offload.patch | 26 ++++++
+ ...76-mt7996-guard-null-sta-on-eapol-tx.patch | 30 +++++++
+ 7 files changed, 254 insertions(+), 1 deletion(-)
+ create mode 100644 package/kernel/mt76/patches/9993-wifi-mt76-mt7996-reg_lock-irqsave-prevent-AP-panic.patch
+ create mode 100644 package/kernel/mt76/patches/9994-wifi-mt76-fix-unlocked-wcid-check-in-mt76_tx_status_skb_add.patch
+ create mode 100644 package/kernel/mt76/patches/9995-wifi-mt76-fix-wcid-teardown-ordering-in-mt76_reset_device.patch
+ create mode 100644 package/kernel/mt76/patches/9996-wifi-mt76-fix-queue-assignment-for-disassoc-packets.patch
+ create mode 100644 package/kernel/mt76/patches/9997-wifi-mt76-mt7996-refresh-tx-agg-timer-under-npu-offload.patch
+ create mode 100644 package/kernel/mt76/patches/9998-wifi-mt76-mt7996-guard-null-sta-on-eapol-tx.patch
+
+diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
+index 2265a8fec8..3a09ca0a35 100644
+--- a/package/kernel/mt76/Makefile
++++ b/package/kernel/mt76/Makefile
+@@ -1,7 +1,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=mt76
+-PKG_RELEASE=2
++PKG_RELEASE=3
+ 
+ PKG_LICENSE:=BSD-3-Clause-Clear
+ PKG_LICENSE_FILES:=
+diff --git a/package/kernel/mt76/patches/9993-wifi-mt76-mt7996-reg_lock-irqsave-prevent-AP-panic.patch b/package/kernel/mt76/patches/9993-wifi-mt76-mt7996-reg_lock-irqsave-prevent-AP-panic.patch
+new file mode 100644
+index 0000000000..59f0cdc5b1
+--- /dev/null
++++ b/package/kernel/mt76/patches/9993-wifi-mt76-mt7996-reg_lock-irqsave-prevent-AP-panic.patch
+@@ -0,0 +1,88 @@
++From 3edfc0cbf7dc666a0b051b54f51634d6ff2a3be6 Mon Sep 17 00:00:00 2001
++From: Shayne Chen <shayne.chen@mediatek.com>
++Subject: [PATCH] wifi: mt76: mt7996: use irqsave on reg_lock to prevent AP panic
++
++AP panic (Asynchronous SError) can occur when the MT7996 register remap
++window (protected by dev->reg_lock) is accessed from hardirq context:
++spin_lock_bh does not disable hardirqs, so an interrupt can reenter the
++remap window mid-access. Use spin_lock_irqsave/irqrestore instead.
++
++Rebased onto OpenWrt mt76 pin be5ce791 (2026-09-01): upstream 69f26dbae7 changed the
++addr test to INVALID_REG_ADDR. Previously rebased onto b2704cf5 (2026-08-01); original MTK context
++was cut against an older base. Original: gerrit 12465539 (mtk-openwrt-feeds).
++
++Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
++---
++--- a/mt7996/mmio.c
+++++ b/mt7996/mmio.c
++@@ -365,29 +365,31 @@
++ 			  size_t len)
++ {
++ 	u32 addr = __mt7996_reg_addr(dev, offset);
+++	unsigned long flags;
++ 
++ 	if (addr != INVALID_REG_ADDR) {
++ 		memcpy_fromio(buf, dev->mt76.mmio.regs + addr, len);
++ 		return;
++ 	}
++ 
++-	spin_lock_bh(&dev->reg_lock);
+++	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	memcpy_fromio(buf, dev->mt76.mmio.regs +
++ 			   __mt7996_reg_remap_addr(dev, offset), len);
++-	spin_unlock_bh(&dev->reg_lock);
+++	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ }
++ 
++ static u32 mt7996_rr(struct mt76_dev *mdev, u32 offset)
++ {
++ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++ 	u32 addr = __mt7996_reg_addr(dev, offset), val;
+++	unsigned long flags;
++ 
++ 	if (addr != INVALID_REG_ADDR)
++ 		return dev->bus_ops->rr(mdev, addr);
++ 
++-	spin_lock_bh(&dev->reg_lock);
+++	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	val = dev->bus_ops->rr(mdev, __mt7996_reg_remap_addr(dev, offset));
++-	spin_unlock_bh(&dev->reg_lock);
+++	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ 
++ 	return val;
++ }
++@@ -396,28 +398,30 @@
++ {
++ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++ 	u32 addr = __mt7996_reg_addr(dev, offset);
+++	unsigned long flags;
++ 
++ 	if (addr != INVALID_REG_ADDR) {
++ 		dev->bus_ops->wr(mdev, addr, val);
++ 		return;
++ 	}
++ 
++-	spin_lock_bh(&dev->reg_lock);
+++	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	dev->bus_ops->wr(mdev, __mt7996_reg_remap_addr(dev, offset), val);
++-	spin_unlock_bh(&dev->reg_lock);
+++	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ }
++ 
++ static u32 mt7996_rmw(struct mt76_dev *mdev, u32 offset, u32 mask, u32 val)
++ {
++ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++ 	u32 addr = __mt7996_reg_addr(dev, offset);
+++	unsigned long flags;
++ 
++ 	if (addr != INVALID_REG_ADDR)
++ 		return dev->bus_ops->rmw(mdev, addr, mask, val);
++ 
++-	spin_lock_bh(&dev->reg_lock);
+++	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	val = dev->bus_ops->rmw(mdev, __mt7996_reg_remap_addr(dev, offset), mask, val);
++-	spin_unlock_bh(&dev->reg_lock);
+++	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ 
++ 	return val;
++ }
+diff --git a/package/kernel/mt76/patches/9994-wifi-mt76-fix-unlocked-wcid-check-in-mt76_tx_status_skb_add.patch b/package/kernel/mt76/patches/9994-wifi-mt76-fix-unlocked-wcid-check-in-mt76_tx_status_skb_add.patch
+new file mode 100644
+index 0000000000..0a88a9fe13
+--- /dev/null
++++ b/package/kernel/mt76/patches/9994-wifi-mt76-fix-unlocked-wcid-check-in-mt76_tx_status_skb_add.patch
+@@ -0,0 +1,45 @@
++From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From: Ryan Leung <lrd.airoha@gmail.com>
++Date: Fri, 22 Aug 2026 00:00:00 +0000
++Subject: [PATCH] wifi: mt76: fix unlocked wcid check in mt76_tx_status_skb_add
++
++mt76_tx_status_skb_add() tested whether the wcid was still published
++(rcu_access_pointer(dev->wcid[wcid->idx])) OUTSIDE dev->status_lock.
++Between that test passing and taking the lock to allocate a packet id
++into wcid->pktid, the wcid can be torn down and unpublished, or its
++index reused for a different station.  The stale/reused wcid then gets a
++pktid allocated and is linked onto dev->wcid_list, so TX status is later
++accounted against a wcid that is no longer the owner of that index.
++
++Drop the unlocked test (keep only the !wcid guard) and instead verify,
++under status_lock, that dev->wcid[wcid->idx] still points at THIS wcid
++before allocating.  The pointer-identity check also rejects index reuse,
++which the previous non-NULL test did not catch.  The WED / NO_ACK fast
++paths return before the lock is taken, so the offload hot path is
++unaffected.
++
++Signed-off-by: Ryan Leung <lrd.airoha@gmail.com>
++---
++--- a/tx.c
+++++ b/tx.c
++@@ -129,7 +129,7 @@ mt76_tx_status_skb_add(struct mt76_dev *dev, struct mt76_wcid *wcid,
++
++ 	memset(cb, 0, sizeof(*cb));
++
++-	if (!wcid || !rcu_access_pointer(dev->wcid[wcid->idx]))
+++	if (!wcid)
++ 		return MT_PACKET_ID_NO_ACK;
++
++ 	if (info->flags & IEEE80211_TX_CTL_NO_ACK)
++@@ -147,6 +147,11 @@ mt76_tx_status_skb_add(struct mt76_dev *dev, struct mt76_wcid *wcid,
++
++ 	spin_lock_bh(&dev->status_lock);
++
+++	if (rcu_access_pointer(dev->wcid[wcid->idx]) != wcid) {
+++		pid = MT_PACKET_ID_NO_ACK;
+++		goto out;
+++	}
+++
++ 	pid = idr_alloc(&wcid->pktid, skb, MT_PACKET_ID_FIRST,
++ 			MT_PACKET_ID_MASK, GFP_ATOMIC);
++ 	if (pid < 0) {
+diff --git a/package/kernel/mt76/patches/9995-wifi-mt76-fix-wcid-teardown-ordering-in-mt76_reset_device.patch b/package/kernel/mt76/patches/9995-wifi-mt76-fix-wcid-teardown-ordering-in-mt76_reset_device.patch
+new file mode 100644
+index 0000000000..2bee4e361c
+--- /dev/null
++++ b/package/kernel/mt76/patches/9995-wifi-mt76-fix-wcid-teardown-ordering-in-mt76_reset_device.patch
+@@ -0,0 +1,27 @@
++From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
++From: Ryan Leung <lrd.airoha@gmail.com>
++Date: Fri, 22 Aug 2026 00:00:00 +0000
++Subject: [PATCH] wifi: mt76: fix wcid teardown ordering in mt76_reset_device
++
++mt76_reset_device() ran mt76_wcid_cleanup() while the wcid was still
++published in dev->wcid[i], only clearing the pointer afterwards.  During
++cleanup the wcid is therefore still reachable by concurrent lookups (TX
++status, RX), which can grab and use a wcid that is being torn down.
++
++Unpublish first: NULL dev->wcid[i], then run mt76_wcid_cleanup().  This
++mirrors the correct add ordering (publish last) so no new lookup can find
++the wcid once teardown has begun.
++
++Signed-off-by: Ryan Leung <lrd.airoha@gmail.com>
++---
++--- a/mac80211.c
+++++ b/mac80211.c
++@@ -856,8 +856,8 @@ void mt76_reset_device(struct mt76_dev *dev)
++ 			continue;
++
++ 		wcid->sta = 0;
++-		mt76_wcid_cleanup(dev, wcid);
++ 		rcu_assign_pointer(dev->wcid[i], NULL);
+++		mt76_wcid_cleanup(dev, wcid);
++ 	}
++ 	rcu_read_unlock();
+diff --git a/package/kernel/mt76/patches/9996-wifi-mt76-fix-queue-assignment-for-disassoc-packets.patch b/package/kernel/mt76/patches/9996-wifi-mt76-fix-queue-assignment-for-disassoc-packets.patch
+new file mode 100644
+index 0000000000..f2f781eb2c
+--- /dev/null
++++ b/package/kernel/mt76/patches/9996-wifi-mt76-fix-queue-assignment-for-disassoc-packets.patch
+@@ -0,0 +1,37 @@
++From 3999d15cfcc72a946ec419c4059b0e0cd7860053 Mon Sep 17 00:00:00 2001
++From: Peter Chiu <chui-hao.chiu@mediatek.com>
++Date: Mon, 27 Jul 2026 15:04:30 +0000
++Subject: [PATCH] wifi: mt76: fix queue assignment for disassoc packets
++
++Like deauth, a disassoc frame sent to a client in powersave mode can get
++stuck in a tx queue along with other buffered frames, filling up hardware
++queues with frames that are only released after the WTBL slot is reused
++for another client.
++
++Move disassoc packets to the ALTX queue, matching the existing deauth
++handling.
++
++Fixes: dedf2ec30fe4 ("wifi: mt76: fix queue assignment for deauth packets")
++Signed-off-by: Peter Chiu <chui-hao.chiu@mediatek.com>
++Link: https://patch.msgid.link/20260727150434.1778520-11-nbd@nbd.name
++Signed-off-by: Felix Fietkau <nbd@nbd.name>
++
++[W1700K staging note, 2026-09-01: from nbd168/wireless 3999d15cfcc7 (Felix's
++upstream staging tree, 2026-07-27). NOT in openwrt/mt76 (tx.c history checked)
++nor in our pin 2c84469c. Prerequisite for 043 (its tx.c context includes this
++line). Paths rewritten from drivers/net/wireless/mediatek/mt76/ to package
++root. Drop when a mt76 bump brings it.]
++
++Rebased 2026-09-03 on top of upstream 0898393ee0 ("wifi: mt76: use ALTX queue for
++packets to disassociated stations", = our former 043) for the mt76 be5ce791 bump.
++---
++--- a/tx.c
+++++ b/tx.c
++@@ -695,6 +695,7 @@
++ 		    (!(wcid->tx_info & MT_WCID_TX_INFO_SET) ||
++ 		     !ieee80211_is_bufferable_mmpdu(skb) ||
++ 		     ieee80211_is_deauth(hdr->frame_control) ||
+++		     ieee80211_is_disassoc(hdr->frame_control) ||
++ 		     head == &wcid->tx_offchannel))
++ 			qid = MT_TXQ_PSD;
++ 
+diff --git a/package/kernel/mt76/patches/9997-wifi-mt76-mt7996-refresh-tx-agg-timer-under-npu-offload.patch b/package/kernel/mt76/patches/9997-wifi-mt76-mt7996-refresh-tx-agg-timer-under-npu-offload.patch
+new file mode 100644
+index 0000000000..2b514d100c
+--- /dev/null
++++ b/package/kernel/mt76/patches/9997-wifi-mt76-mt7996-refresh-tx-agg-timer-under-npu-offload.patch
+@@ -0,0 +1,26 @@
++From: Gilly <gilroyscott1970@gmail.com>
++Date: Wed, 10 Sep 2026 00:00:00 +0000
++Subject: [PATCH] wifi: mt76: mt7996: refresh the tx agg session timer under NPU offload
++
++On boards using Airoha NPU offload, TX block-ack sessions get torn down mid-transfer 
++whenever the peer negotiates a BlockAck timeout (Intel stations commonly do). Offloaded 
++traffic bypasses mac80211, so nothing refreshes the session timer — the driver only did 
++that for WED devices, and the NPU path was gated out. The result is a DELBA in the middle 
++of a transfer and throughput collapsing to un-aggregated rates, with no recovery until 
++unrelated traffic happens to take the software path. Extending the gate to cover NPU 
++devices keeps the session alive the same way it already works on WED.
++
++Signed-off-by: Gilly <gilroyscott1970@gmail.com>
++---
++--- a/mt7996/mac.c
+++++ b/mt7996/mac.c
++@@ -1511,7 +1511,8 @@
++ 		}
++ 	}
++ 
++-	if (mtk_wed_device_active(&dev->mt76.mmio.wed) && wcid->sta) {
+++	if ((mtk_wed_device_active(&dev->mt76.mmio.wed) ||
+++	     mt76_npu_device_active(&dev->mt76)) && wcid->sta) {
++ 		struct ieee80211_sta *sta;
++ 		u8 tid;
++ 
+diff --git a/package/kernel/mt76/patches/9998-wifi-mt76-mt7996-guard-null-sta-on-eapol-tx.patch b/package/kernel/mt76/patches/9998-wifi-mt76-mt7996-guard-null-sta-on-eapol-tx.patch
+new file mode 100644
+index 0000000000..eaaeff9d15
+--- /dev/null
++++ b/package/kernel/mt76/patches/9998-wifi-mt76-mt7996-guard-null-sta-on-eapol-tx.patch
+@@ -0,0 +1,30 @@
++From: Slavin Liu <bolin.liu@seu.edu.cn>
++Date: Sun, 13 Sep 2026 00:00:00 +0000
++Subject: [PATCH] wifi: mt76: mt7996: guard NULL sta on the EAPOL TX path
++
++mac80211 lets EAPOL frames sourced from the local address through to an
++unauthorized destination, so hostapd can hand the driver a control-port
++frame for a station that has already been removed (e.g. a 4-way handshake
++retransmit racing a disconnect). mt7996_tx() then passes a NULL sta and the
++frame reaches mt7996_tx_prepare_skb() with skb->protocol == ETH_P_PAE, where
++the software MLD address translation dereferences sta->mlo unconditionally
++and oopses in the TX worker.
++
++The data-QoS MLO link selection earlier in the function already checks sta
++at our mt76 pin; this is the remaining unguarded half of the upstream RFC
++"wifi: mt76: mt7996: guard station-only MLO TX handling".
++
++Signed-off-by: Slavin Liu <bolin.liu@seu.edu.cn>
++---
++diff --git a/mt7996/mac.c b/mt7996/mac.c
++--- a/mt7996/mac.c
+++++ b/mt7996/mac.c
++@@ -1097,7 +1097,7 @@ int mt7996_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
++ 	 * compatible with 802.11 EAPOL frame, we do the translation by
++ 	 * software
++ 	 */
++-	if (tx_info->skb->protocol == cpu_to_be16(ETH_P_PAE) && sta->mlo) {
+++	if (sta && tx_info->skb->protocol == cpu_to_be16(ETH_P_PAE) && sta->mlo) {
++ 		struct ieee80211_hdr *hdr = (void *)tx_info->skb->data;
++ 		struct ieee80211_bss_conf *link_conf;
++ 		struct ieee80211_link_sta *link_sta;
+-- 
+2.55.0.windows.3
