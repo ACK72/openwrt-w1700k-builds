@@ -85,7 +85,7 @@ return view.extend({
 			E('div', { 'class': 'right' }, [
 				E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Cancel')),
 				' ', E('button', { 'class': 'btn cbi-button-positive',
-					'disabled': this.readonly, 'click': ui.createHandlerFn(this, () => this.install(image))
+					'disabled': this.readonly || null, 'click': ui.createHandlerFn(this, () => this.install(image))
 				}, _('Install and reboot'))
 			])
 		]);
@@ -122,7 +122,7 @@ return view.extend({
 			E('p', {}, _('Back up your settings before upgrading.')),
 			E('div', { 'class': 'right' }, [
 				E('button', { 'class': 'btn', 'click': ui.hideModal }, _('Cancel')),
-				' ', E('button', { 'class': 'btn cbi-button-positive', 'disabled': this.readonly,
+				' ', E('button', { 'class': 'btn cbi-button-positive', 'disabled': this.readonly || null,
 					'click': ui.createHandlerFn(this, () => this.download(releases[Number(select.value)], keep.checked))
 				}, _('Download and verify'))
 			])
@@ -156,7 +156,7 @@ return view.extend({
 			E('p', {}, E('a', { 'href': 'https://github.com/' + repository + '/releases',
 				'target': '_blank', 'rel': 'noopener noreferrer' }, repository)),
 			E('p', {}, _('Install a published W1700K UBI2 release with its included packages.')),
-			E('button', { 'class': 'btn cbi-button-action', 'disabled': this.readonly,
+			E('button', { 'class': 'btn cbi-button-action', 'disabled': this.readonly || null,
 				'click': ui.createHandlerFn(this, this.check) }, _('Check for GitHub firmware'))
 		]);
 	},

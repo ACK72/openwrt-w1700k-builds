@@ -33,6 +33,10 @@
         "045",
         "048"
       ]
+    },
+    {
+      "file": "0007-wifi-fix-npu-rx-buffer-ownership.patch",
+      "description": "Preserve page ownership across incomplete NPU RX chains and order DMA metadata reads."
     }
   ]
 }

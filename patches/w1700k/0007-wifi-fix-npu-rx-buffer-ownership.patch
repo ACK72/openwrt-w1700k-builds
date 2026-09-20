@@ -1,0 +1,246 @@
+From 9b24df41d1bf466f0c72ef321303750d6980827c Mon Sep 17 00:00:00 2001
+From: ACK72 <ACK72@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 02:26:29 +0900
+Subject: [PATCH] wifi: fix NPU RX descriptor ownership and DMA completion
+ ordering
+
+---
+ package/kernel/mt76/Makefile                  |   2 +-
+ ...ifi-mt76-fix-npu-rx-buffer-ownership.patch | 212 ++++++++++++++++++
+ 2 files changed, 213 insertions(+), 1 deletion(-)
+ create mode 100644 package/kernel/mt76/patches/9999-wifi-mt76-fix-npu-rx-buffer-ownership.patch
+
+diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
+index 3a09ca0a35..efc406fcc1 100644
+--- a/package/kernel/mt76/Makefile
++++ b/package/kernel/mt76/Makefile
+@@ -1,7 +1,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=mt76
+-PKG_RELEASE=3
++PKG_RELEASE=4
+ 
+ PKG_LICENSE:=BSD-3-Clause-Clear
+ PKG_LICENSE_FILES:=
+diff --git a/package/kernel/mt76/patches/9999-wifi-mt76-fix-npu-rx-buffer-ownership.patch b/package/kernel/mt76/patches/9999-wifi-mt76-fix-npu-rx-buffer-ownership.patch
+new file mode 100644
+index 0000000000..b4d3c5db4b
+--- /dev/null
++++ b/package/kernel/mt76/patches/9999-wifi-mt76-fix-npu-rx-buffer-ownership.patch
+@@ -0,0 +1,212 @@
++From: ACK72 <ACK72@users.noreply.github.com>
++Subject: [PATCH] wifi: mt76: preserve NPU RX buffer ownership across partial chains
++
++Wait for the complete descriptor chain before building an skb.  The old
++incomplete-chain path freed pages still owned by the ring, allowing later
++polls to reuse/release recycled pages.  Observe DMA completion before reading
++metadata, validate posted entries and lengths, consume complete drops once,
++and clear consumed software entries.  Publish refilled addresses after
++clearing the old completion.  Keep zero-copy, ring sizes and hardware offload.
++
++The deployed official-NPU image produced page-pool warnings and an invalid
++DMA sync address in mt76_npu_rx_poll.  This fixes the identified ownership
++defect; runtime validation is required to establish incident coverage.
++---
++--- a/npu.c
+++++ b/npu.c
++@@ -26,21 +26,23 @@
++ 
++ 		e->buf = mt76_get_page_pool_buf(q, &offset, q->buf_size);
++ 		if (!e->buf)
++ 			break;
++ 
++ 		e->dma_len[0] = SKB_WITH_OVERHEAD(q->buf_size);
++ 		page = virt_to_head_page(e->buf);
++ 		e->dma_addr[0] = page_pool_get_dma_addr(page) + offset;
++ 
++ 		memset(&desc[q->head], 0, sizeof(*desc));
++-		desc[q->head].addr = e->dma_addr[0];
+++		/* Publish the buffer only after clearing the previous completion. */
+++		dma_wmb();
+++		WRITE_ONCE(desc[q->head].addr, e->dma_addr[0]);
++ 
++ 		q->head = (q->head + 1) % q->ndesc;
++ 		q->queued++;
++ 		nframes++;
++ 	}
++ 
++ 	return nframes;
++ }
++ 
++ void mt76_npu_queue_cleanup(struct mt76_dev *dev, struct mt76_queue *q)
++@@ -59,65 +61,116 @@
++ 	spin_unlock_bh(&q->lock);
++ }
++ 
++ static struct sk_buff *mt76_npu_dequeue(struct mt76_dev *dev,
++ 					struct mt76_queue *q,
++ 					u32 *info)
++ {
++ 	struct airoha_npu_rx_dma_desc *desc = (void *)q->desc;
++ 	int i, nframes, index = q->tail;
++ 	struct sk_buff *skb = NULL;
++-
++-	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK, desc[index].info);
+++	u16 len[MAX_SKB_FRAGS + 1];
+++	u32 ctrl;
+++	bool drop = false;
+++
+++	if (q->queued <= 0)
+++		return NULL;
+++
+++	ctrl = READ_ONCE(desc[index].ctrl);
+++	if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
+++		return NULL;
+++
+++	/* DONE transfers ownership of the descriptor metadata to the host. */
+++	dma_rmb();
+++	nframes = FIELD_GET(NPU_RX_DMA_PKT_COUNT_MASK,
+++			    READ_ONCE(desc[index].info));
++ 	nframes = max_t(int, nframes, 1);
++-
+++	if (unlikely(nframes > q->queued || nframes > ARRAY_SIZE(len))) {
+++		dev_err_ratelimited(dev->dev,
+++				    "NPU RX invalid count %d (queued %d)\n",
+++				    nframes, q->queued);
+++		return NULL;
+++	}
+++
+++	/* Do not build/free an skb until the entire chain is complete.  On an
+++	 * incomplete chain the ring must retain every page-pool reference.
+++	 */
++ 	for (i = 0; i < nframes; i++) {
++ 		struct mt76_queue_entry *e = &q->entry[index];
++-		int len = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK,
++-				    desc[index].ctrl);
++-
++-		if (!FIELD_GET(NPU_RX_DMA_DESC_DONE_MASK, desc[index].ctrl)) {
++-			dev_kfree_skb(skb);
+++
+++		if (i) {
+++			ctrl = READ_ONCE(desc[index].ctrl);
+++			if (!(ctrl & NPU_RX_DMA_DESC_DONE_MASK))
+++				return NULL;
+++			dma_rmb();
+++		}
+++
+++		if (unlikely(!e->buf || !e->dma_addr[0] || !e->dma_len[0])) {
+++			dev_err_ratelimited(dev->dev,
+++					    "NPU RX invalid buffer at %d (head %u tail %u queued %d)\n",
+++					    index, q->head, q->tail, q->queued);
++ 			return NULL;
++ 		}
+++		len[i] = FIELD_GET(NPU_RX_DMA_DESC_CUR_LEN_MASK, ctrl);
+++		if (unlikely(!len[i] || len[i] > e->dma_len[0] ||
+++			     len[i] > SKB_WITH_OVERHEAD(q->buf_size)))
+++			drop = true;
+++		index = (index + 1) % q->ndesc;
+++	}
+++
+++	/* Keep the last descriptor's info, as required by the existing RX ABI. */
+++	*info = READ_ONCE(desc[(index + q->ndesc - 1) % q->ndesc].info);
+++	index = q->tail;
+++	if (likely(!drop)) {
+++		struct mt76_queue_entry *e = &q->entry[index];
++ 
++ 		dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
++ 					e->dma_len[0],
++ 					page_pool_get_dma_dir(q->page_pool));
++-
++-		if (!skb) {
++-			skb = napi_build_skb(e->buf, q->buf_size);
++-			if (!skb)
++-				return NULL;
++-
++-			__skb_put(skb, len);
+++		skb = napi_build_skb(e->buf, q->buf_size);
+++		if (skb) {
+++			__skb_put(skb, len[0]);
++ 			skb_reset_mac_header(skb);
++ 			skb_mark_for_recycle(skb);
++-		} else {
++-			struct skb_shared_info *shinfo = skb_shinfo(skb);
+++		}
+++	} else {
+++		dev_err_ratelimited(dev->dev, "NPU RX invalid packet length\n");
+++	}
+++
+++	for (i = 0; i < nframes; i++) {
+++		struct mt76_queue_entry *e = &q->entry[index];
+++
+++		if (!skb) {
+++			mt76_put_page_pool_buf(e->buf, false);
+++		} else if (i) {
++ 			struct page *page = virt_to_head_page(e->buf);
++-			int nr_frags = shinfo->nr_frags;
++-
++-			if (nr_frags < ARRAY_SIZE(shinfo->frags))
++-				skb_add_rx_frag(skb, nr_frags, page,
++-						e->buf - page_address(page),
++-						len, q->buf_size);
+++
+++			dma_sync_single_for_cpu(dev->dma_dev, e->dma_addr[0],
+++						e->dma_len[0],
+++						page_pool_get_dma_dir(q->page_pool));
+++			skb_add_rx_frag(skb, i - 1, page,
+++					e->buf - page_address(page),
+++					len[i], q->buf_size);
++ 		}
++ 
++-		*info = desc[index].info;
+++		/* The skb or page-pool now owns this buffer, never the ring too. */
+++		e->buf = NULL;
+++		e->dma_addr[0] = 0;
+++		e->dma_len[0] = 0;
++ 		index = (index + 1) % q->ndesc;
++ 	}
++ 	q->tail = index;
++-	q->queued -= i;
+++	q->queued -= nframes;
++ 	Q_WRITE(q, dma_idx, q->tail);
++ 
++-	return skb;
+++	/* A dropped complete packet still consumed a poll budget slot. */
+++	return skb ?: ERR_PTR(-EINVAL);
++ }
++ 
++ void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
++ 			u32 info)
++ {
++ 	struct airoha_ppe_dev *ppe_dev;
++ 	u16 reason, hash;
++ 
++ 	if (!mt76_npu_device_active(dev))
++ 		return;
++@@ -154,24 +207,26 @@
++ 	if (!npu)
++ 		goto out;
++ 
++ 	while (done < budget) {
++ 		struct sk_buff *skb;
++ 		u32 info = 0;
++ 
++ 		skb = mt76_npu_dequeue(dev, &dev->q_rx[qid], &info);
++ 		if (!skb)
++ 			break;
+++		done++;
+++		if (IS_ERR(skb))
+++			continue;
++ 
++ 		dev->drv->rx_skb(dev, qid, skb, &info);
++ 		mt76_rx_poll_complete(dev, qid, napi);
++-		done++;
++ 	}
++ 
++ 	mt76_npu_fill_rx_queue(dev, &dev->q_rx[qid]);
++ out:
++ 	if (done < budget && napi_complete(napi))
++ 		dev->drv->rx_poll_complete(dev, qid);
++ 
++ 	rcu_read_unlock();
++ 
++ 	return done;
+-- 
+2.55.0.windows.3
+
