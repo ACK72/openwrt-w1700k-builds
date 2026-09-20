@@ -36,3 +36,12 @@ effective ACK72 mt76 source, including its existing patches, without fuzz.
 Runtime acceptance requires cold and warm boots, 6 GHz STA reconnect, 2.4/5 GHz
 AP operation, mwan3 failover, sustained traffic and responsive LuCI RPC calls.
 Compilation or patch application alone does not establish runtime stability.
+
+Live testing also reproduced a separate LuCI wireless-page exception when a
+radio is stopped: a missing runtime ifname and synthetic ID led to
+`Device(undefined)` and an `indexOf` TypeError. The LuCI patch returns null
+from `WifiNetwork.getDevice()` in this case, matching its caller's existing
+contract. With radio2 actually stopped, the patched page renders the inactive
+interface and continues to show the other radios. A regression check using
+the actual WifiNetwork methods fails on the original source and passes on the
+patched source; runtime names and synthetic IDs keep their existing behavior.

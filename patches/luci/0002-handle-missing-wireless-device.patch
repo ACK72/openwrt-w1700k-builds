@@ -1,0 +1,25 @@
+From: ACK72 <ACK72@users.noreply.github.com>
+Subject: [PATCH] luci-base: do not instantiate a missing wireless device
+
+A disabled or transitioning wireless interface may have neither a runtime
+ifname nor a synthetic network ID (for example, a list-valued device option
+from wifi-scripts). WifiNetwork.getDevice() must return null in that case,
+as its caller isUp() already expects. Constructing Device(undefined) reaches
+Device.getType() and throws at this.device.indexOf(), breaking the entire
+wireless page even while rpcd and the driver remain responsive.
+
+Keep valid runtime and synthetic interface names unchanged.
+
+---
+--- a/modules/luci-base/htdocs/luci-static/resources/network.js
++++ b/modules/luci-base/htdocs/luci-static/resources/network.js
+@@ -4485,7 +4485,8 @@
+ 	 * device associated with this wireless network.
+ 	 */
+ 	getDevice() {
+-		return Network.prototype.instantiateDevice(this.getIfname());
++		const ifname = this.getIfname();
++		return (ifname != null ? Network.prototype.instantiateDevice(ifname) : null);
+ 	},
+ 
+ 	/**
