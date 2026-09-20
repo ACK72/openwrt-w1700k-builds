@@ -10,5 +10,6 @@ assert.equal(fn({...good,updated_at:900}).label,'Stale');
 assert.equal(fn({...good,updated_at:1200}).label,'Stale');
 assert.equal(fn({...good,avg_ping:null,samples:0,reachable:false}).label,'No replies');
 assert.equal(fn({available:false}).label,'N/A');
-assert.ok(fn({...good,avg_ping:15,loss_percent:50,reachable:false}).detail.includes('50.0%'));
+assert.equal(fn({...good,avg_ping:15,jitter:1.25,samples:6,attempts:12,loss_percent:50,reachable:false,target:'1.1.1.1'}).detail,
+  'Jitter: 1.3ms | 6/12 replies | 1.1.1.1');
 console.log('Latency display distinguishes valid zero, stale samples and no replies.');

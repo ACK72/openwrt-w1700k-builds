@@ -32,11 +32,21 @@ This is a recommendation list, not an additional kernel patch import.
 - **027 NPU station bitmap clear:** confirm the stock firmware message ABI, valid
   WCID/TID range and completion/failure semantics before index reuse. Its prose
   says TIDs 0–7 but the loop sends 0–8, and failures are silently skipped.
-- **957 BQL/UAF and 980 RX_NO_CPU_DSCP IRQ:** audit against the fully prepared
-  kernel, not patch filenames alone. These address shared QDMA lifetime and a
-  possible missed RX wakeup, respectively. The present wired throughput test is
-  not proof that either proposed change is needed, safe, or the cause of the
-  separate Wi-Fi PCIe error.
+- **957 BQL and TX pointer cleanup:** now checked against Linux stable 6.18.52
+  with all 68 selected patches affecting the four Airoha Ethernet/NPU files
+  replayed successfully. TX teardown still frees pending SKBs without BQL
+  completion, and ordinary completion leaves `e->skb` stale. Port the BQL
+  accounting and pointer clearing, with stop-under-load validation across shared
+  netdev queues. The current cleanup skips entries with `dma_addr == 0`, so the
+  stale pointer alone does not prove the particular UAF claimed in the patch
+  description. No such UAF was observed in the current test.
+- **980 RX_NO_CPU_DSCP IRQ:** the prepared handler still acknowledges these
+  enabled interrupt bits but only routes RX_DONE to NAPI. The patch passes
+  application checks against the current files. Recommend a separate fix and
+  ring-pressure test covering both interrupt banks, masking/rearming and queue
+  31. This is a concrete missed-wakeup candidate for Ethernet RX stalls, not
+  proof of the cause of Wi-Fi PCIe Completion Timeout. Patch application and
+  source review are not cross-compilation or runtime validation.
 - **963 MIB collection:** removing periodic reset can avoid counter loss, but
   review 64-bit high/low read consistency, reset detection, wrap and multiple
   devices per GDM. Prefer consuming kernel-exported software totals in dashboards
@@ -59,6 +69,12 @@ or user network configuration alongside the intended fix.
 
 FlowSense's missing latency was independently traced to its disabled sampler.
 This builder now uses a low-rate, bounded RTT sampler and displays the mean,
-loss and stale state. No packet-path kernel patch is required for that fix.
+jitter, successful replies/attempts, target and stale state. Loss remains in
+the sampler data. No packet-path kernel patch is required for that fix.
+
+The [channel/recovery follow-up](wifi-recovery-review-20260921.md) identifies
+additional scan-completion and failed-restart handling gaps not covered by
+047. These must be addressed alongside its NPU lifecycle changes; importing
+047 alone is not a complete PCIe recovery fix.
 
 Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/0aa0666de1366b69d5d73d98c19809affc1f76ed/openwrt-patches
