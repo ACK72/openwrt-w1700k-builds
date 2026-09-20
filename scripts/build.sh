@@ -7,13 +7,10 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 WORK="$ROOT/.work"
 CACHE="$ROOT/.cache"
 OPENWRT="$WORK/openwrt"
-NPU="$WORK/npu"
 OUT="$ROOT/artifacts"
 LOGS="$ROOT/logs"
 OPENWRT_REPO=${OPENWRT_REPO:-}
 OPENWRT_REF=${OPENWRT_REF:-w1700k-oc-rc}
-NPU_REPO=${NPU_REPO:-}
-NPU_REF=${NPU_REF:-main}
 CONFIG_FILE=${CONFIG_FILE:-$ROOT/configs/w1700k.config}
 export CCACHE_COMPILERCHECK=content
 export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-3G}
@@ -22,8 +19,6 @@ export CCACHE_BASEDIR="$OPENWRT"
 export CCACHE_COMPRESS=true
 export CCACHE_COMPRESSLEVEL=1
 # Keep ccache's correctness checks; no time_macros/file_stat_matches sloppiness.
-export LLVM_CC=clang-18 LLVM_OBJCOPY=llvm-objcopy-18
-export LLVM_READOBJ=llvm-readobj-18 LLVM_AR=llvm-ar-18
 # OpenWrt otherwise prints recursive Kconfig errors but exits successfully.
 export RECURSIVE_DEP_IS_ERROR=1
 
@@ -73,35 +68,13 @@ checkout_source() {
     fi
 }
 
-npu_key() {
-    {
-        git -C "$NPU" rev-parse HEAD
-        for tool in clang-18 ld.lld-18 llvm-objcopy-18 llvm-readobj-18 llvm-ar-18; do
-            "$tool" --version
-            sha256sum "$(command -v "$tool")"
-        done
-        sha256sum "$ROOT/scripts/build.sh" "$ROOT/scripts/build-meta.py"
-        find "$ROOT/patches/npu" -type f -name '*.patch' -print0 | sort -z | xargs -0 sha256sum
-        uname -m
-    } | sha256sum | cut -d' ' -f1
-}
-
 prepare() {
-    local key
     OPENWRT_REPO=${OPENWRT_REPO:-$(python3 "$ROOT/scripts/repositories.py" openwrt)}
-    NPU_REPO=${NPU_REPO:-$(python3 "$ROOT/scripts/repositories.py" airoha-npu-fdk)}
     checkout_source "$OPENWRT_REPO" "$OPENWRT_REF" "$OPENWRT" full
-    checkout_source "$NPU_REPO" "$NPU_REF" "$NPU"
-    for patch_file in "$ROOT"/patches/npu/*.patch; do
-        if git -C "$NPU" apply --check "$patch_file"; then
-            git -C "$NPU" apply "$patch_file"
-        elif git -C "$NPU" apply --reverse --check "$patch_file"; then
-            echo "Already included upstream: ${patch_file##*/}"
-        else
-            die "FDK compatibility patch no longer applies: $patch_file"
-        fi
-    done
-    mkdir -p "$CACHE/dl" "$CACHE/npu"
+    python3 "$ROOT/scripts/official_npu.py" check "$OPENWRT"
+    # Preserve fast ccache compression independently of the firmware provider.
+    sed -i 's/export CCACHE_NOCOMPRESS:=true/export CCACHE_COMPRESS:=true/' "$OPENWRT/rules.mk"
+    mkdir -p "$CACHE/dl"
     if [[ -L $OPENWRT/dl ]]; then
         [[ $(readlink -f "$OPENWRT/dl") == "$CACHE/dl" ]] || die 'Unexpected dl symlink'
     elif [[ -e $OPENWRT/dl ]]; then
@@ -109,30 +82,10 @@ prepare() {
     else
         ln -s "$CACHE/dl" "$OPENWRT/dl"
     fi
-    key=$(npu_key)
     {
         echo "openwrt=$(git -C "$OPENWRT" rev-parse HEAD)"
-        echo "npu=$(git -C "$NPU" rev-parse HEAD)"
-        echo "npu-key=$key"
+        echo "npu=linux-firmware"
     } | tee "$WORK/sources.env"
-}
-
-build_npu() {
-    local key
-    key=$(npu_key)
-    if [[ -f $CACHE/npu/source-key && $(cat "$CACHE/npu/source-key") == "$key" ]] &&
-       [[ -s $CACHE/npu/debug/firmware.elf && -s $CACHE/npu/debug/firmware.map ]] &&
-       (cd "$CACHE/npu" && sha256sum -c SHA256SUMS); then
-        echo 'Using verified NPU firmware cache'
-    else
-        python3 "$NPU/airoha-npu-fdk-build" --platform an7581 \
-            -o "$CACHE/npu/en7581_MT7996_npu" \
-            --debug-directory "$CACHE/npu/debug" 2>&1 | tee "$LOGS/npu.log"
-        (cd "$CACHE/npu" && sha256sum en7581_MT7996_npu_{rv32,data}.bin \
-            debug/firmware.{elf,map} > SHA256SUMS)
-        printf '%s\n' "$key" > "$CACHE/npu/source-key"
-    fi
-    python3 "$ROOT/scripts/build-meta.py" install-npu "$OPENWRT" "$NPU" "$CACHE/npu"
 }
 
 distfeeds() {
@@ -184,7 +137,7 @@ configure() {
     cp .config "$WORK/requested.config"
     make defconfig 2>&1 | tee "$LOGS/defconfig.log"
     python3 "$ROOT/scripts/build-meta.py" check-config "$OPENWRT" "$WORK/requested.config"
-    python3 "$ROOT/scripts/build-meta.py" keys "$OPENWRT" "$NPU" | tee "$WORK/keys.env"
+    python3 "$ROOT/scripts/build-meta.py" keys "$OPENWRT" | tee "$WORK/keys.env"
 }
 
 run_make() {
@@ -305,10 +258,8 @@ collect() {
     cp "$WORK/image-metadata.json" "$dest/image-metadata.json"
     cp "$OPENWRT/public-key.pem" "$dest/public-key.pem"
     "$OPENWRT/scripts/diffconfig.sh" > "$dest/config.diff"
-    cp "$CACHE/npu/"*.bin "$dest/npu/"
-    cp "$NPU/LICENSE" "$dest/npu/LICENSE"
-    cp -r "$CACHE/npu/debug" "$dest/npu/"
-    python3 "$ROOT/scripts/build-meta.py" manifest "$OPENWRT" "$NPU" "$dest"
+    python3 "$ROOT/scripts/official_npu.py" collect "$OPENWRT" "$dest"
+    python3 "$ROOT/scripts/build-meta.py" manifest "$OPENWRT" "$dest"
     # Packages selected with =y are already installed in the image rootfs.
     # Keep diagnostics in the Actions artifact; releases publish only the ITB.
     # SHA256SUMS itself is explicitly excluded from the input file list.
@@ -319,7 +270,6 @@ collect() {
 
 case ${1:-all} in
     prepare) prepare ;;
-    npu) build_npu ;;
     distfeeds) distfeeds ;;
     configure) configure ;;
     restore) restore_build ;;
@@ -328,6 +278,6 @@ case ${1:-all} in
     toolchain) toolchain ;;
     compile) compile ;;
     collect) cd "$OPENWRT"; collect ;;
-    all) prepare; distfeeds; build_npu; configure; restore_build; download; toolchain; compile; cd "$OPENWRT"; collect; save_build build ;;
-    *) die 'Usage: bash scripts/build.sh [all|prepare|distfeeds|npu|configure|restore|download|toolchain|compile|collect|snapshot]' ;;
+    all) prepare; distfeeds; configure; restore_build; download; toolchain; compile; cd "$OPENWRT"; collect; save_build build ;;
+    *) die 'Usage: bash scripts/build.sh [all|prepare|distfeeds|configure|restore|download|toolchain|compile|collect|snapshot]' ;;
 esac

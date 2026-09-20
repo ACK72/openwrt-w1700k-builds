@@ -161,8 +161,7 @@ def main():
     replacements = {"dl": f"{prefix}-dl-{run}",
                     "ccache": f"{prefix}-ccache-{env['TOOLCHAIN_KEY']}-{run}",
                     "build": f"{prefix}-build-{env['BUILD_KEY']}-{run}",
-                    "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}-dl1",
-                    "npu": f"{prefix}-npu-{env['NPU_KEY']}"}
+                    "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}-dl1"}
     items = list_caches(repo, ref)
     remove = candidates(items, prefix, replacements, ref)
     if any(item["key"] == replacements["build"] for item in items):

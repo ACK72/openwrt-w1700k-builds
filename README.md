@@ -17,5 +17,14 @@ RC를 선택하면 시험용 이미지라는 경고가 표시됩니다. 설치 �
 
 ## 기반 프로젝트
 
-[OpenWrt](https://github.com/openwrt/openwrt), [Airoha NPU FDK](https://github.com/hurryman2212/airoha-npu-fdk), [OpenW1700k](https://github.com/OpenWRT-fanboy/OpenW1700k), [w1700k/builds](https://github.com/w1700k/builds), [BuildWrt](https://github.com/tete1030/openwrt-fastbuild-actions)의 작업을 기반으로 합니다.
+[OpenWrt](https://github.com/openwrt/openwrt), [OpenW1700k](https://github.com/OpenWRT-fanboy/OpenW1700k), [w1700k/builds](https://github.com/w1700k/builds), [BuildWrt](https://github.com/tete1030/openwrt-fastbuild-actions)의 작업을 기반으로 합니다.
 라이선스는 [LICENSE](LICENSE)를 참고하세요.
+
+## NPU 펌웨어
+
+OpenWrt의 `linux-firmware` 패키지가 제공하는 공식 Airoha MT7996 NPU 바이너리를 사용합니다.
+FDK 저장소를 내려받거나 NPU 코드를 다시 컴파일하지 않습니다. 프로그램(`rv32`)과 데이터(`data`)는
+같은 공식 배포본에서 가져오며, 패키지 정의·배포본 SHA256·이미지 루트 파일시스템의 두 바이너리를 검증합니다.
+FDK 시절의 패키지 빌드 캐시는 재사용하지 않으며, 호환되는 컴파일러 캐시는 유지합니다.
+
+검증: `python3 -m unittest discover -s tests -v`

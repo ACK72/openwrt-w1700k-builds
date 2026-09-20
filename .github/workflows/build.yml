@@ -5,7 +5,7 @@ on:
     - cron: '17 18 * * *'
   push:
     branches: [main]
-    paths: ['.github/workflows/build.yml', '.github/actions/**', 'scripts/**', 'configs/**', 'package/**', 'patches/**', 'LICENSES/**', 'containers/**', '.dockerignore']
+    paths: ['.github/workflows/build.yml', '.github/actions/**', 'scripts/**', 'tests/**', 'configs/**', 'package/**', 'patches/**', 'LICENSES/**', 'containers/**', '.dockerignore']
   workflow_dispatch:
     inputs:
       refresh_environment:
@@ -114,7 +114,6 @@ jobs:
       packages: write
     env:
       OPENWRT_REF: ${{ needs.compose.outputs.source }}
-      NPU_REF: main
       CCACHE_MAXSIZE: 3G
       BUILD_ENVIRONMENT: ${{ needs.environment.outputs.image }}
       CLEAN_BUILD: ${{ inputs.clean || false }}
@@ -139,6 +138,7 @@ jobs:
         run: |
           for script in scripts/*.sh; do bash -n "$script"; done
           python3 -m compileall -q scripts
+          python3 -m unittest discover -s tests -v
           node --check package/w1700k-custom/overview.js
           test "$(git -c safe.directory="$GITHUB_WORKSPACE" rev-parse HEAD)" = "$GITHUB_SHA"
           test "$(uname -m)" = aarch64
@@ -182,22 +182,6 @@ jobs:
         run: |
           bash scripts/build.sh prepare
           cat .work/sources.env >> "$GITHUB_OUTPUT"
-      - name: Restore paired NPU firmware
-        id: npu
-        if: inputs.clean != true
-        uses: actions/cache/restore@v6.1.0
-        with:
-          path: .cache/npu
-          key: ${{ env.CACHE_PREFIX }}-npu-${{ steps.sources.outputs.npu-key }}
-      - name: Build and verify paired NPU firmware
-        run: bash scripts/build.sh npu
-      - name: Save paired NPU firmware
-        if: steps.npu.outputs.cache-hit != 'true'
-        uses: ./.github/actions/save-cache
-        with:
-          kind: npu
-          path: .cache/npu
-          key: ${{ env.CACHE_PREFIX }}-npu-${{ steps.sources.outputs.npu-key }}
       - name: Resolve feeds and validate release configuration
         id: keys
         run: |
@@ -371,7 +355,6 @@ jobs:
           TOOLCHAIN_KEY: ${{ steps.keys.outputs.toolchain }}
           BUILD_KEY: ${{ steps.keys.outputs.build }}
           BUILD_BASE_KEY: ${{ steps.keys.outputs.build-base }}
-          NPU_KEY: ${{ steps.sources.outputs.npu-key }}
           DISTFEEDS_CACHE_KEY: ${{ steps.official.outputs.cache-key }}
         run: python3 scripts/prune-caches.py
       - name: Upload diagnostic logs

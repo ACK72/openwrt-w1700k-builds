@@ -7,8 +7,8 @@ according with:
 
 	LICENSES/GPL-2.0
 
-The NPU FDK compatibility patches retain the MIT license and upstream
-copyright notice included in LICENSES/MIT.
+The official prebuilt NPU firmware retains its Airoha license from
+linux-firmware. The build artifact includes that license alongside both blobs.
 
 The full license text is included in LICENSES/GPL-2.0.
 

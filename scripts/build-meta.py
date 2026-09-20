@@ -6,10 +6,10 @@ import json
 import os
 import platform
 import re
-import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from official_npu import BINARIES, stock_npu_info, npu_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLCHAIN_INPUTS = (
@@ -19,7 +19,6 @@ TOOLCHAIN_INPUTS = (
 )
 KERNEL_INPUTS = ("target/linux/airoha", "target/linux/generic", "package/kernel/linux")
 PACKAGE = "airoha-en7581-mt7996-npu-firmware"
-BINARIES = ("en7581_MT7996_npu_rv32.bin", "en7581_MT7996_npu_data.bin")
 REQUIRED_CONFIG = (
     "CONFIG_TARGET_airoha_an7581_DEVICE_gemtek_w1700k-ubi",
     "CONFIG_PACKAGE_airoha-en7581-mt7996-npu-firmware",
@@ -197,46 +196,8 @@ def check_installed(openwrt):
     print(f"Verified {len(requested)} requested packages in the image rootfs ({len(installed)} installed)")
 
 
-def install_npu(openwrt, npu, firmware):
-    # Replace just the MT7996 definition, leaving MT7992/AN7583 packages intact.
-    # Fail closed if the upstream recipe changes instead of building vendor blobs.
-    recipe = openwrt / "package/firmware/linux-firmware/airoha.mk"
-    text = recipe.read_text()
-    marker = "# MT7996 firmware is provided by package/firmware/airoha-npu-fdk."
-    pattern = (
-        rf"Package/{PACKAGE} = [^\n]+\n"
-        rf"define Package/{PACKAGE}/install\n.*?\nendef\n\n"
-        rf"\$\(eval \$\(call BuildPackage,{PACKAGE}\)\)"
-    )
-    if marker not in text:
-        text, count = re.subn(pattern, marker, text, flags=re.S)
-        if count != 1:
-            raise RuntimeError("MT7996 linux-firmware recipe changed; review integration")
-    if f"BuildPackage,{PACKAGE}" in text or f"Package/{PACKAGE}" in text:
-        raise RuntimeError("MT7996 linux-firmware recipe changed; duplicate definition")
-    for name in BINARIES:
-        if not (firmware / name).is_file() or not (firmware / name).stat().st_size:
-            raise RuntimeError(f"Missing/empty FDK output: {name}")
-    # OpenWrt disables compression by default. Cache capacity is constrained in
-    # Actions, so keep ccache's fast zstd compression in this managed checkout.
-    rules = openwrt / "rules.mk"
-    rules_text = rules.read_text()
-    rules_text = rules_text.replace(
-        "export CCACHE_NOCOMPRESS:=true", "export CCACHE_COMPRESS:=true"
-    )
-    package = openwrt / "package/firmware/airoha-npu-fdk"
-    (package / "files").mkdir(parents=True, exist_ok=True)
-    revision = git(npu, "rev-parse", "HEAD")
-    template = (ROOT / "package/airoha-npu-fdk/Makefile").read_text()
-    (package / "Makefile").write_text(template.replace("@NPU_VERSION@", "0~" + revision[:12]))
-    for name in BINARIES:
-        shutil.copy2(firmware / name, package / "files" / name)
-    shutil.copy2(npu / "LICENSE", package / "files/LICENSE")
-    recipe.write_text(text)
-    rules.write_text(rules_text)
-
-
-def keys(openwrt, npu):
+def keys(openwrt):
+    npu = stock_npu_info(openwrt)
     commit = builder_commit()
     feeds = {
         p.name: git(p, "rev-parse", "HEAD")
@@ -267,13 +228,14 @@ def keys(openwrt, npu):
     bootstrap_root = read_config(openwrt / ".config").get("CONFIG_GOLANG_EXTERNAL_BOOTSTRAP_ROOT", '""').strip('"')
     # Host Go changes invalidate package products, not the C/C++ cross-toolchain.
     bootstrap = digest_paths(Path(bootstrap_root), ["bin", "pkg", "src", "VERSION"]) if bootstrap_root else ""
-    base_inputs = toolchain + config_digest(openwrt / ".config") + bootstrap
+    base_inputs = toolchain + config_digest(openwrt / ".config") + bootstrap + npu_identity(npu)
     build_base = hashlib.sha256(base_inputs.encode()).hexdigest()
     kernel_hash = digest_paths(openwrt, kernel_inputs(openwrt))
-    build = hashlib.sha256(("build-v3" + base_inputs + kernel_hash + vermagic).encode()).hexdigest()
+    build = hashlib.sha256(("build-v4" + base_inputs + kernel_hash + vermagic).encode()).hexdigest()
     state = {
         "openwrt": git(openwrt, "rev-parse", "HEAD"),
-        "npu": git(npu, "rev-parse", "HEAD"),
+        "npu": "linux-firmware:" + npu["version"],
+        "npu_source": "linux-firmware", "npu_upstream": npu,
         "feeds": feeds, "builder": builder_hash, "builder_commit": commit, "toolchain": toolchain,
         "host": host_hash, "build": build,
         "config": digest_paths(openwrt, [".config"]), "channel": "w1700k-oc-rc",
@@ -288,7 +250,7 @@ def keys(openwrt, npu):
     print(f"toolchain={toolchain}\nbuild={build}\nbuild-base={build_base}\nfingerprint={fingerprint}")
 
 
-def manifest(openwrt, npu, output):
+def manifest(openwrt, output):
     state = json.loads((openwrt.parent / "build-state.json").read_text())
     state["build_type"] = "release"
     stack_file = openwrt.parent / "source-stack.json"
@@ -300,11 +262,10 @@ def manifest(openwrt, npu, output):
     state["built_at"] = datetime.now(timezone.utc).isoformat()
     state["official_distfeeds"] = json.loads((openwrt.parent / "distfeeds.json").read_text(encoding="utf-8"))
     state["changelog"] = git(openwrt, "log", "-20", "--format=%h %s", "--abbrev=10", "HEAD").splitlines()
-    state["npu_compiler"] = subprocess.check_output(["clang-18", "--version"], text=True).strip()
-    state["npu_patches"] = {
-        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in sorted((ROOT / "patches/npu").glob("*.patch"))
-    }
+    if state["npu_source"] != "linux-firmware" or state["npu_upstream"] != stock_npu_info(openwrt):
+        raise ValueError("NPU provider changed since configuration")
+    state["npu_compiler"] = None  # Official prebuilt binaries, not locally compiled.
+    state["npu_patches"] = {}
     state["firmware_sha256"] = {
         name: hashlib.sha256((output / "npu" / name).read_bytes()).hexdigest()
         for name in BINARIES
@@ -315,15 +276,13 @@ def manifest(openwrt, npu, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for command in ("install-npu", "keys", "manifest", "check-config", "feed-packages", "check-installed"):
+    for command in ("keys", "manifest", "check-config", "feed-packages", "check-installed"):
         subparser = subparsers.add_parser(command)
         subparser.add_argument("openwrt", type=Path)
         if command in ("check-config", "feed-packages"):
             subparser.add_argument("profile", type=Path)
-        elif command != "check-installed":
-            subparser.add_argument("npu", type=Path)
-            if command != "keys":
-                subparser.add_argument("output", type=Path)
+        elif command == "manifest":
+            subparser.add_argument("output", type=Path)
     args = parser.parse_args()
     if args.command == "check-config":
         check_config(args.openwrt, args.profile)
@@ -332,11 +291,9 @@ def main():
     elif args.command == "feed-packages":
         print("\n".join(feed_packages(args.openwrt, args.profile)))
     elif args.command == "keys":
-        keys(args.openwrt, args.npu)
-    elif args.command == "install-npu":
-        install_npu(args.openwrt, args.npu, args.output)
+        keys(args.openwrt)
     else:
-        manifest(args.openwrt, args.npu, args.output)
+        manifest(args.openwrt, args.output)
 
 
 if __name__ == "__main__":
