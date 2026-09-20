@@ -219,6 +219,13 @@ compile() {
         "$OPENWRT/staging_dir/host/bin/ccache" -z > "$LOGS/ccache-reset.log" 2>&1 || true
     fi
     if [[ -f $WORK/cache-restored && $(cat "$WORK/cache-restored") == build ]]; then
+        # ucode's cached DEBUG_SUPPORT configuration can link libubox from
+        # staging_dir/host, outside the hostpkg snapshot. Its upstream host
+        # dependency list only names libjson-c, so world need not reinstall
+        # libubox before invoking that cached Ninja graph. Restore this library
+        # through its normal recipe (including dependencies), not by copying an
+        # old host prefix over the compatible toolchain snapshot.
+        run_make restored-host-libubox package/libs/libubox/host/compile
         # Regenerate release identity and the public package key for this run.
         run_make base-files-clean package/base-files/clean
     fi
