@@ -60,7 +60,8 @@
       "selected": [
         "045"
       ],
-      "author": "Gilly <gilroyscott1970@gmail.com>"
+      "author": "Gilly1970 <gilroyscott@hotmail.com>",
+      "source_commit": "6faa8a090e7ab635f542121d01362875253b78ee"
     },
     {
       "file": "0006f-wifi-mt76-mt7996-guard-null-sta-on-eapol-tx.patch",

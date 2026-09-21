@@ -1,12 +1,13 @@
-From: Gilly <gilroyscott1970@gmail.com>
-Date: Thu, 10 Sep 2026 00:00:00 +0000
+From: Gilly1970 <gilroyscott@hotmail.com>
+Date: Thu, 10 Sep 2026 10:47:48 +0000
 Subject: [PATCH] wifi: mt76: mt7996: refresh the tx agg session timer under NPU offload
 
 Import this patch through Gilly1970/Gemtek-W1700K-6.18.
-The Git author records the embedded patch author; ACK72 packages
-the import. Preserve the embedded authorship and sign-off history.
+The Git author and date follow the originating repository commit. ACK72
+packages the import. Preserve the embedded author alias and sign-off history.
 
 Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/blob/0aa0666de1366b69d5d73d98c19809affc1f76ed/openwrt-patches/045-wifi-mt76-mt7996-refresh-tx-agg-timer-under-npu-offload.patch
+Original-commit: https://github.com/Gilly1970/Gemtek-W1700K-6.18/commit/6faa8a090e7ab635f542121d01362875253b78ee
 
 ---
 diff --git a/package/kernel/mt76/patches/9997-wifi-mt76-mt7996-refresh-tx-agg-timer-under-npu-offload.patch b/package/kernel/mt76/patches/9997-wifi-mt76-mt7996-refresh-tx-agg-timer-under-npu-offload.patch
