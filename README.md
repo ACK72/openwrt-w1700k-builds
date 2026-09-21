@@ -2,7 +2,8 @@
 
 **[Release firmware](../../releases/latest)** · [RC firmware](../../releases)
 
-Custom `w1700k-oc` firmware for the Gemtek W1700K HW2.1. This project builds images that include OpenWrt, Airoha NPU firmware, and additional packages.
+Custom `w1700k-oc` firmware for the Gemtek W1700K HW2.1.
+This project builds images that include OpenWrt, Airoha NPU firmware, and additional packages.
 
 In LuCI's **Attended Sysupgrade**, use **Check for GitHub firmware** to select and install a stable or RC image.
 
