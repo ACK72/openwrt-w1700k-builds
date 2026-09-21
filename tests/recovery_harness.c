@@ -116,7 +116,7 @@ static int mt76_queue_is_wed_rro_msdu_pg(struct mt76_queue *q) { return 0; }
 static void napi_disable(int *n) { if (*n!=1) issues++; *n=0; }
 static void napi_enable(int *n) { if (*n!=0) issues++; *n=1; }
 static void napi_schedule(int *n) { if (*n!=1) issues++; }
-static void mt76_worker_disable(int *w) { *w=0; }
+static void mt76_worker_disable(int *w) { if(!*w)issues++; *w=0; }
 static void mt76_worker_enable(int *w) { *w=1; }
 static void ieee80211_stop_queues(struct ieee80211_hw *hw) { stopped=1; }
 static void ieee80211_wake_queues(struct ieee80211_hw *hw) { wakes++; stopped=0; }

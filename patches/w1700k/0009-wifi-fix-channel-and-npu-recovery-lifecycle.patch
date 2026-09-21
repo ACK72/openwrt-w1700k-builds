@@ -17,14 +17,15 @@ diff --git a/package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch b/
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch
-@@ -0,0 +1,3831 @@
+@@ -0,0 +1,3986 @@
 +From: ACK72 <ACK72@users.noreply.github.com>
 +Subject: [PATCH] mt76: complete channel operations and fail closed on recovery errors
 +
 +Always complete aborted scan/ROC software state, propagate channel errors,
-+restore cached context on failure, and do not resume the TX worker after an
-+MCU timeout. Reject survey queries during recovery and make a racing wait
-+interruptible, preserving normal ACS serialization.
++restore cached context on failure, and keep TX blocked by RESET on every
++PHY after MCU timeout. Balance the channel worker park before recovery
++takes it once under the mutex. Reject survey queries during recovery and
++make a racing wait interruptible, preserving normal ACS serialization.
 +
 +Adapt Gilly 047 NPU full-reset parity, additionally checking the stock NPU
 +stop/idle acknowledgement before reclaiming DMA rings, checking every L1
@@ -511,7 +512,7 @@ new file mode 100644
 + EXPORT_SYMBOL_GPL(mt76_cancel_remain_on_channel);
 +--- a/mac80211.c
 ++++ b/mac80211.c
-+@@ -953,290 +953,318 @@
++@@ -953,290 +953,326 @@
 + 		phy->rx_amsdu[q].tail = &skb->next;
 + 	}
 + 
@@ -644,18 +645,27 @@ new file mode 100644
 + 		memset(phy->chan_state, 0, sizeof(*phy->chan_state));
 + 
 + 	ret = dev->drv->set_channel(phy);
++ 
++-	clear_bit(MT76_RESET, &phy->state);
+++	/* Balance our park before recovery takes the mutex and parks once.
+++	 * RESET on every PHY keeps the TX worker from submitting any frames.
+++	 */
+++	if (test_bit(MT76_MCU_RESET, &dev->phy.state)) {
+++		int i;
+++
+++		for (i = 0; i < ARRAY_SIZE(dev->phys); i++)
+++			if (dev->phys[i])
+++				set_bit(MT76_RESET, &dev->phys[i]->state);
+++		ret = ret ? ret : -EIO;
+++	} else {
+++		clear_bit(MT76_RESET, &phy->state);
+++	}
 ++	if (ret) {
 ++		phy->chandef = old_chandef;
 ++		phy->main_chandef = old_main;
 ++		phy->chan_state = old_state;
 ++		phy->offchannel = old_offchannel;
 ++	}
-++
-++	/* A command timeout hands ownership to the recovery worker. */
-++	if (test_bit(MT76_MCU_RESET, &dev->phy.state))
-++		return ret ? ret : -EIO;
-+ 
-+ 	clear_bit(MT76_RESET, &phy->state);
 + 	mt76_worker_enable(&dev->tx_worker);
 + 	mt76_worker_schedule(&dev->tx_worker);
 + 
@@ -831,7 +841,7 @@ new file mode 100644
 + 		if (cur > signal)
 + 			swap(cur, signal);
 + 
-+@@ -2239,139 +2267,171 @@
++@@ -2239,139 +2275,171 @@
 + 		if (link_id == mvif->deflink_id)
 + 			mlink = (struct mt76_vif_link *)vif->drv_priv;
 + 		else
@@ -1399,7 +1409,7 @@ new file mode 100644
 + }
 +--- a/mt7996/mac.c
 ++++ b/mt7996/mac.c
-+@@ -2050,674 +2050,751 @@
++@@ -2050,674 +2050,755 @@
 + 	nf = mt7996_phy_get_nf(phy, mphy->band_idx);
 + 	if (!phy->noise)
 + 		phy->noise = nf << 4;
@@ -1520,7 +1530,7 @@ new file mode 100644
 ++	set_bit(MT76_MCU_RESET, &dev->mphy.state);
 ++	mt7996_for_each_phy(dev, phy)
 ++		set_bit(MT76_RESET, &phy->mt76->state);
-++	mt76_worker_disable(&dev->mt76.tx_worker);
+++	/* The recovery caller already owns the TX worker park. */
 ++	ieee80211_stop_queues(mt76_hw(dev));
 ++	mt7996_irq_disable(dev, ~0);
 ++	mt76_wr(dev, MT_INT_MASK_CSR, 0);
@@ -1561,8 +1571,9 @@ new file mode 100644
 + 	mt7996_for_each_phy(dev, phy)
 + 		mt76_txq_schedule_all(phy->mt76);
 + 
-+ 	/* disable all tx/rx napi */
-+ 	mt76_worker_disable(&dev->mt76.tx_worker);
++-	/* disable all tx/rx napi */
++-	mt76_worker_disable(&dev->mt76.tx_worker);
+++	/* The full-reset caller parked TX; now disable host-owned NAPI. */
 + 	mt76_for_each_q_rx(mdev, i) {
 +-		if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
 +-		    mt76_queue_is_wed_rro(&mdev->q_rx[i]))
@@ -1732,7 +1743,6 @@ new file mode 100644
 + 	set_bit(MT76_MCU_RESET, &dev->mphy.state);
 + 	wake_up(&dev->mt76.mcu.wait);
 + 	ieee80211_stop_queues(hw);
-++	mt76_worker_disable(&dev->mt76.tx_worker);
 ++	mt7996_for_each_phy(dev, phy)
 ++		set_bit(MT76_RESET, &phy->mt76->state);
 + 
@@ -1741,8 +1751,21 @@ new file mode 100644
 + 		cancel_delayed_work_sync(&phy->mt76->mac_work);
 + 
 + 	mt76_abort_scan(&dev->mt76);
++-
 ++	mt7996_for_each_phy(dev, phy)
 ++		mt76_abort_roc(phy->mt76);
+++
+++	/* Channel changes balance their own park under this mutex first. */
++ 	mutex_lock(&dev->mt76.mutex);
++-	for (i = 0; i < 10; i++) {
++-		if (!mt7996_mac_restart(dev))
++-			break;
++-	}
++-
++-	if (i == 10)
++-		dev_err(dev->mt76.dev, "chip full reset failed\n");
+++	mt76_worker_disable(&dev->mt76.tx_worker);
+++	mutex_unlock(&dev->mt76.mutex);
 ++
 ++	if (mtk_wed_device_active(&dev->mt76.mmio.wed_hif2))
 ++		mtk_wed_device_stop(&dev->mt76.mmio.wed_hif2);
@@ -1753,15 +1776,8 @@ new file mode 100644
 ++	ret = mt7996_npu_hw_stop(dev);
 ++	if (ret)
 ++		goto failed;
-+ 
-+ 	mutex_lock(&dev->mt76.mutex);
-+-	for (i = 0; i < 10; i++) {
-+-		if (!mt7996_mac_restart(dev))
-+-			break;
-+-	}
-+-
-+-	if (i == 10)
-+-		dev_err(dev->mt76.dev, "chip full reset failed\n");
+++
+++	mutex_lock(&dev->mt76.mutex);
 ++	ret = mt7996_mac_restart(dev);
 ++	if (ret) {
 ++		mutex_unlock(&dev->mt76.mutex);
@@ -1866,7 +1882,6 @@ new file mode 100644
 + 
 +-	mt7996_npu_hw_stop(dev);
 + 	ieee80211_stop_queues(mt76_hw(dev));
-++	mt76_worker_disable(&dev->mt76.tx_worker);
 + 
 + 	set_bit(MT76_RESET, &dev->mphy.state);
 + 	set_bit(MT76_MCU_RESET, &dev->mphy.state);
@@ -1879,15 +1894,19 @@ new file mode 100644
 + 		set_bit(MT76_RESET, &phy->mt76->state);
 + 		cancel_delayed_work_sync(&phy->mt76->mac_work);
 + 	}
++-
++ 	mutex_lock(&dev->mt76.mutex);
++-
++ 	mt76_worker_disable(&dev->mt76.tx_worker);
+++	mutex_unlock(&dev->mt76.mutex);
 ++	ret = mt7996_npu_hw_stop(dev);
 ++	if (ret) {
 ++		mt7996_reset_failed(dev, ret);
 ++		return;
 ++	}
-+ 
-+ 	mutex_lock(&dev->mt76.mutex);
-+ 
-+ 	mt76_worker_disable(&dev->mt76.tx_worker);
+++
+++	mutex_lock(&dev->mt76.mutex);
+++
 + 	mt76_for_each_q_rx(&dev->mt76, i) {
 + 		if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
 + 		    mt76_queue_is_wed_rro(&dev->mt76.q_rx[i]))
@@ -2190,7 +2209,7 @@ new file mode 100644
 + 	cnt = mt76_rr(dev, MT_MIB_BSCR1(band_idx));
 + 	mib->tx_bf_ibf_ppdu_cnt += cnt;
 + 
-+@@ -2749,200 +2826,204 @@
++@@ -2749,200 +2830,204 @@
 + 	mib->tx_bf_rx_fb_eht_cnt += cnt;
 + 	mib->tx_bf_rx_fb_all_cnt += cnt;
 + 
@@ -3574,6 +3593,142 @@ new file mode 100644
 + 			       struct ieee80211_key_conf *key);
 + int mt7996_mcu_wtbl_update_hdr_trans(struct mt7996_dev *dev,
 + 				     struct ieee80211_vif *vif,
++--- a/mt7996/npu.c
+++++ b/mt7996/npu.c
++@@ -508,124 +508,129 @@
++ 				     &dev->mt76.q_rx[MT_RXQ_NPU0]);
++ 	if (err)
++ 		return err;
++ 
++ 	return mt76_npu_rx_queue_init(&dev->mt76,
++ 				      &dev->mt76.q_rx[MT_RXQ_NPU1]);
++ }
++ 
++ int __mt7996_npu_hw_init(struct mt7996_dev *dev)
++ {
++ 	struct airoha_npu *npu;
++ 	int i, err;
++ 
++ 	npu = rcu_dereference_protected(dev->mt76.mmio.npu, &dev->mt76.mutex);
++ 	if (!npu)
++ 		return 0;
++ 
++ 	err = mt7996_npu_offload_init(dev, npu);
++ 	if (err)
++ 		return err;
++ 
++ 	if (is_mt7996(&dev->mt76))
++ 		err = mt7996_npu_rxd_init(dev, npu);
++ 	else
++ 		err = mt7992_npu_rxd_init(dev, npu);
++ 
++ 	if (err)
++ 		return err;
++ 
++ 	err = mt7996_npu_txd_init(dev, npu);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mt7996_npu_rx_event_init(dev, npu);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mt7996_npu_set_pcie_addr(dev, npu);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mt7996_npu_tx_done_init(dev, npu);
++ 	if (err)
++ 		return err;
++ 
++ 	for (i = MT_RXQ_NPU0; i <= MT_RXQ_NPU1; i++)
++ 		airoha_npu_wlan_enable_irq(npu, i - MT_RXQ_NPU0);
++ 
++ 	return 0;
++ }
++ 
++ int mt7996_npu_hw_init(struct mt7996_dev *dev)
++ {
++ 	int i, err;
++ 
++ 	BUILD_BUG_ON(ARRAY_SIZE(dev->npu_txd_addr) % 3);
++ 
++ 	for (i = 0; i < ARRAY_SIZE(dev->npu_txd_addr); i += 3) {
++ 		int band = i && is_mt7996(&dev->mt76) ? MT_BAND2 : MT_BAND0;
++ 		u32 size = is_mt7996(&dev->mt76) ? band == MT_BAND2
++ 						 ? MT7996_NPU_TX_RING_SIZE
++ 						 : MT7996_NPU_RX_RING_SIZE / 2
++ 						 : MT7996_TX_RING_SIZE;
++ 
++ 		if (!dmam_alloc_coherent(dev->mt76.dma_dev, 256 * size,
++ 					 &dev->npu_txd_addr[i], GFP_KERNEL))
++ 			return -ENOMEM;
++ 
++ 		if (!dmam_alloc_coherent(dev->mt76.dma_dev, 256 * size,
++ 					 &dev->npu_txd_addr[i + 1],
++ 					 GFP_KERNEL))
++ 			return -ENOMEM;
++ 
++ 		if (!dmam_alloc_coherent(dev->mt76.dma_dev, 256 * 1024,
++ 					 &dev->npu_txd_addr[i + 2],
++ 					 GFP_KERNEL))
++ 			return -ENOMEM;
++ 	}
++ 
++ 	mutex_lock(&dev->mt76.mutex);
++ 	err = __mt7996_npu_hw_init(dev);
++ 	mutex_unlock(&dev->mt76.mutex);
++ 
++ 	return err;
++ }
++ 
++ int mt7996_npu_hw_stop(struct mt7996_dev *dev)
++ {
++ 	struct airoha_npu *npu;
++ 	int i, err = 0;
++ 	u32 info;
++ 
++ 	mutex_lock(&dev->mt76.mutex);
++ 
++ 	npu = rcu_dereference_protected(dev->mt76.mmio.npu, &dev->mt76.mutex);
++ 	if (!npu)
++ 		goto unlock;
++ 
++ 	err = mt76_npu_send_msg(npu, 4, WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
++ 				0, GFP_KERNEL);
++-	if (err)
+++	if (err) {
+++		dev_err(dev->mt76.dev, "NPU stop SET4 failed: %d\n", err);
++ 		goto unlock;
+++	}
++ 
++ 	for (i = 0; i < 10; i++) {
++ 		err = mt76_npu_get_msg(npu, 3, WLAN_FUNC_GET_WAIT_NPU_INFO,
++ 				       &info, GFP_KERNEL);
++ 		if (!err && !info)
++ 			break;
++ 
++ 		err = -ETIMEDOUT;
++ 		usleep_range(10000, 15000);
++ 	}
++ 
++-	if (!err)
+++	if (!err) {
++ 		err = mt76_npu_send_msg(npu, 6,
++ 					WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR,
++ 					0, GFP_KERNEL);
++-	else
++-		dev_err(dev->mt76.dev, "npu stop failed\n");
+++		if (err)
+++			dev_err(dev->mt76.dev, "NPU stop SET6 failed: %d\n", err);
+++	} else {
+++		dev_err(dev->mt76.dev, "NPU stop GET3 did not become idle: %d\n", err);
+++	}
++ unlock:
++ 	mutex_unlock(&dev->mt76.mutex);
++ 
++ 	return err;
++ }
 +--- a/scan.c
 ++++ b/scan.c
 +@@ -1,251 +1,266 @@

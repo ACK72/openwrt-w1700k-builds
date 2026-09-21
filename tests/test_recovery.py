@@ -147,6 +147,37 @@ class ScanRocCompletion(unittest.TestCase):
         self.assertEqual(self.case(7)[0:4],[1,0,0,1])
         self.assertEqual(self.case(8)[3],0)
 
+class ChannelRecoveryHandoff(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp=tempfile.TemporaryDirectory(prefix='w1700k-channel-');folder=Path(cls.temp.name)
+        inner=inner_patch('0009-wifi-fix-channel-and-npu-recovery-lifecycle.patch','package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch')
+        source=patch_side(inner,'mac80211.c')
+        (folder/'channel_function.h').write_text(function(source,'__mt76_set_channel'))
+        shutil.copyfile(ROOT/'tests/channel_handoff_harness.c',folder/'test.c')
+        try: cls.lib=compile_harness(folder,'channel')
+        except subprocess.CalledProcessError as e: raise RuntimeError(e.stderr.decode(errors='replace')) from e
+
+    @classmethod
+    def tearDownClass(cls):
+        if os.name=='nt':
+            import _ctypes
+            _ctypes.FreeLibrary(cls.lib._handle)
+        cls.lib=None;cls.temp.cleanup()
+
+    def test_balanced_park_and_reset_blocks_every_phy(self):
+        expected=[
+            [0,1,1,0,1,0,1,0,0],
+            [5,1,1,0,1,0,1,1,0],
+            [5,1,1,0,1,1,1,1,1],
+            [5,0,0,0,0,0,1,1,0],
+            [5,1,1,0,1,1,1,1,1],
+        ]
+        for n,row in enumerate(expected):
+            with self.subTest(case=n):
+                out=(ctypes.c_uint32*9)();self.lib.run_case(n,out)
+                self.assertEqual(list(out),row)
+
 class FirmwareEventBounds(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

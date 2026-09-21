@@ -12,7 +12,9 @@ PCIe endpoint or to identify the first cause of command 0x34 timing out.
   Stop scanning after a channel error, without sending probes or scheduling
   another channel. Cancel same-radio scan/ROC work before context changes.
 - Roll back cached channel/context state after a failed update. Keep TX stopped
-  if a channel command initiated MCU recovery. Do not requeue the MAC worker
+  using RESET on every PHY if a channel command initiated MCU recovery.
+  Balance that channel operation's worker park before recovery parks it once
+  under the device mutex. Do not requeue the MAC worker
   after failed channel setup. Report the failed channel TLV tag, band, channels,
   width, reason, scan/ROC flags, duration and errno at a bounded rate.
 - Check the existing official-NPU stop protocol before any reset ring cleanup:
@@ -67,6 +69,29 @@ function bodies extracted from the patches with mocked kernel boundaries:
 These tests check control flow and ownership, not hardware DMA/AER behavior.
 Full ARM64 compilation and router acceptance are recorded separately when done.
 No dangerous PCIe fault injection or unvalidated AER callback is included.
+
+### First hardware acceptance and correction
+
+Run 35565978739 / builder 2bb6ffc compiled and was installed with network,
+wireless and firewall configuration hashes preserved. PC-to-Mac 6GHz TCP
+reached 1558.4 Mbit/s and reverse 1513.8 Mbit/s, compared with 1547.9/1471.3
+before installation. Six channel applications including two ACS selections
+and two AP disable/enable cycles completed without kernel errors or stuck RPC.
+
+This is **not yet a successful recovery acceptance**. The L1 debug request
+produced no start/completion event. A software-triggered full reset under
+traffic failed its NPU stop operation after about 500ms. The failure path
+also exposed a double `kthread_park()` warning: the initial harness treated
+worker disable as idempotent, unlike the real kernel. Both LuCI RPCs still
+responded after failure; traffic was stopped and a normal reboot restored Wi-Fi.
+
+The follow-up balances each channel operation's park/unpark while RESET gates
+all PHY transmit paths, then takes the recovery park once after those operations
+are serialized under the mutex. Failure and restart helpers do not park it
+again. The harness now rejects duplicate parks, and five actual channel-body
+cases cover success, ordinary error, MCU timeout, pre-existing reset and a reset
+racing with successful channel completion. Stop errors now identify SET4,
+GET3 or SET6; the initiating NPU timeout is still under investigation.
 
 ## NPU memory investigation
 
