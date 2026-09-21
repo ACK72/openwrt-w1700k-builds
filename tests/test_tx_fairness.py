@@ -14,7 +14,7 @@ class PendingFrameFairness(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temps, cls.libs = [], []
-        inner = inner_patch('0010-wifi-service-pending-frames-before-data.patch',
+        inner = inner_patch('0016-wifi-service-pending-frames-before-data.patch',
                             'package/kernel/mt76/patches/9999-z-mt76-pending-before-data.patch')
         for new in (False, True):
             source = patch_side(inner, 'tx.c', new=new)

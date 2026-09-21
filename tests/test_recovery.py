@@ -51,7 +51,7 @@ class RecoveryLifecycle(unittest.TestCase):
     def setUpClass(cls):
         cls.temp=tempfile.TemporaryDirectory(prefix='w1700k-recovery-')
         cls.folder=Path(cls.temp.name)
-        inner=inner_patch('0009-wifi-fix-channel-and-npu-recovery-lifecycle.patch','package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch')
+        inner=inner_patch('0015-wifi-fix-channel-and-npu-recovery-lifecycle.patch','package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch')
         source=patch_side(inner,'mt7996/mac.c')
         names=['mt7996_reset_rx_owned','mt7996_reset_disconnect','mt7996_reset_failed','mt7996_mac_restart','mt7996_mac_full_reset','mt7996_mac_reset_work']
         # Return types on a preceding line are explicitly retained here.
@@ -119,7 +119,7 @@ class ScanRocCompletion(unittest.TestCase):
     def setUpClass(cls):
         cls.temp=tempfile.TemporaryDirectory(prefix='w1700k-scan-')
         folder=Path(cls.temp.name)
-        inner=inner_patch('0009-wifi-fix-channel-and-npu-recovery-lifecycle.patch','package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch')
+        inner=inner_patch('0015-wifi-fix-channel-and-npu-recovery-lifecycle.patch','package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch')
         scan=patch_side(inner,'scan.c'); channel=patch_side(inner,'channel.c')
         (folder/'control_functions.h').write_text(function(scan,'mt76_scan_complete')+function(scan,'mt76_scan_work')+function(channel,'mt76_roc_complete'))
         shutil.copyfile(ROOT/'tests/wifi_control_harness.c',folder/'test.c')
@@ -161,7 +161,7 @@ class ChannelRecoveryHandoff(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp=tempfile.TemporaryDirectory(prefix='w1700k-channel-');folder=Path(cls.temp.name)
-        inner=inner_patch('0009-wifi-fix-channel-and-npu-recovery-lifecycle.patch','package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch')
+        inner=inner_patch('0015-wifi-fix-channel-and-npu-recovery-lifecycle.patch','package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch')
         source=patch_side(inner,'mac80211.c')
         (folder/'channel_function.h').write_text(function(source,'__mt76_set_channel'))
         shutil.copyfile(ROOT/'tests/channel_handoff_harness.c',folder/'test.c')
@@ -192,7 +192,7 @@ class FirmwareEventBounds(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp=tempfile.TemporaryDirectory(prefix='w1700k-events-');folder=Path(cls.temp.name)
-        inner=inner_patch('0008-airoha-select-gilly-event-and-ethernet-fixes.patch','package/kernel/mt76/patches/9999-x-mt7996-bound-events.patch')
+        inner=inner_patch('0014-airoha-select-gilly-event-and-ethernet-fixes.patch','package/kernel/mt76/patches/9999-x-mt7996-bound-events.patch')
         source=patch_side(inner,'mt7996/mcu.c')
         (folder/'event_functions.h').write_text('static void\n'+function(source,'mt7996_mcu_rx_all_sta_info_event')+'static void\n'+function(source,'mt7996_mcu_ie_countdown'))
         shutil.copyfile(ROOT/'tests/event_bounds_harness.c',folder/'test.c')

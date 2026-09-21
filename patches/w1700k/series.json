@@ -23,7 +23,7 @@
       "description": "Initialize the inherited PERSTOUT reset value."
     },
     {
-      "file": "0006a-wifi-mt76-mt7996-reg_lock-irqsave-prevent-AP-panic.patch",
+      "file": "0006-wifi-mt76-mt7996-reg_lock-irqsave-prevent-AP-panic.patch",
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
       "selected": [
         "034"
@@ -31,7 +31,7 @@
       "author": "Shayne Chen <shayne.chen@mediatek.com>"
     },
     {
-      "file": "0006b-wifi-mt76-fix-unlocked-wcid-check-in-mt76_tx_status_skb_add.patch",
+      "file": "0007-wifi-mt76-fix-unlocked-wcid-check-in-mt76_tx_status_skb_add.patch",
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
       "selected": [
         "035"
@@ -39,7 +39,7 @@
       "author": "Ryan Leung <lrd.airoha@gmail.com>"
     },
     {
-      "file": "0006c-wifi-mt76-fix-wcid-teardown-ordering-in-mt76_reset_device.patch",
+      "file": "0008-wifi-mt76-fix-wcid-teardown-ordering-in-mt76_reset_device.patch",
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
       "selected": [
         "036"
@@ -47,7 +47,7 @@
       "author": "Ryan Leung <lrd.airoha@gmail.com>"
     },
     {
-      "file": "0006d-wifi-mt76-fix-queue-assignment-for-disassoc-packets.patch",
+      "file": "0009-wifi-mt76-fix-queue-assignment-for-disassoc-packets.patch",
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
       "selected": [
         "042"
@@ -55,7 +55,7 @@
       "author": "Peter Chiu <chui-hao.chiu@mediatek.com>"
     },
     {
-      "file": "0006e-wifi-mt76-mt7996-refresh-tx-agg-timer-under-npu-offload.patch",
+      "file": "0010-wifi-mt76-mt7996-refresh-tx-agg-timer-under-npu-offload.patch",
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
       "selected": [
         "045"
@@ -64,7 +64,7 @@
       "source_commit": "6faa8a090e7ab635f542121d01362875253b78ee"
     },
     {
-      "file": "0006f-wifi-mt76-mt7996-guard-null-sta-on-eapol-tx.patch",
+      "file": "0011-wifi-mt76-mt7996-guard-null-sta-on-eapol-tx.patch",
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
       "selected": [
         "048"
@@ -72,15 +72,15 @@
       "author": "Slavin Liu <bolin.liu@seu.edu.cn>"
     },
     {
-      "file": "0006g-package-bump-mt76-after-imported-fixes.patch",
+      "file": "0012-package-bump-mt76-after-imported-fixes.patch",
       "description": "Identify the six imported fixes without attributing their code to the packager."
     },
     {
-      "file": "0007-wifi-fix-npu-rx-buffer-ownership.patch",
+      "file": "0013-wifi-fix-npu-rx-buffer-ownership.patch",
       "description": "Preserve page ownership across incomplete NPU RX chains and order DMA metadata reads."
     },
     {
-      "file": "0008-airoha-select-gilly-event-and-ethernet-fixes.patch",
+      "file": "0014-airoha-select-gilly-event-and-ethernet-fixes.patch",
       "selected": [
         "026 (adapted)",
         "044 (adapted)",
@@ -91,15 +91,15 @@
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed"
     },
     {
-      "file": "0009-wifi-fix-channel-and-npu-recovery-lifecycle.patch",
+      "file": "0015-wifi-fix-channel-and-npu-recovery-lifecycle.patch",
       "description": "Complete scan/ROC, propagate channel failures and check NPU stop/restart before resuming recovery. Includes adapted Gilly 047."
     },
     {
-      "file": "0010-wifi-service-pending-frames-before-data.patch",
+      "file": "0016-wifi-service-pending-frames-before-data.patch",
       "description": "Bound and fairly schedule shared-radio pending traffic without stranding data capacity."
     },
     {
-      "file": "0011-wifi-bump-recovery-failure-release.patch",
+      "file": "0017-wifi-bump-recovery-failure-release.patch",
       "description": "Bump mt76 package release for checked DMA errors and terminal STA disconnect handling."
     }
   ]

@@ -14,7 +14,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 def patched_functions():
-    outer = (ROOT / 'patches/w1700k/0007-wifi-fix-npu-rx-buffer-ownership.patch').read_text()
+    outer = (ROOT / 'patches/w1700k/0013-wifi-fix-npu-rx-buffer-ownership.patch').read_text()
     marker = 'diff --git a/package/kernel/mt76/patches/9999-wifi-mt76-fix-npu-rx-buffer-ownership.patch '
     added = outer[outer.index(marker):].splitlines()
     inner = '\n'.join(line[1:] for line in added if line.startswith('+') and not line.startswith('+++'))
