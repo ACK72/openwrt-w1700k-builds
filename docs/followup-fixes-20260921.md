@@ -1,5 +1,11 @@
 # Follow-up against ACK72 main a245e96, 2026-09-21
 
+Later review: the recommendation below to preserve 0010 is superseded by
+[the pending-priority audit](pending-priority-review-20260921.md). Competing
+pending payload and fixed PHY order reveal fairness limitations that the
+original single-frame model did not cover. 0010 should not be accepted
+unchanged as a validated stable fix.
+
 ## Version and hardware evidence
 
 Remote main was fetched and confirmed as a245e96 (16:09 KST). Its Actions

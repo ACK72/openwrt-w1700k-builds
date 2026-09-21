@@ -132,6 +132,11 @@ and restoration of the designated configuration archive.
 
 ### Cross-band STA acceptance and pending-frame scheduling
 
+Later review of 0010: see [the pending-priority audit](pending-priority-review-20260921.md).
+The test described below covers a single waiting frame. Expanded tests found
+that pending payload can displace regular TXQs and that fixed PHY ordering
+still allows band-2 starvation. Those limitations qualify the original result.
+
 The 6GHz STA connected to the saved upstream AP and acquired a DHCP lease.
 5GHz channel 44, restricted ACS over 36/40/44/48, and channel 36 each returned
 with the Mac associated. An earlier unrestricted ACS selected channel 173 and

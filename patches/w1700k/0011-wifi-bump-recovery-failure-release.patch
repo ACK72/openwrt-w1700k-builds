@@ -1,5 +1,5 @@
 From: ACK72 <ACK72@users.noreply.github.com>
-Subject: [PATCH] wifi: bump mt76 release for terminal recovery error handling
+Subject: [PATCH] wifi: bump mt76 release for recovery and fair pending scheduling
 
 diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
 --- a/package/kernel/mt76/Makefile
@@ -9,7 +9,7 @@ diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
  
  PKG_NAME:=mt76
 -PKG_RELEASE=7
-+PKG_RELEASE=8
++PKG_RELEASE=9
  
  PKG_LICENSE:=BSD-3-Clause-Clear
  PKG_LICENSE_FILES:=

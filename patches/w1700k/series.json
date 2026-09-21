@@ -55,7 +55,7 @@
     },
     {
       "file": "0010-wifi-service-pending-frames-before-data.patch",
-      "description": "Service secondary-radio control frames before refilling the shared data rings."
+      "description": "Bound and fairly schedule shared-radio pending traffic without stranding data capacity."
     },
     {
       "file": "0011-wifi-bump-recovery-failure-release.patch",
