@@ -101,3 +101,23 @@ snapshot), latency and 12/12 replies. No 5 GHz or 6 GHz disconnect, new kernel
 warning, PCIe error or reboot appeared during this additional test. Traffic,
 radio conditions and polling differed from the first run, so these figures are
 not a controlled before/after throughput comparison.
+
+Subsequent observation recorded further 6 GHz reconnects at 19:18 and
+19:31:26–19:31:38, outside the controlled iperf stages. The latter followed
+beacon loss / locally generated reason 4, then temporary association refusal
+and authentication status 1 before reconnecting. Existing 6 GHz instability
+must not be described as fixed by the successful 5 GHz test.
+
+## Built image
+
+Builder commit: `0fc2c41da0fb2e135737f1af6f4d23ab3102a560`.
+[Build 35587501509](https://github.com/ACK72/openwrt-w1700k-builds/actions/runs/35587501509)
+completed successfully, including rootfs checks for all 211 requested packages,
+the ucode exec backend, monitor startup and patched nft rtmon.
+[Release](https://github.com/ACK72/openwrt-w1700k-builds/releases/tag/w1700k-oc-rc-35587501509-1):
+`r36438-934755b484`, image size 22,717,250 bytes.
+
+SHA-256: `736caaafd8b70da90818de4bd98bfeaa97b8d65699e405983d2c57002f50cdc5`.
+The downloaded image matched the release digest and passed `sysupgrade -T -n`
+on the device. Runtime monitoring/UI fixes were applied to the existing router;
+the newly built full image was not flashed during this verification.
