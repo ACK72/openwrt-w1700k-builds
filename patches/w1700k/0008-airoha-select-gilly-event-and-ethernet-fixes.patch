@@ -1,0 +1,598 @@
+From: ACK72 <ACK72@users.noreply.github.com>
+Subject: [PATCH] airoha: select Gilly event bounds and Ethernet correctness fixes
+
+diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
+--- a/package/kernel/mt76/Makefile
++++ b/package/kernel/mt76/Makefile
+@@ -1,7 +1,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=mt76
+-PKG_RELEASE=4
++PKG_RELEASE=5
+ 
+ PKG_LICENSE:=BSD-3-Clause-Clear
+ PKG_LICENSE_FILES:=
+diff --git a/package/kernel/mt76/patches/9999-x-mt7996-bound-events.patch b/package/kernel/mt76/patches/9999-x-mt7996-bound-events.patch
+new file mode 100644
+--- /dev/null
++++ b/package/kernel/mt76/patches/9999-x-mt7996-bound-events.patch
+@@ -0,0 +1,422 @@
++From: ACK72 <ACK72@users.noreply.github.com>
++Subject: [PATCH] mt7996: bound firmware station and countdown events
++
++Adapt Gilly 026 and 044, preserving AIR_TIME and checking the entire
++event header before dereference. Unknown well-sized tags can be skipped.
++Source: Gilly1970/Gemtek-W1700K-6.18 at 0aa0666de1366b69d5d73d98c19809affc1f76ed.
++The source patches attribute 026 to mt76 upstream and 044 to an unknown
++origin; this adaptation does not claim independent authorship.
++
++--- a/mt7996/mcu.c
+++++ b/mt7996/mcu.c
++@@ -628,367 +628,403 @@
++ 		__le32 args[3];
++ 	} __packed req = {
++ 		.args = {
++ 			cpu_to_le32(a1),
++ 			cpu_to_le32(a2),
++ 			cpu_to_le32(a3),
++ 		},
++ 	};
++ 
++ 	if (mt7996_has_wa(dev))
++ 		return mt76_mcu_send_msg(&dev->mt76, cmd, &req.args,
++ 					 sizeof(req.args), false);
++ 
++ 	req.tag = cpu_to_le16(cmd == MCU_WA_PARAM_CMD(QUERY) ? UNI_CMD_SDO_QUERY :
++ 							       UNI_CMD_SDO_SET);
++ 	req.len = cpu_to_le16(sizeof(req) - 4);
++ 
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_WA_UNI_CMD(SDO), &req,
++ 				 sizeof(req), false);
++ }
++ 
++ struct mt7996_mcu_countdown_data {
++ 	struct mt76_phy *mphy;
++ 	u8 omac_idx;
++ };
++ 
++ static void
++ mt7996_mcu_csa_finish(void *priv, u8 *mac, struct ieee80211_vif *vif)
++ {
++ 	struct mt7996_mcu_countdown_data *cdata = (void *)priv;
++ 	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
++ 	struct ieee80211_bss_conf *link_conf = NULL;
++ 	unsigned long valid_links = vif->valid_links ?: BIT(0);
++ 	unsigned int link_id;
++ 
++ 	if (vif->type == NL80211_IFTYPE_STATION)
++ 		return;
++ 
++ 	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++ 		struct mt76_vif_link *mlink =
++ 			rcu_dereference(mvif->mt76.link[link_id]);
++ 
++ 		if (mlink && mlink->band_idx == cdata->mphy->band_idx &&
++ 		    mlink->omac_idx == cdata->omac_idx) {
++ 			link_conf = rcu_dereference(vif->link_conf[link_id]);
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (!link_conf || !link_conf->csa_active)
++ 		return;
++ 
++ 	ieee80211_csa_finish(vif, link_conf->link_id);
++ }
++ 
++ static void
++ mt7996_mcu_cca_finish(void *priv, u8 *mac, struct ieee80211_vif *vif)
++ {
++ 	struct mt7996_mcu_countdown_data *cdata = (void *)priv;
++ 	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
++ 	struct ieee80211_bss_conf *link_conf = NULL;
++ 	unsigned long valid_links = vif->valid_links ?: BIT(0);
++ 	unsigned int link_id;
++ 
++ 	if (vif->type == NL80211_IFTYPE_STATION)
++ 		return;
++ 
++ 	for_each_set_bit(link_id, &valid_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++ 		struct mt76_vif_link *mlink =
++ 			rcu_dereference(mvif->mt76.link[link_id]);
++ 
++ 		if (mlink && mlink->band_idx == cdata->mphy->band_idx &&
++ 		    mlink->omac_idx == cdata->omac_idx) {
++ 			link_conf = rcu_dereference(vif->link_conf[link_id]);
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (!link_conf || !link_conf->color_change_active)
++ 		return;
++ 
++ 	ieee80211_color_change_finish(vif, link_conf->link_id);
++ }
++ 
++ static void
++ mt7996_mcu_ie_countdown(struct mt7996_dev *dev, struct sk_buff *skb)
++ {
++ #define UNI_EVENT_IE_COUNTDOWN_CSA 0
++ #define UNI_EVENT_IE_COUNTDOWN_BCC 1
++ 	struct header {
++ 		u8 band;
++ 		u8 rsv[3];
++ 	};
++ 	struct mt7996_mcu_rxd *rxd = (struct mt7996_mcu_rxd *)skb->data;
++ 	const char *data = (char *)&rxd[1], *tail;
++ 	struct header *hdr = (struct header *)data;
++ 	struct tlv *tlv = (struct tlv *)(data + 4);
++ 	struct mt7996_mcu_countdown_notify *event;
++ 	struct mt7996_mcu_countdown_data cdata;
++ 
+++	if (skb->len < sizeof(*rxd) + sizeof(*hdr))
+++		return;
+++
++ 	if (hdr->band >= ARRAY_SIZE(dev->mt76.phys))
++ 		return;
++ 
++ 	cdata.mphy = dev->mt76.phys[hdr->band];
++ 	if (!cdata.mphy)
++ 		return;
++ 
++ 	tail = skb->data + skb->len;
++ 	data += sizeof(*hdr);
++-	while (data + sizeof(*tlv) < tail && le16_to_cpu(tlv->len)) {
+++	while (tail - data >= sizeof(*tlv)) {
+++		u16 tag_len = le16_to_cpu(tlv->len);
+++
+++		if (tag_len < sizeof(*tlv) || tag_len > tail - data)
+++			break;
++ 		event = (struct mt7996_mcu_countdown_notify *)tlv->data;
++ 
++-		cdata.omac_idx = event->omac_idx;
+++		if ((le16_to_cpu(tlv->tag) == UNI_EVENT_IE_COUNTDOWN_CSA ||
+++		     le16_to_cpu(tlv->tag) == UNI_EVENT_IE_COUNTDOWN_BCC) &&
+++		    tag_len < sizeof(*tlv) + sizeof(*event))
+++			break;
++ 
++ 		switch (le16_to_cpu(tlv->tag)) {
++ 		case UNI_EVENT_IE_COUNTDOWN_CSA:
+++			cdata.omac_idx = event->omac_idx;
++ 			ieee80211_iterate_active_interfaces_atomic(mt76_hw(dev),
++ 					IEEE80211_IFACE_ITER_RESUME_ALL,
++ 					mt7996_mcu_csa_finish, &cdata);
++ 			break;
++ 		case UNI_EVENT_IE_COUNTDOWN_BCC:
+++			cdata.omac_idx = event->omac_idx;
++ 			ieee80211_iterate_active_interfaces_atomic(mt76_hw(dev),
++ 					IEEE80211_IFACE_ITER_RESUME_ALL,
++ 					mt7996_mcu_cca_finish, &cdata);
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 
++-		data += le16_to_cpu(tlv->len);
+++		data += tag_len;
++ 		tlv = (struct tlv *)data;
++ 	}
++ }
++ 
++ static void
++ mt7996_mcu_rx_radar_detected(struct mt7996_dev *dev, struct sk_buff *skb)
++ {
++ 	struct mt76_phy *mphy = &dev->mt76.phy;
++ 	struct mt7996_mcu_rdd_report *r;
++ 
++ 	r = (struct mt7996_mcu_rdd_report *)skb->data;
++ 
++ 	switch (r->rdd_idx) {
++ 	case MT_RDD_IDX_BAND2:
++ 		mphy = dev->mt76.phys[MT_BAND2];
++ 		break;
++ 	case MT_RDD_IDX_BAND1:
++ 		mphy = dev->mt76.phys[MT_BAND1];
++ 		break;
++ 	case MT_RDD_IDX_BACKGROUND:
++ 		if (!dev->rdd2_phy)
++ 			goto err;
++ 		mphy = dev->rdd2_phy->mt76;
++ 		break;
++ 	default:
++ 		goto err;
++ 	}
++ 
++ 	if (!mphy)
++ 		goto err;
++ 
++ 	if (r->rdd_idx == MT_RDD_IDX_BACKGROUND) {
++ 		cfg80211_background_radar_event(mphy->hw->wiphy,
++ 						&dev->rdd2_chandef,
++ 						GFP_ATOMIC);
++ 	} else {
++ 		struct mt7996_phy *phy = mphy->priv;
++ 
++ 		phy->rdd_tx_paused = true;
++ 		ieee80211_radar_detected(mphy->hw, NULL);
++ 	}
++ 	dev->hw_pattern++;
++ 
++ 	return;
++ 
++ err:
++ 	dev_err(dev->mt76.dev, "Invalid RDD idx %d\n", r->rdd_idx);
++ }
++ 
++ static void
++ mt7996_mcu_rx_log_message(struct mt7996_dev *dev, struct sk_buff *skb)
++ {
++ #define UNI_EVENT_FW_LOG_FORMAT 0
++ 	struct mt7996_mcu_rxd *rxd = (struct mt7996_mcu_rxd *)skb->data;
++ 	const char *data = (char *)&rxd[1] + 4, *type;
++ 	struct tlv *tlv = (struct tlv *)data;
++ 	int len;
++ 
++ 	if (!(rxd->option & MCU_UNI_CMD_EVENT)) {
++ 		len = skb->len - sizeof(*rxd);
++ 		data = (char *)&rxd[1];
++ 		goto out;
++ 	}
++ 
++ 	if (le16_to_cpu(tlv->tag) != UNI_EVENT_FW_LOG_FORMAT)
++ 		return;
++ 
++ 	data += sizeof(*tlv) + 4;
++ 	len = le16_to_cpu(tlv->len) - sizeof(*tlv) - 4;
++ 
++ out:
++ 	switch (rxd->s2d_index) {
++ 	case 0:
++ 		if (mt7996_debugfs_rx_log(dev, data, len))
++ 			return;
++ 
++ 		type = "WM";
++ 		break;
++ 	case 2:
++ 		type = "WA";
++ 		break;
++ 	default:
++ 		type = "unknown";
++ 		break;
++ 	}
++ 
++ 	wiphy_info(mt76_hw(dev)->wiphy, "%s: %.*s", type, len, data);
++ }
++ 
++ static int
++ mt7996_mcu_update_tx_gi(struct rate_info *rate, struct all_sta_trx_rate *mcu_rate)
++ {
++ 	switch (mcu_rate->tx_mode) {
++ 	case MT_PHY_TYPE_CCK:
++ 	case MT_PHY_TYPE_OFDM:
++ 		break;
++ 	case MT_PHY_TYPE_HT:
++ 	case MT_PHY_TYPE_HT_GF:
++ 	case MT_PHY_TYPE_VHT:
++ 		if (mcu_rate->tx_gi)
++ 			rate->flags |= RATE_INFO_FLAGS_SHORT_GI;
++ 		else
++ 			rate->flags &= ~RATE_INFO_FLAGS_SHORT_GI;
++ 		break;
++ 	case MT_PHY_TYPE_HE_SU:
++ 	case MT_PHY_TYPE_HE_EXT_SU:
++ 	case MT_PHY_TYPE_HE_TB:
++ 	case MT_PHY_TYPE_HE_MU:
++ 		if (mcu_rate->tx_gi > NL80211_RATE_INFO_HE_GI_3_2)
++ 			return -EINVAL;
++ 		rate->he_gi = mcu_rate->tx_gi;
++ 		break;
++ 	case MT_PHY_TYPE_EHT_SU:
++ 	case MT_PHY_TYPE_EHT_TRIG:
++ 	case MT_PHY_TYPE_EHT_MU:
++ 		if (mcu_rate->tx_gi > NL80211_RATE_INFO_EHT_GI_3_2)
++ 			return -EINVAL;
++ 		rate->eht_gi = mcu_rate->tx_gi;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void
++ mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
++ {
++ 	struct mt7996_mcu_all_sta_info_event *res;
++-	u16 i;
++-
++-	skb_pull(skb, sizeof(struct mt7996_mcu_rxd));
+++	size_t elem_size;
+++	u16 i, sta_num;
+++
+++	if (!skb_pull(skb, sizeof(struct mt7996_mcu_rxd)))
+++		return;
+++	if (skb->len < sizeof(*res))
+++		return;
++ 
++ 	res = (struct mt7996_mcu_all_sta_info_event *)skb->data;
++ 
++-	for (i = 0; i < le16_to_cpu(res->sta_num); i++) {
+++	switch (le16_to_cpu(res->tag)) {
+++	case UNI_ALL_STA_TXRX_RATE:
+++		elem_size = sizeof(res->rate[0]);
+++		break;
+++	case UNI_ALL_STA_TXRX_ADM_STAT:
+++		elem_size = sizeof(res->adm_stat[0]);
+++		break;
+++	case UNI_ALL_STA_TXRX_MSDU_COUNT:
+++		elem_size = sizeof(res->msdu_cnt[0]);
+++		break;
+++	case UNI_ALL_STA_TXRX_AIR_TIME:
+++		elem_size = sizeof(res->airtime[0]);
+++		break;
+++	default:
+++		return;
+++	}
+++	sta_num = le16_to_cpu(res->sta_num);
+++	if (sta_num > (skb->len - sizeof(*res)) / elem_size)
+++		return;
+++
+++	for (i = 0; i < sta_num; i++) {
++ 		u8 ac;
++ 		u16 wlan_idx;
++ 		struct mt76_wcid *wcid;
++ 
++ 		switch (le16_to_cpu(res->tag)) {
++ 		case UNI_ALL_STA_TXRX_RATE:
++ 			wlan_idx = le16_to_cpu(res->rate[i].wlan_idx);
++ 			wcid = mt76_wcid_ptr(dev, wlan_idx);
++ 
++ 			if (!wcid)
++ 				break;
++ 
++ 			if (mt7996_mcu_update_tx_gi(&wcid->rate, &res->rate[i]))
++ 				dev_err(dev->mt76.dev, "Failed to update TX GI\n");
++ 			break;
++ 		case UNI_ALL_STA_TXRX_ADM_STAT:
++ 			wlan_idx = le16_to_cpu(res->adm_stat[i].wlan_idx);
++ 			wcid = mt76_wcid_ptr(dev, wlan_idx);
++ 
++ 			if (!wcid)
++ 				break;
++ 
++ 			for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
++ 				wcid->stats.tx_bytes +=
++ 					le32_to_cpu(res->adm_stat[i].tx_bytes[ac]);
++ 				wcid->stats.rx_bytes +=
++ 					le32_to_cpu(res->adm_stat[i].rx_bytes[ac]);
++ 			}
++ 			break;
++ 		case UNI_ALL_STA_TXRX_MSDU_COUNT:
++ 			wlan_idx = le16_to_cpu(res->msdu_cnt[i].wlan_idx);
++ 			wcid = mt76_wcid_ptr(dev, wlan_idx);
++ 
++ 			if (!wcid)
++ 				break;
++ 
++ 			wcid->stats.tx_packets +=
++ 				le32_to_cpu(res->msdu_cnt[i].tx_msdu_cnt);
++ 			wcid->stats.rx_packets +=
++ 				le32_to_cpu(res->msdu_cnt[i].rx_msdu_cnt);
++ 			break;
++ 		case UNI_ALL_STA_TXRX_AIR_TIME: {
++ 			static const u8 ac_to_tid[] = {
++ 				[IEEE80211_AC_BE] = 0,
++ 				[IEEE80211_AC_BK] = 1,
++ 				[IEEE80211_AC_VI] = 4,
++ 				[IEEE80211_AC_VO] = 6
++ 			};
++ 			struct ieee80211_sta *sta;
++ 
++ 			wlan_idx = le16_to_cpu(res->airtime[i].wlan_idx);
++ 			wcid = mt76_wcid_ptr(dev, wlan_idx);
++ 			sta = wcid_to_sta(wcid);
++ 			if (!sta)
++ 				break;
++ 
++ 			for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
++ 				u8 lmac_ac = mt76_connac_lmac_mapping(ac);
++ 				u32 tx_cur = le32_to_cpu(res->airtime[i].tx[lmac_ac]);
++ 				u32 rx_cur = le32_to_cpu(res->airtime[i].rx[lmac_ac]);
++ 
++ 				if (!tx_cur && !rx_cur)
++ 					continue;
++ 
++ 				ieee80211_sta_register_airtime(sta, ac_to_tid[ac], tx_cur, rx_cur);
++ 			}
++ 			break;
++ 		}
++ 		default:
++ 			break;
++ 		}
++ 	}
++ }
++ 
++ static void
++ mt7996_mcu_rx_thermal_notify(struct mt7996_dev *dev, struct sk_buff *skb)
++ {
++ #define THERMAL_NOTIFY_TAG 0x4
++ #define THERMAL_NOTIFY 0x2
++ 	struct mt76_phy *mphy = &dev->mt76.phy;
++ 	struct mt7996_mcu_thermal_notify *n;
++ 	struct mt7996_phy *phy;
++ 
++ 	n = (struct mt7996_mcu_thermal_notify *)skb->data;
++ 
++ 	if (le16_to_cpu(n->tag) != THERMAL_NOTIFY_TAG)
++ 		return;
++ 
++ 	if (n->event_id != THERMAL_NOTIFY)
++ 		return;
++ 
++ 	if (n->band_idx > MT_BAND2)
++ 		return;
++ 
++ 	mphy = dev->mt76.phys[n->band_idx];
++ 	if (!mphy)
++ 		return;
++ 
++ 	phy = (struct mt7996_phy *)mphy->priv;
++ 	phy->throttle_state = n->duty_percent;
+diff --git a/target/linux/airoha/patches-6.18/999-ack72-ethernet-correctness.patch b/target/linux/airoha/patches-6.18/999-ack72-ethernet-correctness.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/airoha/patches-6.18/999-ack72-ethernet-correctness.patch
+@@ -0,0 +1,151 @@
++From: ACK72 <ACK72@users.noreply.github.com>
++Subject: [PATCH] airoha: fix PPE errors, TX BQL teardown and RX IRQ routing
++
++Port Gilly 949, 957 and 980 onto the effective 6.18.52 stack.
++957 is attributed by Gilly <gilroyscott1970@gmail.com> to Lorenzo
++Bianconi; 980 was staged from netdev without a recorded author.
++Source: Gilly1970/Gemtek-W1700K-6.18 at 0aa0666de1366b69d5d73d98c19809affc1f76ed.
++Do not infer a demonstrated UAF merely from the stale skb pointer.
++
++--- a/drivers/net/ethernet/airoha/airoha_eth.c
+++++ b/drivers/net/ethernet/airoha/airoha_eth.c
++@@ -1015,19 +1015,22 @@
++ 
++ 	if (done < budget && napi_complete(napi)) {
++ 		struct airoha_qdma *qdma = q->qdma;
++ 		int i, qid = q - &qdma->q_rx[0];
++ 		int intr_reg = qid < RX_DONE_HIGH_OFFSET ? QDMA_INT_REG_IDX1
++ 							 : QDMA_INT_REG_IDX2;
+++		u32 irq_id = qid % RX_DONE_HIGH_OFFSET;
+++		u32 intr_mask = BIT(irq_id) |
+++				BIT(irq_id + RX_NO_CPU_DSCP_LOW_OFFSET);
++ 
++ 		for (i = 0; i < ARRAY_SIZE(qdma->irq_banks); i++) {
++ 			if (!(BIT(qid) & RX_IRQ_BANK_PIN_MASK(i)))
++ 				continue;
++ 
++ 			airoha_qdma_irq_enable(&qdma->irq_banks[i], intr_reg,
++-					       BIT(qid % RX_DONE_HIGH_OFFSET));
+++					       intr_mask);
++ 		}
++ 	}
++ 
++ 	return done;
++ }
++ 
++@@ -1249,12 +1252,13 @@
++ 		if (!(desc_ctrl & QDMA_DESC_DONE_MASK) &&
++ 		    !(desc_ctrl & QDMA_DESC_DROP_MASK))
++ 			goto unlock;
++ 
++ 		e = &q->entry[index];
++ 		skb = e->skb;
+++		e->skb = NULL;
++ 
++ 		dma_unmap_single(eth->dev, e->dma_addr, e->dma_len,
++ 				 DMA_TO_DEVICE);
++ 		e->dma_addr = 0;
++ 		list_add_tail(&e->list, &q->tx_list);
++ 
++@@ -1409,13 +1413,19 @@
++ 
++ 		if (!e->dma_addr)
++ 			continue;
++ 
++ 		dma_unmap_single(eth->dev, e->dma_addr, e->dma_len,
++ 				 DMA_TO_DEVICE);
++-		dev_kfree_skb_any(e->skb);
+++		if (e->skb) {
+++			struct netdev_queue *txq;
+++
+++			txq = skb_get_tx_queue(e->skb->dev, e->skb);
+++			netdev_tx_completed_queue(txq, 1, e->skb->len);
+++			dev_kfree_skb_any(e->skb);
+++		}
++ 		e->dma_addr = 0;
++ 		e->skb = NULL;
++ 		list_add_tail(&e->list, &q->tx_list);
++ 
++ 		/* Reset DMA descriptor */
++ 		WRITE_ONCE(desc->ctrl, 0);
++@@ -1665,22 +1675,25 @@
++ 		airoha_qdma_wr(qdma, REG_INT_STATUS(i), intr[i]);
++ 	}
++ 
++ 	if (!test_bit(DEV_STATE_INITIALIZED, &qdma->eth->state))
++ 		return IRQ_NONE;
++ 
++-	rx_intr1 = intr[1] & RX_DONE_LOW_INT_MASK;
+++	rx_intr1 = intr[1] & (RX_DONE_LOW_INT_MASK | RX_NO_CPU_DSCP_LOW_INT_MASK);
++ 	if (rx_intr1) {
++ 		airoha_qdma_irq_disable(irq_bank, QDMA_INT_REG_IDX1, rx_intr1);
++-		rx_intr_mask |= rx_intr1;
++-	}
++-
++-	rx_intr2 = intr[2] & RX_DONE_HIGH_INT_MASK;
+++		rx_intr_mask |= (rx_intr1 & RX_DONE_LOW_INT_MASK) |
+++				RX_NO_CPU_DSCP_INT_RX1_MASK(rx_intr1);
+++	}
+++
+++	rx_intr2 = intr[2] & (RX_DONE_HIGH_INT_MASK | RX_NO_CPU_DSCP_HIGH_INT_MASK);
++ 	if (rx_intr2) {
++ 		airoha_qdma_irq_disable(irq_bank, QDMA_INT_REG_IDX2, rx_intr2);
++-		rx_intr_mask |= (rx_intr2 << 16);
+++		rx_intr_mask |= ((rx_intr2 & RX_DONE_HIGH_INT_MASK) <<
+++				 RX_DONE_HIGH_OFFSET) |
+++				(rx_intr2 & RX_NO_CPU_DSCP_HIGH_INT_MASK);
++ 	}
++ 
++ 	for (i = 0; rx_intr_mask && i < ARRAY_SIZE(qdma->q_rx); i++) {
++ 		if (!qdma->q_rx[i].ndesc)
++ 			continue;
++ 
++--- a/drivers/net/ethernet/airoha/airoha_ppe.c
+++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
++@@ -1396,24 +1396,24 @@
++ }
++ 
++ static int airoha_ppe_flush_sram_entries(struct airoha_ppe *ppe)
++ {
++ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
++ 	struct airoha_foe_entry *hwe = ppe->foe;
++-	int i, err = 0;
+++	int i;
++ 
++ 	for (i = 0; i < sram_num_entries; i++) {
++ 		int err;
++ 
++ 		memset(&hwe[i], 0, sizeof(*hwe));
++ 		err = airoha_ppe_foe_commit_sram_entry(ppe, i);
++ 		if (err)
++-			break;
++-	}
++-
++-	return err;
+++			return err;
+++	}
+++
+++	return 0;
++ }
++ 
++ static struct airoha_npu *airoha_ppe_npu_get(struct airoha_eth *eth)
++ {
++ 	struct airoha_npu *npu = airoha_npu_get(eth->dev);
++ 
++--- a/drivers/net/ethernet/airoha/airoha_regs.h
+++++ b/drivers/net/ethernet/airoha/airoha_regs.h
++@@ -572,12 +572,14 @@
++ 	 RX1_DONE_INT_MASK | RX0_DONE_INT_MASK)
++ 
++ #define RX_NO_CPU_DSCP_LOW_OFFSET	__ffs(RX_NO_CPU_DSCP_LOW_INT_MASK)
++ #define INT_RX1_MASK(_n)							\
++ 	((((_n) << RX_NO_CPU_DSCP_LOW_OFFSET) & RX_NO_CPU_DSCP_LOW_INT_MASK) |	\
++ 	 (RX_DONE_LOW_INT_MASK & (_n)))
+++#define RX_NO_CPU_DSCP_INT_RX1_MASK(_n)					\
+++	(((_n) & RX_NO_CPU_DSCP_LOW_INT_MASK) >> RX_NO_CPU_DSCP_LOW_OFFSET)
++ 
++ /* QDMA_CSR_INT_ENABLE3 */
++ #define RX31_NO_CPU_DSCP_INT_MASK	BIT(31)
++ #define RX30_NO_CPU_DSCP_INT_MASK	BIT(30)
++ #define RX29_NO_CPU_DSCP_INT_MASK	BIT(29)
++ #define RX28_NO_CPU_DSCP_INT_MASK	BIT(28)

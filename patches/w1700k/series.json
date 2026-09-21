@@ -37,6 +37,21 @@
     {
       "file": "0007-wifi-fix-npu-rx-buffer-ownership.patch",
       "description": "Preserve page ownership across incomplete NPU RX chains and order DMA metadata reads."
+    },
+    {
+      "file": "0008-airoha-select-gilly-event-and-ethernet-fixes.patch",
+      "selected": [
+        "026 (adapted)",
+        "044 (adapted)",
+        "949",
+        "957",
+        "980"
+      ],
+      "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed"
+    },
+    {
+      "file": "0009-wifi-fix-channel-and-npu-recovery-lifecycle.patch",
+      "description": "Complete scan/ROC, propagate channel failures and check NPU stop/restart before resuming recovery. Includes adapted Gilly 047."
     }
   ]
 }
