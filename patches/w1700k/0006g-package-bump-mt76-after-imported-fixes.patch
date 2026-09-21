@@ -1,0 +1,21 @@
+From: ACK72 <ACK72@users.noreply.github.com>
+Date: Mon, 21 Sep 2026 00:35:43 +0900
+Subject: [PATCH] package: bump mt76 after imported correctness fixes
+
+Identify the package containing the six separately attributed imports.
+This packaging change is separate from the original driver authorship.
+
+---
+diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
+index 2265a8fec8..3a09ca0a35 100644
+--- a/package/kernel/mt76/Makefile
++++ b/package/kernel/mt76/Makefile
+@@ -1,7 +1,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=mt76
+-PKG_RELEASE=2
++PKG_RELEASE=3
+ 
+ PKG_LICENSE:=BSD-3-Clause-Clear
+ PKG_LICENSE_FILES:=

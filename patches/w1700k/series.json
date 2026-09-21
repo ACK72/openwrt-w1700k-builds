@@ -23,16 +23,56 @@
       "description": "Initialize the inherited PERSTOUT reset value."
     },
     {
-      "file": "0006-wifi-select-gilly-mt76-correctness-fixes.patch",
+      "file": "0006a-wifi-mt76-mt7996-reg_lock-irqsave-prevent-AP-panic.patch",
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
       "selected": [
-        "034",
-        "035",
-        "036",
-        "042",
-        "045",
+        "034"
+      ],
+      "author": "Shayne Chen <shayne.chen@mediatek.com>"
+    },
+    {
+      "file": "0006b-wifi-mt76-fix-unlocked-wcid-check-in-mt76_tx_status_skb_add.patch",
+      "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
+      "selected": [
+        "035"
+      ],
+      "author": "Ryan Leung <lrd.airoha@gmail.com>"
+    },
+    {
+      "file": "0006c-wifi-mt76-fix-wcid-teardown-ordering-in-mt76_reset_device.patch",
+      "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
+      "selected": [
+        "036"
+      ],
+      "author": "Ryan Leung <lrd.airoha@gmail.com>"
+    },
+    {
+      "file": "0006d-wifi-mt76-fix-queue-assignment-for-disassoc-packets.patch",
+      "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
+      "selected": [
+        "042"
+      ],
+      "author": "Peter Chiu <chui-hao.chiu@mediatek.com>"
+    },
+    {
+      "file": "0006e-wifi-mt76-mt7996-refresh-tx-agg-timer-under-npu-offload.patch",
+      "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
+      "selected": [
+        "045"
+      ],
+      "author": "Gilly <gilroyscott1970@gmail.com>"
+    },
+    {
+      "file": "0006f-wifi-mt76-mt7996-guard-null-sta-on-eapol-tx.patch",
+      "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
+      "selected": [
         "048"
-      ]
+      ],
+      "author": "Slavin Liu <bolin.liu@seu.edu.cn>"
+    },
+    {
+      "file": "0006g-package-bump-mt76-after-imported-fixes.patch",
+      "description": "Identify the six imported fixes without attributing their code to the packager."
     },
     {
       "file": "0007-wifi-fix-npu-rx-buffer-ownership.patch",
