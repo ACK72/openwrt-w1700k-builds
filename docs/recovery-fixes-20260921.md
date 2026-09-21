@@ -25,8 +25,11 @@ PCIe endpoint or to identify the first cause of command 0x34 timing out.
   requests promptly, and does not wake queues or request a fake mac80211 restart.
   NAPI enable/disable remains balanced. The terminal state requires a device
   restart; a persistent PCIe fault can still require power removal.
-- Survey queries return a bounded error while the device mutex is busy/resetting,
-  preventing the observed `rpcd -> mt76_get_survey -> mutex_lock` indefinite wait.
+- Survey queries fail promptly when MCU reset is already active. Normal ACS
+  queries still serialize on the mutex, using an interruptible wait in case
+  reset races with the query. Do not return EBUSY merely because an ordinary
+  MAC worker holds the mutex: hostapd ACS can treat that as a survey failure.
+  The reset worker itself no longer loops ten times or resumes a failed device.
 - Beacon monitoring skips reset downtime and refreshes its timestamp after a
   successful L1 recovery. Keep the seven-interval loss threshold. Error-only
   diagnostics record beacon age, band/link, scan/ROC flags and outstanding tokens.

@@ -17,13 +17,14 @@ diff --git a/package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch b/
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch
-@@ -0,0 +1,3823 @@
+@@ -0,0 +1,3831 @@
 +From: ACK72 <ACK72@users.noreply.github.com>
 +Subject: [PATCH] mt76: complete channel operations and fail closed on recovery errors
 +
 +Always complete aborted scan/ROC software state, propagate channel errors,
 +restore cached context on failure, and do not resume the TX worker after an
-+MCU timeout. Make survey queries nonblocking during recovery.
++MCU timeout. Reject survey queries during recovery and make a racing wait
++interruptible, preserving normal ACS serialization.
 +
 +Adapt Gilly 047 NPU full-reset parity, additionally checking the stock NPU
 +stop/idle acknowledgement before reclaiming DMA rings, checking every L1
@@ -291,10 +292,10 @@ new file mode 100644
 + 		new_ctx = (struct mt76_chanctx *)v->new_ctx->drv_priv;
 + 		phy = new_ctx->phy;
 + 
-+ 		if (mode == CHANCTX_SWMODE_SWAP_CONTEXTS && old_phy->chanctx &&
-+ 		    old_phy->chanctx == old_ctx && phy != old_phy)
-+ 			old_phy->chanctx = NULL;
-+ 
++-		if (mode == CHANCTX_SWMODE_SWAP_CONTEXTS && old_phy->chanctx &&
++-		    old_phy->chanctx == old_ctx && phy != old_phy)
++-			old_phy->chanctx = NULL;
++-
 + 		if (need_update[phy->band_idx]) {
 + 			ret = mt76_phy_update_channel(phy, v->new_ctx);
 + 			if (ret)
@@ -302,6 +303,10 @@ new file mode 100644
 + 
 + 			need_update[phy->band_idx] = false;
 + 		}
+++
+++		if (mode == CHANCTX_SWMODE_SWAP_CONTEXTS && old_phy->chanctx &&
+++		    old_phy->chanctx == old_ctx && phy != old_phy)
+++			old_phy->chanctx = NULL;
 + 
 + 		mlink = mt76_vif_conf_link(dev, v->vif, v->link_conf);
 + 		if (!mlink)
@@ -506,7 +511,7 @@ new file mode 100644
 + EXPORT_SYMBOL_GPL(mt76_cancel_remain_on_channel);
 +--- a/mac80211.c
 ++++ b/mac80211.c
-+@@ -953,290 +953,315 @@
++@@ -953,290 +953,318 @@
 + 		phy->rx_amsdu[q].tail = &skb->next;
 + 	}
 + 
@@ -716,9 +721,12 @@ new file mode 100644
 +-	mutex_lock(&dev->mutex);
 ++	if (test_bit(MT76_MCU_RESET, &dev->phy.state))
 ++		return -EIO;
-++	/* Do not block rpcd behind firmware recovery or a channel command. */
-++	if (!mutex_trylock(&dev->mutex))
-++		return -EBUSY;
+++	/* Normal ACS queries must serialize, not fail on transient contention.
+++	 * Allow a terminating signal to interrupt a query racing with reset.
+++	 */
+++	ret = mutex_lock_interruptible(&dev->mutex);
+++	if (ret)
+++		return ret;
 ++	if (test_bit(MT76_MCU_RESET, &dev->phy.state)) {
 ++		ret = -EIO;
 ++		goto out;
@@ -823,7 +831,7 @@ new file mode 100644
 + 		if (cur > signal)
 + 			swap(cur, signal);
 + 
-+@@ -2239,139 +2264,171 @@
++@@ -2239,139 +2267,171 @@
 + 		if (link_id == mvif->deflink_id)
 + 			mlink = (struct mt76_vif_link *)vif->drv_priv;
 + 		else
