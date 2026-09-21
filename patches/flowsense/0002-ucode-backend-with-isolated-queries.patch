@@ -1,0 +1,3887 @@
+From: ACK72
+Subject: [PATCH] flowsense: adapt Gilly r7 ucode parsing while preserving RPC process isolation
+
+Source: Gilly1970/Gemtek-W1700K-6.18@4a1e35762e382dfaf2306da9b079c548e2f3d632
+SPDX-License-Identifier: Apache-2.0
+
+--- /dev/null
++++ b/package/luci-app-airoha-flowsense/root/usr/share/luci-airoha-flowsense/backend.sh
+@@ -0,0 +1,1358 @@
++#!/bin/sh
++
++# Airoha FlowSense RPC backend for LuCI (Offload & PPE Monitor)
++
++. /lib/functions.sh
++
++get_status() {
++	# === NPU Status ===
++	local npu_fw="/lib/firmware/airoha/en7581_MT7996_npu_rv32.bin"
++	local npu_ver="Unknown"
++
++	if [ -f "$npu_fw" ]; then
++		npu_ver=$(strings "$npu_fw" 2>/dev/null | grep -oE '([0-9]+\.[0-9]+\.[0-9]+-)?TLB[0-9.]+[-_v0-9]*' | head -1)
++		[ -z "$npu_ver" ] && npu_ver="Unknown"
++	fi
++
++	local npu_loaded="false"
++	local npu_device=""
++	local npu_driver_path="/sys/bus/platform/drivers/airoha-npu"
++
++	if [ -d "$npu_driver_path" ]; then
++		npu_device=$(ls -1 "$npu_driver_path" 2>/dev/null | grep '\.npu$' | head -1)
++		if [ -n "$npu_device" ]; then
++			npu_loaded="true"
++		fi
++	fi
++
++	local npu_clock=0
++	if [ -f "/sys/kernel/debug/clk/npu/clk_rate" ]; then
++		npu_clock=$(cat /sys/kernel/debug/clk/npu/clk_rate 2>/dev/null || echo 0)
++	fi
++
++	local npu_cores=$(grep -c "airoha-npu-wdt" /proc/interrupts 2>/dev/null || echo 0)
++
++	local offload_bound=$(cat /sys/kernel/debug/ppe/bind 2>/dev/null | grep -c "^[0-9a-fA-F]")
++	local offload_total=$(cat /sys/kernel/debug/ppe/entries 2>/dev/null | grep -c "^[0-9a-fA-F]")
++
++	local mem_info=$(dmesg | grep "reserved mem.*npu" | head -4)
++	local regions="[]"
++
++	if [ -n "$mem_info" ]; then
++		regions=$(echo "$mem_info" | awk '
++		BEGIN { printf "[" }
++		{
++			if (NR > 1) printf ","
++			match($0, /0x[0-9a-fA-F]+\.\.0x[0-9a-fA-F]+/)
++			range = substr($0, RSTART, RLENGTH)
++			split(range, a, "\\.\\.")
++			match($0, /\([0-9]+ [KMG]i?B\)/)
++			size = substr($0, RSTART+1, RLENGTH-2)
++			match($0, /non-reusable [^ ]+/)
++			name = substr($0, RSTART+13)
++			gsub(/@.*/, "", name)
++			printf "{\"name\":\"%s\",\"start\":\"%s\",\"end\":\"%s\",\"size\":\"%s\"}", name, a[1], a[2], size
++		}
++		END { printf "]" }
++		')
++	fi
++
++	# === CPU Frequency Status ===
++	local cpufreq_path="/sys/devices/system/cpu/cpufreq/policy0"
++	local cpu_cur_freq=0
++	local cpu_hw_freq=0
++	local cpu_governor="unknown"
++	local cpu_avail_governors=""
++	local cpu_min_freq=0
++	local cpu_max_freq=0
++	local cpu_avail_freqs=""
++
++	if [ -d "$cpufreq_path" ]; then
++		cpu_cur_freq=$(cat "$cpufreq_path/scaling_cur_freq" 2>/dev/null || echo 0)
++		cpu_hw_freq=$(cat "$cpufreq_path/cpuinfo_cur_freq" 2>/dev/null || echo 0)
++		cpu_governor=$(cat "$cpufreq_path/scaling_governor" 2>/dev/null || echo "unknown")
++		cpu_avail_governors=$(cat "$cpufreq_path/scaling_available_governors" 2>/dev/null || echo "")
++		cpu_min_freq=$(cat "$cpufreq_path/scaling_min_freq" 2>/dev/null || echo 0)
++		cpu_max_freq=$(cat "$cpufreq_path/scaling_max_freq" 2>/dev/null || echo 0)
++		cpu_avail_freqs=$(cat "$cpufreq_path/scaling_available_frequencies" 2>/dev/null || echo "")
++	fi
++
++	# Read actual PLL frequency from hardware (detects overclock)
++	local pll_freq=0
++	if command -v devmem > /dev/null 2>&1; then
++		local pcw_raw=$(devmem 0x1fa202b4 2>/dev/null)
++		local chg_raw=$(devmem 0x1fa202b8 2>/dev/null)
++		if [ -n "$pcw_raw" ] && [ -n "$chg_raw" ]; then
++			pcw_raw=$((pcw_raw))
++			chg_raw=$((chg_raw))
++			local pcw_int=$(( (pcw_raw >> 24) & 0x7F ))
++			local pll_posdiv=$(( (chg_raw >> 4) & 7 ))
++			if [ "$pll_posdiv" -eq 0 ]; then
++				pll_freq=$((pcw_int * 50))
++			else
++				pll_freq=$((pcw_int * 50 / (1 << pll_posdiv)))
++			fi
++		fi
++	fi
++
++	# Count online CPUs
++	local cpu_count=0
++	if [ -d "/sys/devices/system/cpu" ]; then
++		cpu_count=$(ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null | wc -l)
++	fi
++
++	printf '{"npu_version":"%s","npu_loaded":%s,"npu_device":"%s","npu_clock":%d,"npu_cores":%d,"offload_bound":%d,"offload_total":%d,"memory_regions":%s,"cpu_cur_freq":%d,"cpu_hw_freq":%d,"cpu_governor":"%s","cpu_avail_governors":"%s","cpu_min_freq":%d,"cpu_max_freq":%d,"cpu_avail_freqs":"%s","cpu_count":%d,"pll_freq_mhz":%d}' \
++		"${npu_ver:-Unknown}" "$npu_loaded" "${npu_device:-}" "${npu_clock:-0}" "${npu_cores:-0}" "${offload_bound:-0}" "${offload_total:-0}" "$regions" \
++		"${cpu_cur_freq:-0}" "${cpu_hw_freq:-0}" "${cpu_governor:-unknown}" "${cpu_avail_governors:-}" "${cpu_min_freq:-0}" "${cpu_max_freq:-0}" "${cpu_avail_freqs:-}" "${cpu_count:-0}" "${pll_freq:-0}"
++}
++
++get_ppe_entries() {
++	local bind_file="/sys/kernel/debug/ppe/bind"
++	local entries_file="/sys/kernel/debug/ppe/entries"
++
++	# Parse a PPE file into JSON entries array (awk function reused for both files)
++	parse_ppe() {
++		local file="$1" state_filter="$2" limit="$3"
++		awk -v state_filter="$state_filter" -v limit="$limit" '
++		BEGIN { total=0; shown=0; n4=0; n6=0 }
++		/^[0-9a-fA-F]+ / {
++			state = $2
++			if (state_filter != "" && state != state_filter) next
++			total++
++			if ($3 == "IPv4") n4++
++			if ($3 == "IPv6") n6++
++			if (shown >= limit) next
++			shown++
++			if ($3 == "IPv4" || $3 == "IPv6") { type=$3; subtype=$4 }
++			else if ($3 == "L2B" || $4 == "L2B") { type="L2B"; subtype="" }
++			else { type=$3; subtype=$4 }
++			orig=""; match($0,/orig=[^ ]+/); if(RSTART>0) orig=substr($0,RSTART+5,RLENGTH-5)
++			new_flow=""; match($0,/new=[^ ]+/); if(RSTART>0) new_flow=substr($0,RSTART+4,RLENGTH-4)
++			eth=""; match($0,/eth=[^ ]+/); if(RSTART>0) eth=substr($0,RSTART+4,RLENGTH-4)
++			entry[shown]=sprintf("{\"index\":\"%s\",\"state\":\"%s\",\"type\":\"%s\",\"proto\":\"%s\",\"orig\":\"%s\",\"new_flow\":\"%s\",\"eth\":\"%s\"}",$1,state,type,subtype,orig,new_flow,eth)
++		}
++		END {
++			printf "{\"total\":%d,\"ipv4\":%d,\"ipv6\":%d,\"entries\":[",total,n4,n6
++			for(i=1;i<=shown;i++){if(i>1)printf ","; printf "%s",entry[i]}
++			printf "]}"
++		}
++		' "$file" 2>/dev/null || echo '{"total":0,"ipv4":0,"ipv6":0,"entries":[]}'
++	}
++
++	local bnd_json unb_json
++
++	if [ -f "$bind_file" ]; then
++		local _bnd_parsed=$(parse_ppe "$bind_file" "" 25)
++
++		# The bind file may be a plain-text count ("946\n" or "946" no newline)
++		# OR a line-per-entry table. Try both and take the larger value.
++		# Only override parse_ppe's total when we have something bigger.
++		local _cnt_direct=$(tr -d '[:space:]' < "$bind_file" 2>/dev/null)
++		case "$_cnt_direct" in ''|*[!0-9]*) _cnt_direct=0 ;; esac
++		local _cnt_wc=$(wc -l < "$bind_file" 2>/dev/null | tr -d '[:space:]')
++		case "$_cnt_wc" in ''|*[!0-9]*) _cnt_wc=0 ;; esac
++		local _bnd_total=$(( _cnt_direct > _cnt_wc ? _cnt_direct : _cnt_wc ))
++
++		if [ "$_bnd_total" -gt 0 ] 2>/dev/null; then
++			bnd_json=$(printf '%s' "$_bnd_parsed" | sed 's/^{"total":[0-9]*/{"total":'"$_bnd_total"'/')
++		else
++			# Both external methods gave 0 — trust parse_ppe's own count
++			bnd_json="$_bnd_parsed"
++		fi
++	else
++		bnd_json='{"total":0,"ipv4":0,"ipv6":0,"entries":[]}'
++	fi
++
++	if [ -f "$entries_file" ]; then
++		unb_json=$(parse_ppe "$entries_file" "UNB" 25)
++	else
++		unb_json='{"total":0,"ipv4":0,"ipv6":0,"entries":[]}'
++	fi
++
++	# Per-band BND counts: collect client MACs per band, match against eth= in bind file
++	local macs0 macs1 macs2 mldif mldsdir mst mmac
++	macs0=$(iw dev 2>/dev/null | awk '/Interface phy[0-9]*\.0-/{print $2}' | while read -r iface; do
++		iw dev "$iface" station dump 2>/dev/null | awk '/^Station/{print $2}'
++	done)
++	macs1=$(iw dev 2>/dev/null | awk '/Interface phy[0-9]*\.1-/{print $2}' | while read -r iface; do
++		iw dev "$iface" station dump 2>/dev/null | awk '/^Station/{print $2}'
++	done)
++	macs2=$(iw dev 2>/dev/null | awk '/Interface phy[0-9]*\.2-/{print $2}' | while read -r iface; do
++		iw dev "$iface" station dump 2>/dev/null | awk '/^Station/{print $2}'
++	done)
++	# MLO: MLD clients live on ap-mld* (no phyX.N- name), so the scan above misses
++	# them and their offloaded flows never set band_bnd -> the frontend never leaves
++	# the exact byte-rate. Classify each MLD station into every band it has a
++	# link-N debugfs dir on.
++	for mldif in $(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type AP/{print i}'); do
++		case "$mldif" in *-mld*) ;; *) continue ;; esac
++		mldsdir="/sys/kernel/debug/ieee80211/phy0/netdev:${mldif}/stations"
++		[ -d "$mldsdir" ] || continue
++		for mst in "$mldsdir"/*/; do
++			[ -d "$mst" ] || continue
++			mmac=$(basename "$mst")
++			[ -d "${mst}link-0" ] && macs0="${macs0}
++${mmac}"
++			[ -d "${mst}link-1" ] && macs1="${macs1}
++${mmac}"
++			[ -d "${mst}link-2" ] && macs2="${macs2}
++${mmac}"
++		done
++	done
++	macs0=$(printf '%s\n' "$macs0" | grep -v '^[[:space:]]*$' | tr '\n' '|' | sed 's/|$//')
++	macs1=$(printf '%s\n' "$macs1" | grep -v '^[[:space:]]*$' | tr '\n' '|' | sed 's/|$//')
++	macs2=$(printf '%s\n' "$macs2" | grep -v '^[[:space:]]*$' | tr '\n' '|' | sed 's/|$//')
++
++	local band_bnd="[0,0,0]"
++	if [ -f "$bind_file" ]; then
++		band_bnd=$(awk -v m0="$macs0" -v m1="$macs1" -v m2="$macs2" '
++		function has(macs, eth,    n,arr,i,low) {
++			if (macs == "") return 0
++			low = tolower(eth)
++			n = split(macs, arr, "|")
++			for (i=1; i<=n; i++) if (arr[i] != "" && index(low, tolower(arr[i])) > 0) return 1
++			return 0
++		}
++		/^[0-9a-fA-F]+ BND / {
++			eth=""; match($0,/eth=[^ \t]+/); if (RSTART>0) eth=substr($0,RSTART+4,RLENGTH-4)
++			# an MLD client is listed on EVERY band it has a link on, so
++			# count its flows on each (else-if starved the higher bands)
++			if (has(m0,eth)) c0++
++			if (has(m1,eth)) c1++
++			if (has(m2,eth)) c2++
++		}
++		END { printf "[%d,%d,%d]", c0+0, c1+0, c2+0 }
++		' "$bind_file" 2>/dev/null || printf "[0,0,0]")
++	fi
++	bnd_json=$(printf '%s' "$bnd_json" | sed 's/}$/,"band_bnd":'"$band_bnd"'}/')
++
++	# Per-band UNB counts: IP-based matching (UNB flows lack eth= MAC info)
++	# Cross-reference WiFi client MACs with ARP neighbour table to get per-band IPs,
++	# then match UNB orig= source IP against those sets.
++	local neigh
++	neigh=$(ip neigh show 2>/dev/null | grep ' lladdr ')
++	local ips0 ips1 ips2
++	ips0=$(printf '%s\n' "$neigh" | awk -v macs="$macs0" '
++		BEGIN{n=split(macs,a,"|");for(i=1;i<=n;i++)if(a[i]!="")m[tolower(a[i])]=1}
++		m[tolower($5)]{printf "%s|",$1}' | sed 's/|$//')
++	ips1=$(printf '%s\n' "$neigh" | awk -v macs="$macs1" '
++		BEGIN{n=split(macs,a,"|");for(i=1;i<=n;i++)if(a[i]!="")m[tolower(a[i])]=1}
++		m[tolower($5)]{printf "%s|",$1}' | sed 's/|$//')
++	ips2=$(printf '%s\n' "$neigh" | awk -v macs="$macs2" '
++		BEGIN{n=split(macs,a,"|");for(i=1;i<=n;i++)if(a[i]!="")m[tolower(a[i])]=1}
++		m[tolower($5)]{printf "%s|",$1}' | sed 's/|$//')
++
++	local band_unb="[0,0,0]"
++	if [ -f "$entries_file" ]; then
++		band_unb=$(awk -v i0="$ips0" -v i1="$ips1" -v i2="$ips2" '
++		function has(ips, ip,    n,arr,i) {
++			if (ips == "") return 0
++			n = split(ips, arr, "|")
++			for (i=1; i<=n; i++) if (arr[i] == ip) return 1
++			return 0
++		}
++		/^[0-9a-fA-F]+ UNB / {
++			src=""
++			match($0,/orig=[^ \t]+/)
++			if (RSTART>0) {
++				orig=substr($0,RSTART+5,RLENGTH-5)
++				if (substr(orig,1,1) != "[") { n=split(orig,p,":"); src=p[1] }
++			}
++			if (src != "") {
++				if (has(i0,src)) c0++
++				if (has(i1,src)) c1++
++				if (has(i2,src)) c2++
++			}
++		}
++		END { printf "[%d,%d,%d]", c0+0, c1+0, c2+0 }
++		' "$entries_file" 2>/dev/null || printf "[0,0,0]")
++	fi
++	unb_json=$(printf '%s' "$unb_json" | sed 's/}$/,"band_unb":'"$band_unb"'}/')
++
++	# Per-port BND counts for LAN ports using bridge FDB learned MACs
++	local macs_p1 macs_p2 macs_p3 macs_p4
++	macs_p1=$(bridge fdb show dev lan1 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
++	macs_p2=$(bridge fdb show dev lan2 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
++	macs_p3=$(bridge fdb show dev lan3 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
++	macs_p4=$(bridge fdb show dev lan4 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
++
++	local port_bnd="[0,0,0,0]"
++	if [ -f "$bind_file" ]; then
++		port_bnd=$(awk -v m1="$macs_p1" -v m2="$macs_p2" -v m3="$macs_p3" -v m4="$macs_p4" '
++		function has(macs, eth,    n,arr,i,low) {
++			if (macs == "") return 0
++			low = tolower(eth)
++			n = split(macs, arr, "|")
++			for (i=1; i<=n; i++) if (arr[i] != "" && index(low, tolower(arr[i])) > 0) return 1
++			return 0
++		}
++		/^[0-9a-fA-F]+ BND / {
++			eth=""; match($0,/eth=[^ \t]+/); if (RSTART>0) eth=substr($0,RSTART+4,RLENGTH-4)
++			if      (has(m1,eth)) c1++
++			else if (has(m2,eth)) c2++
++			else if (has(m3,eth)) c3++
++			else if (has(m4,eth)) c4++
++		}
++		END { printf "[%d,%d,%d,%d]", c1+0, c2+0, c3+0, c4+0 }
++		' "$bind_file" 2>/dev/null || printf "[0,0,0,0]")
++	fi
++	bnd_json=$(printf '%s' "$bnd_json" | sed 's/}$/,"port_bnd":'"$port_bnd"'}/')
++
++	# Per-client BND counts: for each connected WiFi station, how many bound (offloaded)
++	# flows carry its MAC in eth=. Reuses the per-band station MAC lists (macs0/1/2) and
++	# the same eth= match as band_bnd/port_bnd. Counts per station independently (a
++	# client<->client flow can credit both ends; the common client<->WAN flow matches
++	# only the client MAC, so no double count in practice).
++	# Per-client BND counts + IP/hostname. Feeds awk three tagged streams: @NEIGH lines
++	# (ip neigh) -> mac->ipv4, @LEASE lines (/tmp/dhcp.leases) -> mac->hostname, then the
++	# raw bind table for the eth= match. Marker prefixes keep them apart (bind rows start
++	# with a hex index, never @NEIGH/@LEASE). Counts per station; IP/host are best-effort.
++	local client_bnd="[]"
++	if [ -f "$bind_file" ]; then
++		client_bnd=$(
++		{
++			printf '%s\n' "$neigh" | sed 's/^/@NEIGH /'
++			sed 's/^/@LEASE /' /tmp/dhcp.leases 2>/dev/null
++			cat "$bind_file"
++		} | awk -v m0="$macs0" -v m1="$macs1" -v m2="$macs2" '
++		BEGIN {
++			ntot=0
++			c=split(m0,a,"|"); for(i=1;i<=c;i++) if(a[i]!=""){ mac[++ntot]=tolower(a[i]); bnd_band[ntot]=0; cnt[ntot]=0 }
++			c=split(m1,a,"|"); for(i=1;i<=c;i++) if(a[i]!=""){ mac[++ntot]=tolower(a[i]); bnd_band[ntot]=1; cnt[ntot]=0 }
++			c=split(m2,a,"|"); for(i=1;i<=c;i++) if(a[i]!=""){ mac[++ntot]=tolower(a[i]); bnd_band[ntot]=2; cnt[ntot]=0 }
++		}
++		$1=="@NEIGH" { ipx=$2; mcx=tolower($6); if(index(ipx,":")==0 && index(ipx,".")>0 && mcx!="" && !(mcx in mac2ip)) mac2ip[mcx]=ipx; next }
++		$1=="@LEASE" { lm=tolower($3); lh=$5; gsub(/["\\]/,"",lh); if(lm!="" && lh!="" && lh!="*") mac2host[lm]=lh; next }
++		/^[0-9a-fA-F]+ BND / {
++			eth=""; match($0,/eth=[^ \t]+/); if(RSTART>0) eth=tolower(substr($0,RSTART+4,RLENGTH-4))
++			if(eth=="") next
++			for(i=1;i<=ntot;i++) if(index(eth,mac[i])>0) cnt[i]++
++		}
++		END {
++			printf "["
++			for(i=1;i<=ntot;i++){
++				ip = (mac[i] in mac2ip) ? mac2ip[mac[i]] : ""
++				host = (mac[i] in mac2host) ? mac2host[mac[i]] : ""
++				if(i>1)printf ","
++				printf "{\"mac\":\"%s\",\"ip\":\"%s\",\"host\":\"%s\",\"band\":%d,\"bnd\":%d}",mac[i],ip,host,bnd_band[i],cnt[i]
++			}
++			printf "]"
++		}
++		' 2>/dev/null || printf "[]")
++	fi
++	bnd_json=$(printf '%s' "$bnd_json" | sed 's/}$/,"client_bnd":'"$client_bnd"'}/')
++
++	printf '{"bnd":%s,"unb":%s}' "$bnd_json" "$unb_json"
++}
++
++get_token_info() {
++	# Per-band WiFi station stats (count, retries) from iw — works regardless of debugfs.
++	local sta_json="" band
++	for band in 0 1 2; do
++		local stats=$(
++			for iface in $(iw dev 2>/dev/null | awk '/Interface phy0\.'$band'-/{print $2}'); do
++				iw dev "$iface" station dump 2>/dev/null
++			done | awk '
++			BEGIN { n=0; tp=0; tr=0 }
++			/^Station/ { n++ }
++			/tx packets:/ { tp += $3 }
++			/tx retries:/ { tr += $3 }
++			END { printf "%d %d %d", n, tp, tr }'
++		)
++		set -- $stats
++		[ -n "$sta_json" ] && sta_json="${sta_json},"
++		sta_json="${sta_json}{\"band\":${band},\"count\":${1:-0},\"tx_packets\":${2:-0},\"tx_retries\":${3:-0}}"
++	done
++
++	# PLE/HIF pool from hw-queues — drops toward zero before mt7996 SER.
++	local hw_queues="/sys/kernel/debug/ieee80211/phy0/mt76/hw-queues"
++	local ple_free=0 hif_used=0 hif_reserved=0
++	if [ -f "$hw_queues" ]; then
++		local hex
++		hex=$(awk '/Total free page:/ {print $4; exit}' "$hw_queues" 2>/dev/null)
++		[ -n "$hex" ] && ple_free=$(printf "%d" "$hex" 2>/dev/null || echo 0)
++		hex=$(awk '/HIF free page:/ {print $6; exit}' "$hw_queues" 2>/dev/null)
++		[ -n "$hex" ] && hif_reserved=$(printf "%d" "$hex" 2>/dev/null || echo 0)
++		hex=$(awk '/HIF free page:/ {print $8; exit}' "$hw_queues" 2>/dev/null)
++		[ -n "$hex" ] && hif_used=$(printf "%d" "$hex" 2>/dev/null || echo 0)
++	fi
++
++	printf '{"ple_free":%d,"hif_used":%d,"hif_reserved":%d,"tx_queues":[],"station_counts":[%s]}' \
++		"$ple_free" "$hif_used" "$hif_reserved" "$sta_json"
++}
++
++
++
++
++get_frame_engine() {
++	if ! command -v devmem > /dev/null 2>&1; then
++		echo '{"error":"devmem not available"}'
++		return
++	fi
++
++	# PSE queue status (IQ=hi16, OQ=lo16) and drop counts for each port
++	local i reg_q reg_d pse_ports=""
++	for i in 0 1 2 3 4 5 6 7 8 9; do
++		reg_q=$(printf "0x%x" $((0x1fb50150 + i * 4)))
++		reg_d=$(printf "0x%x" $((0x1fb50120 + i * 4)))
++		local qval=$(($(devmem $reg_q)))
++		local dval=$(($(devmem $reg_d)))
++		local iq=$(( (qval >> 16) & 0xFFFF ))
++		local oq=$(( qval & 0xFFFF ))
++		[ -n "$pse_ports" ] && pse_ports="${pse_ports},"
++		pse_ports="${pse_ports}{\"port\":${i},\"iq\":${iq},\"oq\":${oq},\"drops\":${dval}}"
++	done
++
++	# PSE shared buffer
++	local psb=$(($(devmem 0x1fb50104)))
++	local pse_used=$(( (psb >> 16) & 0xFFFF ))
++	local pse_free=$(( psb & 0x7FFF ))
++
++	# GDM counters (TX_OK, TX_DROP, RX_OK, RX_FC_DROP, RX_OVER_DROP)
++	# Read as hex to handle large 32-bit counters
++	local gdm1_tx=$(($(devmem 0x1fb50604)))
++	local gdm1_txd=$(($(devmem 0x1fb50608)))
++	local gdm1_rx=$(($(devmem 0x1fb50648)))
++	local gdm1_rxd=$(($(devmem 0x1fb5064c)))
++
++	local gdm2_tx=$(($(devmem 0x1fb51604)))
++	local gdm2_txd=$(($(devmem 0x1fb51608)))
++	local gdm2_rx=$(($(devmem 0x1fb51648)))
++	local gdm2_rxd=$(($(devmem 0x1fb5164c)))
++
++	local gdm4_tx=$(($(devmem 0x1fb52604)))
++	local gdm4_txd=$(($(devmem 0x1fb52608)))
++	local gdm4_rx=$(($(devmem 0x1fb52648)))
++	local gdm4_rxd=$(($(devmem 0x1fb5264c)))
++
++	# CDM counters (TX_OK, RXCPU_OK, RXHWF_OK, RXCPU_DROP, RXHWF_DROP)
++	local cdm1_tx=$(($(devmem 0x1fb50580)))
++	local cdm1_rxcpu=$(($(devmem 0x1fb50590)))
++	local cdm1_rxhwf=$(($(devmem 0x1fb50594)))
++	local cdm1_rxcpud=$(($(devmem 0x1fb505a0)))
++	local cdm1_rxhwfd=$(($(devmem 0x1fb505a4)))
++
++	local cdm2_tx=$(($(devmem 0x1fb51580)))
++	local cdm2_rxcpu=$(($(devmem 0x1fb51590)))
++	local cdm2_rxhwf=$(($(devmem 0x1fb51594)))
++	local cdm2_rxcpud=$(($(devmem 0x1fb515a0)))
++	local cdm2_rxhwfd=$(($(devmem 0x1fb515a4)))
++
++	printf '{"pse_ports":[%s],"pse_used":%d,"pse_free":%d,' "$pse_ports" "$pse_used" "$pse_free"
++	printf '"gdm1":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm1_tx" "$gdm1_txd" "$gdm1_rx" "$gdm1_rxd"
++	printf '"gdm2":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm2_tx" "$gdm2_txd" "$gdm2_rx" "$gdm2_rxd"
++	printf '"gdm4":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm4_tx" "$gdm4_txd" "$gdm4_rx" "$gdm4_rxd"
++	printf '"cdm1":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d},' "$cdm1_tx" "$cdm1_rxcpu" "$cdm1_rxhwf" "$cdm1_rxcpud" "$cdm1_rxhwfd"
++	printf '"cdm2":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}}' "$cdm2_tx" "$cdm2_rxcpu" "$cdm2_rxhwf" "$cdm2_rxcpud" "$cdm2_rxhwfd"
++}
++
++get_tx_stats() {
++	local stats_file="/sys/kernel/debug/ieee80211/phy0/mt76/tx_stats"
++
++	if [ ! -f "$stats_file" ]; then
++		echo '{"bands":[]}'
++		return
++	fi
++
++	awk '
++	BEGIN {
++		band = -1
++		printf "{\"bands\":["
++		first = 1
++	}
++	/Phy band [0-9]/ {
++		if (band >= 0) {
++			if (!first) printf ","
++			first = 0
++			drops = attempts - success
++			if (drops < 0) drops = 0
++			printf "{\"band\":%d,\"attempts\":%d,\"success\":%d,\"drops\":%d,\"per\":%d,\"ba_miss\":%d}", \
++				band, attempts, success, drops, per, ba_miss
++		}
++		gsub(/.*band /, ""); band = $1 + 0
++		attempts = 0; success = 0; per = 0; ba_miss = 0
++	}
++	/BA miss count:/ { ba_miss = $NF + 0 }
++	/Tx attempts:/ { attempts = $3 + 0 }
++	/Tx success:/ { success = $3 + 0 }
++	/Tx PER:/ { p = $NF; gsub(/%/, "", p); per = p + 0 }
++	END {
++		if (band >= 0) {
++			if (!first) printf ","
++			drops = attempts - success
++			if (drops < 0) drops = 0
++			printf "{\"band\":%d,\"attempts\":%d,\"success\":%d,\"drops\":%d,\"per\":%d,\"ba_miss\":%d}", \
++				band, attempts, success, drops, per, ba_miss
++		}
++		printf "]}"
++	}
++	' "$stats_file" 2>/dev/null || echo '{"bands":[]}'
++}
++
++get_vlan_offload() {
++	local val
++	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null)
++	printf '{"enabled":%d}' "${val:-0}"
++}
++
++set_vlan_offload() {
++	local enabled
++	enabled=$(echo "$1" | jsonfilter -e "@.enabled" 2>/dev/null)
++
++	# jsonfilter returns empty string for integer 0; treat empty as 0
++	[ -z "$enabled" ] && enabled="0"
++
++	if [ "$enabled" != "0" ] && [ "$enabled" != "1" ]; then
++		echo '{"error":"enabled must be 0 or 1"}'
++		return
++	fi
++
++	if ! echo "$enabled" > /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null; then
++		echo '{"error":"failed - bridge module may not be loaded"}'
++		return
++	fi
++
++	# Persist across reboots
++	echo "net.bridge.bridge-nf-filter-vlan-tagged=$enabled" > /etc/sysctl.d/14-vlan-offload.conf
++	chmod 644 /etc/sysctl.d/14-vlan-offload.conf
++	printf '{"result":"ok","enabled":%d}' "$enabled"
++}
++
++get_flow_offload() {
++	local fo foh
++	fo=$(uci get firewall.@defaults[0].flow_offloading 2>/dev/null)
++	foh=$(uci get firewall.@defaults[0].flow_offloading_hw 2>/dev/null)
++	if [ "$fo" = "1" ] && [ "$foh" = "1" ]; then
++		printf '{"enabled":1}'
++	else
++		printf '{"enabled":0}'
++	fi
++}
++
++set_flow_offload() {
++	local enabled
++	enabled=$(echo "$1" | jsonfilter -e "@.enabled" 2>/dev/null)
++
++	[ -z "$enabled" ] && enabled="0"
++
++	if [ "$enabled" != "0" ] && [ "$enabled" != "1" ]; then
++		echo '{"error":"enabled must be 0 or 1"}'
++		return
++	fi
++
++	if [ "$enabled" = "1" ]; then
++		uci set firewall.@defaults[0].flow_offloading='1'
++		uci set firewall.@defaults[0].flow_offloading_hw='1'
++	else
++		uci delete firewall.@defaults[0].flow_offloading 2>/dev/null
++		uci delete firewall.@defaults[0].flow_offloading_hw 2>/dev/null
++	fi
++	uci commit firewall
++	/etc/init.d/firewall reload >/dev/null 2>&1 &
++	printf '{"result":"ok","enabled":%d}' "$enabled"
++}
++
++get_pppoe_offload() {
++	local val
++	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null)
++	printf '{"enabled":%d}' "${val:-0}"
++}
++
++set_pppoe_offload() {
++	local enabled
++	enabled=$(echo "$1" | jsonfilter -e "@.enabled" 2>/dev/null)
++
++	[ -z "$enabled" ] && enabled="0"
++
++	if [ "$enabled" != "0" ] && [ "$enabled" != "1" ]; then
++		echo '{"error":"enabled must be 0 or 1"}'
++		return
++	fi
++
++	if ! echo "$enabled" > /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null; then
++		echo '{"error":"failed - bridge module may not be loaded"}'
++		return
++	fi
++
++	# Persist across reboots
++	echo "net.bridge.bridge-nf-filter-pppoe-tagged=$enabled" > /etc/sysctl.d/15-pppoe-offload.conf
++	chmod 644 /etc/sysctl.d/15-pppoe-offload.conf
++	printf '{"result":"ok","enabled":%d}' "$enabled"
++}
++
++get_device_mode() {
++	local mode="router"
++	local reason=""
++
++	# Primary check: has the user explicitly configured this as a dumb AP?
++	local dhcp_ignore
++	dhcp_ignore=$(uci get dhcp.lan.ignore 2>/dev/null)
++	if [ "$dhcp_ignore" = "1" ]; then
++		mode="ap"
++		reason="dhcp_disabled"
++	fi
++
++	# Secondary check: is the WAN interface up with a real IP?
++	if [ "$mode" = "router" ]; then
++		local wan_up wan_ip
++		wan_up=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@.up" 2>/dev/null)
++		wan_ip=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@['ipv4-address'][0].address" 2>/dev/null)
++		if [ "$wan_up" != "true" ] || [ -z "$wan_ip" ]; then
++			mode="ap"
++			reason="no_wan"
++		fi
++	fi
++
++	# Fallback: check if default route points to a local gateway (upstream router)
++	if [ "$mode" = "router" ]; then
++		local gw
++		gw=$(ip route show default 2>/dev/null | awk '/default via/{print $3; exit}')
++		if [ -n "$gw" ]; then
++			# If gateway is in 192.168.x.x or 10.x.x.x range, we're behind another router
++			case "$gw" in
++				192.168.*.*|10.*.*.*)
++					# Only treat as AP if we have no public WAN IP
++					local wan_ip2
++					wan_ip2=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@['ipv4-address'][0].address" 2>/dev/null)
++					if [ -z "$wan_ip2" ]; then
++						mode="ap"
++						reason="local_gateway"
++					fi
++					;;
++			esac
++		fi
++	fi
++
++	printf '{"mode":"%s","reason":"%s"}' "$mode" "$reason"
++}
++
++
++get_wan_health() {
++	# Get WAN interface logical status
++	local wan_status
++	wan_status=$(ubus call network.interface.wan status 2>/dev/null)
++
++	if [ -z "$wan_status" ]; then
++		echo '{"available":false}'
++		return
++	fi
++
++	local up l3_device uptime
++	up=$(echo "$wan_status" | jsonfilter -e "@.up" 2>/dev/null)
++	l3_device=$(echo "$wan_status" | jsonfilter -e "@.l3_device" 2>/dev/null)
++	uptime=$(echo "$wan_status" | jsonfilter -e "@.uptime" 2>/dev/null)
++
++	# Get device-level statistics via ip -s link
++	local rx_bytes=0 tx_bytes=0 rx_errors=0 tx_errors=0 rx_dropped=0 tx_dropped=0 collisions=0
++	if [ -n "$l3_device" ]; then
++		local stats
++		stats=$(ip -s link show "$l3_device" 2>/dev/null)
++		if [ -n "$stats" ]; then
++			# ip -s link output: RX line followed by bytes/packets/errors/dropped/...
++			# TX line followed by same
++			rx_bytes=$(echo "$stats" | awk '/^    [0-9]/{if(rx==1){print $1+0; rx=0}} /RX:/{rx=1}')
++			tx_bytes=$(echo "$stats" | awk '/^    [0-9]/{if(tx==1){print $1+0; tx=0}} /TX:/{tx=1}')
++			rx_errors=$(echo "$stats" | awk '/RX:/{getline; print $3+0}')
++			tx_errors=$(echo "$stats" | awk '/TX:/{getline; print $3+0}')
++			rx_dropped=$(echo "$stats" | awk '/RX:/{getline; print $4+0}')
++			tx_dropped=$(echo "$stats" | awk '/TX:/{getline; print $4+0}')
++		fi
++	fi
++
++	printf '{"available":true,"up":%s,"device":"%s","uptime":%d,"rx_bytes":%d,"tx_bytes":%d,"rx_errors":%d,"tx_errors":%d,"rx_dropped":%d,"tx_dropped":%d}' \
++		"${up:-false}" "${l3_device:-}" "${uptime:-0}" \
++		"${rx_bytes:-0}" "${tx_bytes:-0}" \
++		"${rx_errors:-0}" "${tx_errors:-0}" \
++		"${rx_dropped:-0}" "${tx_dropped:-0}"
++}
++
++get_jitter_result() {
++	local result_file="/tmp/npu-jitter.json"
++	if [ -f "$result_file" ]; then
++		cat "$result_file"
++	else
++		echo '{"jitter":0,"last_ping":0,"samples":0,"target":"1.1.1.1","reachable":false,"available":false}'
++	fi
++}
++
++get_wifi_stats() {
++	# Collect per-band station stats from all AP interfaces using iw.
++	# MT7996 appears as a single phy0 with sub-interfaces (phy0.0-ap0,
++	# phy0.1-ap0, phy0.2-ap0), so we loop over interfaces and detect
++	# each one's actual operating frequency to classify its band.
++
++	if ! command -v iw > /dev/null 2>&1; then
++		echo '{"available":false,"bands":[]}'
++		return
++	fi
++
++	# Find all AP interfaces
++	local all_ifaces
++	all_ifaces=$(iw dev 2>/dev/null | awk '/Interface/{iface=$2} /type AP/{print iface}')
++
++	[ -z "$all_ifaces" ] && { printf '{"available":true,"bands":[]}'; return; }
++
++	# Accumulate station dumps and interface names per band index (0=2.4G, 1=5G, 2=6G)
++	local dump0="" dump1="" dump2=""
++	local ifaces0="" ifaces1="" ifaces2=""
++	# Per-band uplink rx_fragments (MLO: summed across each band's link-N dirs).
++	local rxfrag0=0 rxfrag1=0 rxfrag2=0
++	local is_mld=0   # set when an MLO (*-mld*) AP interface is present
++
++	for iface in $all_ifaces; do
++		# MLO/MLD interface (e.g. ap-mld0): an MLD spans all bands under a
++		# single netdev, so the phyX.N-apY name trick and the single-channel
++		# frequency fallback don't apply. Classify each station by its
++		# per-link debugfs instead (link-0/1/2 = 2.4/5/6 GHz on MT7996).
++		case "$iface" in
++		*-mld*)
++			is_mld=1
++			local mdbg="/sys/kernel/debug/ieee80211/phy0/netdev:${iface}/stations"
++			local mfull b s bmacs bd frag
++			mfull=$(iw dev "$iface" station dump 2>/dev/null)
++			for b in 0 1 2; do
++				case "$b" in
++					0) ifaces0="${ifaces0} ${iface}" ;;
++					1) ifaces1="${ifaces1} ${iface}" ;;
++					2) ifaces2="${ifaces2} ${iface}" ;;
++				esac
++				bmacs=""; frag=0
++				[ -d "$mdbg" ] && for s in "$mdbg"/*/; do
++					if [ -d "${s}link-${b}" ]; then
++						bmacs="${bmacs} $(basename "$s")"
++						frag=$((frag + $(cat "${s}link-${b}/rx_fragments" 2>/dev/null || echo 0)))
++					fi
++				done
++				case "$b" in 0) rxfrag0=$frag ;; 1) rxfrag1=$frag ;; 2) rxfrag2=$frag ;; esac
++				[ -z "$bmacs" ] && continue
++				# Keep the MLD station visible on every linked band for
++				# counts/signal/rate, but STRIP its byte counters: iw shows one
++				# MLD-aggregate value which would double-count into every band.
++				# Per-band throughput for MLD traffic comes from the hw_
++				# fields (MIB + fw stats) computed below instead.
++				bd=$(printf '%s\n' "$mfull" | awk -v macs="$bmacs" '
++					BEGIN { n = split(macs, a, " "); for (i = 1; i <= n; i++) want[tolower(a[i])] = 1 }
++					/^Station/ { keep = (tolower($2) in want) }
++					keep && /(tx|rx) bytes:/ { next }
++					keep && /(tx|rx) duration:/ { next }
++					keep { print }')
++				case "$b" in
++					0) dump0="${dump0}
++${bd}" ;;
++					1) dump1="${dump1}
++${bd}" ;;
++					2) dump2="${dump2}
++${bd}" ;;
++				esac
++			done
++			continue
++			;;
++		esac
++
++		# Determine band index.
++		# Primary: parse interface name (phyX.N-apY → N is band index:
++		#   0=2.4 GHz, 1=5 GHz, 2=6 GHz on MT7996).
++		# Fallback: read operating frequency from iw dev info.
++		local band_idx
++		band_idx=$(printf '%s' "$iface" | sed -n 's/^[^.]*\.\([0-9][0-9]*\)-.*/\1/p')
++
++		if [ -z "$band_idx" ]; then
++			local freq
++			freq=$(iw dev "$iface" info 2>/dev/null | grep 'channel' | \
++				grep -oE '[0-9]+' | awk '$0+0>1000{print $0+0; exit}')
++			if [ -z "$freq" ] || [ "$freq" -le 0 ] 2>/dev/null; then
++				continue
++			elif [ "$freq" -ge 5925 ]; then
++				band_idx=2
++			elif [ "$freq" -ge 5000 ]; then
++				band_idx=1
++			else
++				band_idx=0
++			fi
++		fi
++
++		# Always register interface for tx_bytes tracking (independent of client state)
++		case "$band_idx" in
++			0) ifaces0="${ifaces0} ${iface}" ;;
++			1) ifaces1="${ifaces1} ${iface}" ;;
++			2) ifaces2="${ifaces2} ${iface}" ;;
++		esac
++
++		# Standard (non-MLO) per-band uplink rx_fragments. Each band is its own
++		# AP netdev and the station's rx_fragments sits DIRECTLY under
++		# stations/<MAC>/ (no link-N subdir, unlike the MLD case above). Sum this
++		# iface's clients into the band total so the gauge's uplink half lights up
++		# on a standard 3-radio setup too. Additive — MLO path unaffected.
++		local sdbg="/sys/kernel/debug/ieee80211/phy0/netdev:${iface}/stations"
++		local ss sfrag=0
++		[ -d "$sdbg" ] && for ss in "$sdbg"/*/; do
++			[ -f "${ss}rx_fragments" ] && sfrag=$((sfrag + $(cat "${ss}rx_fragments" 2>/dev/null || echo 0)))
++		done
++		case "$band_idx" in
++			0) rxfrag0=$((rxfrag0 + sfrag)) ;;
++			1) rxfrag1=$((rxfrag1 + sfrag)) ;;
++			2) rxfrag2=$((rxfrag2 + sfrag)) ;;
++		esac
++
++		# Station dump for client stats — skip band if no clients
++		local d
++		d=$(iw dev "$iface" station dump 2>/dev/null)
++		[ -z "$d" ] && continue
++
++		case "$band_idx" in
++			0) dump0="${dump0}
++${d}" ;;
++			1) dump1="${dump1}
++${d}" ;;
++			2) dump2="${dump2}
++${d}" ;;
++		esac
++	done
++
++	# Compute per-band TX throughput from mac80211 per-station tx bytes.
++	# The sysfs netdev tx_bytes counter is bypassed by MT7996 HW DMA.
++	# iw station dump 'tx bytes:' comes from mac80211 per-sta counters
++	# which are updated before frames enter the hardware TX queue.
++	local now; now=$(date +%s 2>/dev/null || awk '{printf "%d",$1}' /proc/uptime)
++
++	# Per-band tx+rx byte totals (mac80211 per-sta counters via iw). expected
++	# throughput reads 0 on MT7996 fw, so the gauge needle is driven from these
++	# real byte deltas instead. Both directions so uploads light the gauge too.
++	local sta_tx0 sta_tx1 sta_tx2 sta_rx0 sta_rx1 sta_rx2
++	sta_tx0=$(printf '%s\n' "$dump0" | awk '/tx bytes:/{t+=$NF} END{printf "%d",t+0}')
++	sta_tx1=$(printf '%s\n' "$dump1" | awk '/tx bytes:/{t+=$NF} END{printf "%d",t+0}')
++	sta_tx2=$(printf '%s\n' "$dump2" | awk '/tx bytes:/{t+=$NF} END{printf "%d",t+0}')
++	sta_rx0=$(printf '%s\n' "$dump0" | awk '/rx bytes:/{t+=$NF} END{printf "%d",t+0}')
++	sta_rx1=$(printf '%s\n' "$dump1" | awk '/rx bytes:/{t+=$NF} END{printf "%d",t+0}')
++	sta_rx2=$(printf '%s\n' "$dump2" | awk '/rx bytes:/{t+=$NF} END{printf "%d",t+0}')
++
++	# awk reads OLD prev_file and computes Mbps deltas before we overwrite it.
++	# prev format: now tx0 tx1 tx2 rx0 rx1 rx2  (7 fields; older 4-field files
++	# just skip the rx delta for one poll)
++	local _rates
++	_rates=$(awk -v now="$now" \
++		-v t0="$sta_tx0" -v t1="$sta_tx1" -v t2="$sta_tx2" \
++		-v r0="$sta_rx0" -v r1="$sta_rx1" -v r2="$sta_rx2" \
++		'BEGIN {
++			pf = "/tmp/npu-wifi-bytes.prev"
++			tx0="0.0"; tx1="0.0"; tx2="0.0"; rx0="0.0"; rx1="0.0"; rx2="0.0"
++			if ((getline line < pf) > 0) {
++				n = split(line, a)
++				pt = a[1]+0; dt = now - pt
++				if (pt > 0 && now > pt) {
++					d=t0-a[2]; if(d<0)d=0; tx0=sprintf("%.1f", d/dt/125000)
++					d=t1-a[3]; if(d<0)d=0; tx1=sprintf("%.1f", d/dt/125000)
++					d=t2-a[4]; if(d<0)d=0; tx2=sprintf("%.1f", d/dt/125000)
++					if (n >= 7) {
++						d=r0-a[5]; if(d<0)d=0; rx0=sprintf("%.1f", d/dt/125000)
++						d=r1-a[6]; if(d<0)d=0; rx1=sprintf("%.1f", d/dt/125000)
++						d=r2-a[7]; if(d<0)d=0; rx2=sprintf("%.1f", d/dt/125000)
++					}
++				}
++			}
++			printf "%s %s %s %s %s %s\n", tx0, tx1, tx2, rx0, rx1, rx2
++		}' /dev/null)
++	echo "$now $sta_tx0 $sta_tx1 $sta_tx2 $sta_rx0 $sta_rx1 $sta_rx2" > /tmp/npu-wifi-bytes.prev
++	local tx0_mbps tx1_mbps tx2_mbps rx0_mbps rx1_mbps rx2_mbps
++	tx0_mbps=$(echo "$_rates" | awk '{print $1}')
++	tx1_mbps=$(echo "$_rates" | awk '{print $2}')
++	tx2_mbps=$(echo "$_rates" | awk '{print $3}')
++	rx0_mbps=$(echo "$_rates" | awk '{print $4}')
++	rx1_mbps=$(echo "$_rates" | awk '{print $5}')
++	rx2_mbps=$(echo "$_rates" | awk '{print $6}')
++
++	# HW (offload-surviving) per-band byte rates — exact where available:
++	#  - hwrx (uplink): per-band MAC MIB rx_ampdu_bytes (mt76 band_bytes debugfs,
++	#    driver patch 041). Counts at the MAC: sees NPU/WED-offloaded traffic AND
++	#    every link of an MLD station. u32 accumulators -> modular delta.
++	#  - hwtx (downlink): sum of per-station fw ADM tx_bytes ('stats' debugfs,
++	#    driver patches 038/039). Exact for normal stations and an MLD's setup
++	#    link; the fw does not account an MLD's secondary-link DL (air_mbps
++	#    remains the fallback for that case). Legacy clients on an MLD SSID have
++	#    no per-band path and are skipped here (covered by iw exact + air est).
++	local hwrx0=0 hwrx1=0 hwrx2=0 hwtx0=0 hwtx1=0 hwtx2=0
++	local BB=/sys/kernel/debug/ieee80211/phy0/mt76/band_bytes
++	if [ -r "$BB" ]; then
++		local mib_cur stx0=0 stx1=0 stx2=0 sf sv sb
++		mib_cur=$(awk '/Phy band/{b=$3} /rx_ampdu_bytes:/{v[b]=$2} END{printf "%.0f %.0f %.0f", v[0]+0, v[1]+0, v[2]+0}' "$BB" 2>/dev/null)
++		for sf in /sys/kernel/debug/ieee80211/phy0/netdev:*/stations/*/stats \
++			  /sys/kernel/debug/ieee80211/phy0/netdev:*/stations/*/link-*/stats; do
++			[ -r "$sf" ] || continue
++			case "$sf" in
++				*/link-0/stats) sb=0 ;;
++				*/link-1/stats) sb=1 ;;
++				*/link-2/stats) sb=2 ;;
++				*netdev:phy0.0-*) sb=0 ;;
++				*netdev:phy0.1-*) sb=1 ;;
++				*netdev:phy0.2-*) sb=2 ;;
++				*) continue ;;
++			esac
++			sv=$(awk '/^tx_bytes:/{print $2}' "$sf" 2>/dev/null)
++			case "$sb" in
++				0) stx0=$((stx0 + ${sv:-0})) ;;
++				1) stx1=$((stx1 + ${sv:-0})) ;;
++				2) stx2=$((stx2 + ${sv:-0})) ;;
++			esac
++		done
++		local _hw
++		_hw=$(awk -v now="$now" -v m="$mib_cur" -v t0="$stx0" -v t1="$stx1" -v t2="$stx2" '
++			BEGIN {
++				pf = "/tmp/npu-wifi-hwbytes.prev"
++				r0="0.0"; r1="0.0"; r2="0.0"; x0="0.0"; x1="0.0"; x2="0.0"
++				split(m, c)
++				have = ((getline line < pf) > 0)
++				close(pf)
++				if (have) {
++					n = split(line, a); pt = a[1]+0; dt = now - pt
++					if (pt > 0 && now <= pt) {
++						# same-second duplicate/concurrent call: replay the
++						# stored rates WITHOUT moving the baseline, so a
++						# double-polling frontend does not read 0 and reset
++						# the delta window every tick.
++						if (n >= 13) { r0=a[8]; r1=a[9]; r2=a[10]; x0=a[11]; x1=a[12]; x2=a[13] }
++						printf "%s %s %s %s %s %s\n", r0, r1, r2, x0, x1, x2
++						exit
++					}
++					if (pt > 0 && now > pt) {
++						for (b = 0; b < 3; b++) {
++							d = c[b+1] - a[2+b]
++							if (d < 0) d += 4294967296       # u32 wrap
++							if (d < 0 || d > 2147483648) d = 0   # sanity
++							mb[b] = d * 8 / dt / 1000000
++						}
++						r0=sprintf("%.1f",mb[0]); r1=sprintf("%.1f",mb[1]); r2=sprintf("%.1f",mb[2])
++						d=t0-a[5]; if(d<0)d=0; x0=sprintf("%.1f", d*8/dt/1000000)
++						d=t1-a[6]; if(d<0)d=0; x1=sprintf("%.1f", d*8/dt/1000000)
++						d=t2-a[7]; if(d<0)d=0; x2=sprintf("%.1f", d*8/dt/1000000)
++					}
++				}
++				printf "%d %.0f %.0f %.0f %.0f %.0f %.0f %s %s %s %s %s %s\n", now, c[1]+0, c[2]+0, c[3]+0, t0, t1, t2, r0, r1, r2, x0, x1, x2 > pf
++				printf "%s %s %s %s %s %s\n", r0, r1, r2, x0, x1, x2
++			}' /dev/null)
++		hwrx0=$(echo "$_hw"|awk '{print $1}'); hwrx1=$(echo "$_hw"|awk '{print $2}'); hwrx2=$(echo "$_hw"|awk '{print $3}')
++		hwtx0=$(echo "$_hw"|awk '{print $4}'); hwtx1=$(echo "$_hw"|awk '{print $5}'); hwtx2=$(echo "$_hw"|awk '{print $6}')
++	fi
++
++	# Per-band Tx PER (packet error rate) from mt76 debugfs — the consistent
++	# per-MPDU hardware error metric. Surfaced below as retry_pct because the
++	# station-dump ratio (per-MPDU tx_retries vs per-MSDU tx_packets) over-reads
++	# 2-5x on EHT/6 GHz and isn't a real health signal.
++	local band_per_0=0 band_per_1=0 band_per_2=0
++	local band_txok_0=0 band_txok_1=0 band_txok_2=0
++	eval "$(awk '
++		/Phy band [0-9]/ { b = $NF + 0 }
++		/Tx PER:/ { v = $3; gsub(/%/, "", v); if (b >= 0 && b <= 2) printf "band_per_%d=%d;", b, v + 0 }
++		/Tx success:/ { if (b >= 0 && b <= 2) printf "band_txok_%d=%.0f;", b, $3 + 0 }
++	' /sys/kernel/debug/ieee80211/phy0/mt76/tx_stats 2>/dev/null)"
++
++	# Per-band total frame rate (frames/s): downlink Tx-success MPDUs (mt76 tx_stats,
++	# per Phy band, survives NPU offload) + uplink rx_fragments (per link). Drives the
++	# MLO per-band frames arc + BND glow (offload hides bytes, not frames).
++	local fcur0=$((band_txok_0 + rxfrag0)) fcur1=$((band_txok_1 + rxfrag1)) fcur2=$((band_txok_2 + rxfrag2))
++	local _fps frames0 frames1 frames2
++	_fps=$(awk -v now="$now" -v c0="$fcur0" -v c1="$fcur1" -v c2="$fcur2" '
++		BEGIN {
++			pf = "/tmp/npu-wifi-frames.prev"
++			f0="0"; f1="0"; f2="0"
++			if ((getline line < pf) > 0) {
++				n = split(line, a); pt = a[1]+0; dt = now - pt
++				if (pt > 0 && now > pt) {
++					d=c0-a[2]; if(d<0)d=0; f0=sprintf("%d", d/dt)
++					d=c1-a[3]; if(d<0)d=0; f1=sprintf("%d", d/dt)
++					d=c2-a[4]; if(d<0)d=0; f2=sprintf("%d", d/dt)
++				}
++			}
++			printf "%s %s %s\n", f0, f1, f2
++		}' /dev/null)
++	echo "$now $fcur0 $fcur1 $fcur2" > /tmp/npu-wifi-frames.prev
++	frames0=$(echo "$_fps" | awk '{print $1}')
++	frames1=$(echo "$_fps" | awk '{print $2}')
++	frames2=$(echo "$_fps" | awk '{print $3}')
++
++	# Per-band OFFLOADED throughput estimate from radio AIRTIME. Airtime survives NPU
++	# offload (the MAC spends airtime on every frame regardless of who bridges it),
++	# unlike the byte counters the NPU bypasses. Per band bytes ~= duration*bitrate,
++	# deltaed over the poll interval, * efficiency to approximate goodput (retries +
++	# PHY/MAC overhead). tx/rx duration + bitrate come from the station dumps already
++	# collected above (no extra iw calls). Frontend uses this when a band is offloaded
++	# (BND>0), the exact mac80211 byte-rate otherwise.
++	#
++	# EFFICIENCY IS AUTO-CALIBRATED per band: whenever a band carries real traffic but
++	# is NOT offloaded (BND==0), the exact byte-rate IS the true throughput, so
++	# exact/raw-airtime = the live efficiency for that band's RF/rate/retry conditions.
++	# EMA-learn it and apply it when the band offloads. `npu-monitor.settings.air_eff`
++	# (default 80) is the SEED/fallback until a band has a calibration sample.
++	local AIR_EFF; AIR_EFF=$(uci -q get npu-monitor.settings.air_eff 2>/dev/null)
++	case "$AIR_EFF" in ''|*[!0-9]*) AIR_EFF=80 ;; esac
++	{ [ "$AIR_EFF" -ge 1 ] && [ "$AIR_EFF" -le 200 ]; } 2>/dev/null || AIR_EFF=80
++	local a0 a1 a2
++	_airsum() { printf '%s\n' "$1" | awk '
++		/tx duration:/{td+=$3+0} /rx duration:/{rd+=$3+0}
++		/tx bitrate:/{tr+=$3+0;trn++} /rx bitrate:/{rr+=$3+0;rrn++}
++		END{printf "%.0f %.0f %.1f %.1f", td+0, rd+0, (trn?tr/trn:0), (rrn?rr/rrn:0)}'; }
++	a0=$(_airsum "$dump0"); a1=$(_airsum "$dump1"); a2=$(_airsum "$dump2")
++	# Per-band BND count (gates auto-calibration to non-offloaded bands). Reuse client
++	# MACs from the dumps + the bind table (same match as getPpeEntries).
++	local bn0=0 bn1=0 bn2=0
++	if [ -f /sys/kernel/debug/ppe/bind ]; then
++		local pm0 pm1 pm2 _bn
++		pm0=$(printf '%s\n' "$dump0" | awk '/^Station/{print $2}' | tr '\n' '|' | sed 's/|$//')
++		pm1=$(printf '%s\n' "$dump1" | awk '/^Station/{print $2}' | tr '\n' '|' | sed 's/|$//')
++		pm2=$(printf '%s\n' "$dump2" | awk '/^Station/{print $2}' | tr '\n' '|' | sed 's/|$//')
++		_bn=$(awk -v m0="$pm0" -v m1="$pm1" -v m2="$pm2" '
++			function has(macs, eth,   n,arr,i,low){ if(macs=="")return 0; low=tolower(eth); n=split(macs,arr,"|"); for(i=1;i<=n;i++) if(arr[i]!=""&&index(low,tolower(arr[i]))>0)return 1; return 0 }
++			/^[0-9a-fA-F]+ BND /{ eth=""; match($0,/eth=[^ \t]+/); if(RSTART>0)eth=substr($0,RSTART+4,RLENGTH-4); if(has(m0,eth))c0++; if(has(m1,eth))c1++; if(has(m2,eth))c2++ }
++			END{printf "%d %d %d", c0+0,c1+0,c2+0}' /sys/kernel/debug/ppe/bind 2>/dev/null)
++		bn0=$(echo "$_bn"|awk '{print $1}'); bn1=$(echo "$_bn"|awk '{print $2}'); bn2=$(echo "$_bn"|awk '{print $3}')
++	fi
++	local _air
++	_air=$(awk -v now="$now" -v seed="$AIR_EFF" -v a0="$a0" -v a1="$a1" -v a2="$a2" \
++		-v tx0="$tx0_mbps" -v rx0="$rx0_mbps" -v tx1="$tx1_mbps" -v rx1="$rx1_mbps" -v tx2="$tx2_mbps" -v rx2="$rx2_mbps" \
++		-v bn0="$bn0" -v bn1="$bn1" -v bn2="$bn2" '
++		BEGIN {
++			split(a0,x0); split(a1,x1); split(a2,x2)
++			ctd[0]=x0[1]+0; crd[0]=x0[2]+0; btr[0]=x0[3]+0; brr[0]=x0[4]+0
++			ctd[1]=x1[1]+0; crd[1]=x1[2]+0; btr[1]=x1[3]+0; brr[1]=x1[4]+0
++			ctd[2]=x2[1]+0; crd[2]=x2[2]+0; btr[2]=x2[3]+0; brr[2]=x2[4]+0
++			ex[0]=tx0+rx0; ex[1]=tx1+rx1; ex[2]=tx2+rx2
++			bn[0]=bn0+0; bn[1]=bn1+0; bn[2]=bn2+0
++			seedf=seed/100; if(seedf<0.3)seedf=0.3; if(seedf>1)seedf=1
++			FLOOR=15; ALPHA=0.25   # need >15 Mbps raw airtime to sample; EMA weight 0.25
++			for (b=0;b<3;b++) { eff[b]=seedf; air[b]="0.0" }
++			pf="/tmp/npu-wifi-airtime.prev"
++			if ((getline line < pf) > 0) {
++				n=split(line,p); pt=p[1]+0; dt=now-pt
++				for (b=0;b<3;b++) { e=p[9+b]+0; if(e>=0.3 && e<=1.0) eff[b]=e }   # learned eff from state
++				if (pt>0 && now>pt) {
++					for (b=0;b<3;b++) {
++						dtd=ctd[b]-p[2+b]; if(dtd<0)dtd=0
++						drd=crd[b]-p[5+b]; if(drd<0)drd=0
++						raw=(dtd*btr[b] + drd*brr[b])/1000000/dt   # Mbps, no efficiency factor
++						if (raw != raw || raw > 20000) raw=0       # guard NaN / counter-wrap spikes
++						if (bn[b]==0 && raw>FLOOR && ex[b]>FLOOR) {   # calibrate only on non-offloaded traffic
++							s=ex[b]/raw
++							if (s>=0.3 && s<=1.0) eff[b]=eff[b]*(1-ALPHA) + s*ALPHA
++						}
++						air[b]=sprintf("%.1f", raw*eff[b])
++					}
++				}
++			}
++			close(pf)
++			printf "%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.3f %.3f %.3f\n", now, ctd[0],ctd[1],ctd[2],crd[0],crd[1],crd[2], eff[0],eff[1],eff[2] > pf
++			printf "%s %s %s %.0f %.0f %.0f\n", air[0],air[1],air[2], eff[0]*100,eff[1]*100,eff[2]*100
++		}' /dev/null)
++	local air0 air1 air2 aireff0 aireff1 aireff2
++	air0=$(echo "$_air"|awk '{print $1}'); air1=$(echo "$_air"|awk '{print $2}'); air2=$(echo "$_air"|awk '{print $3}')
++	aireff0=$(echo "$_air"|awk '{print $4}'); aireff1=$(echo "$_air"|awk '{print $5}'); aireff2=$(echo "$_air"|awk '{print $6}')
++
++	local bands_json=""
++	for band_idx in 0 1 2; do
++		local dump tx_mbps rx_mbps band_per frames_ps air_mbps air_eff hw_tx hw_rx
++		case "$band_idx" in
++			0) dump="$dump0"; tx_mbps="$tx0_mbps"; rx_mbps="$rx0_mbps"; band_per="$band_per_0"; frames_ps="$frames0"; air_mbps="$air0"; air_eff="$aireff0"; hw_tx="$hwtx0"; hw_rx="$hwrx0" ;;
++			1) dump="$dump1"; tx_mbps="$tx1_mbps"; rx_mbps="$rx1_mbps"; band_per="$band_per_1"; frames_ps="$frames1"; air_mbps="$air1"; air_eff="$aireff1"; hw_tx="$hwtx1"; hw_rx="$hwrx1" ;;
++			2) dump="$dump2"; tx_mbps="$tx2_mbps"; rx_mbps="$rx2_mbps"; band_per="$band_per_2"; frames_ps="$frames2"; air_mbps="$air2"; air_eff="$aireff2"; hw_tx="$hwtx2"; hw_rx="$hwrx2" ;;
++		esac
++		[ -z "$dump" ] && continue
++
++		local stats
++		stats=$(echo "$dump" | awk -v band_per="${band_per:-0}" '
++		BEGIN {
++			stations=0; tx_pkts=0; tx_retries=0; tx_failed=0
++			sum_phy=0; phy_count=0
++			sum_sig=0; sig_count=0; min_sig=0
++		}
++		/^Station / { stations++ }
++		/tx packets:/ { tx_pkts += $3+0 }
++		/tx retries:/ { tx_retries += $3+0 }
++		/tx failed:/ { tx_failed += $3+0 }
++		/tx bitrate:/ { sum_phy += $3+0; phy_count++ }
++		/signal avg:/ {
++			for (i = 1; i <= NF; i++) {
++				if ($i ~ /^-[0-9]+$/) {
++					sig = $i+0
++					sum_sig += sig; sig_count++
++					if (sig_count == 1 || sig < min_sig) min_sig = sig
++					break
++				}
++			}
++		}
++		END {
++			avg_phy = (phy_count > 0) ? sum_phy/phy_count : 0
++			# Real per-MPDU Tx PER from mt76 debugfs (passed in) as retry/error %;
++			# raw tx_retries/tx_packets still emitted below but their ratio
++			# over-reads on EHT (per-MPDU vs per-MSDU) so it is not used for health.
++			retry_pct = band_per + 0
++			avg_sig = (sig_count > 0) ? int(sum_sig / sig_count) : 0
++			printf "%d %d %d %d %.1f %d %d %d", \
++				stations, tx_pkts, tx_retries, tx_failed, avg_phy, retry_pct, avg_sig, min_sig
++		}')
++
++		set -- $stats
++		[ -n "$bands_json" ] && bands_json="${bands_json},"
++		local sta_tx_raw
++		case "$band_idx" in
++			0) sta_tx_raw="$sta_tx0" ;;
++			1) sta_tx_raw="$sta_tx1" ;;
++			2) sta_tx_raw="$sta_tx2" ;;
++		esac
++		bands_json="${bands_json}{\"band\":${band_idx},\"stations\":${1:-0},\"tx_packets\":${2:-0},\"tx_retries\":${3:-0},\"tx_failed\":${4:-0},\"avg_phy_rate\":${5:-0},\"retry_pct\":${6:-0},\"avg_signal\":${7:-0},\"min_signal\":${8:-0},\"tx_mbps\":${tx_mbps},\"rx_mbps\":${rx_mbps:-0},\"air_mbps\":${air_mbps:-0},\"hw_tx_mbps\":${hw_tx:-0},\"hw_rx_mbps\":${hw_rx:-0},\"air_eff\":${air_eff:-0},\"frames_ps\":${frames_ps:-0},\"tx_bytes_raw\":${sta_tx_raw:-0}}"
++	done
++
++	printf '{"available":true,"mlo":%s,"bands":[%s]}' "$([ "$is_mld" = 1 ] && echo true || echo false)" "$bands_json"
++}
++
++get_bridge_stats() {
++	# Check br-lan for tx_dropped (CPU can't feed WiFi chip fast enough)
++	# and overall packet rates for bridge activity indication
++
++	local stats
++	stats=$(ip -s link show br-lan 2>/dev/null)
++
++	if [ -z "$stats" ]; then
++		echo '{"available":false}'
++		return
++	fi
++
++	local rx_bytes rx_packets rx_dropped tx_bytes tx_packets tx_dropped
++	rx_bytes=$(echo "$stats"   | awk '/RX:/{getline; print $1+0}')
++	rx_packets=$(echo "$stats" | awk '/RX:/{getline; print $2+0}')
++	rx_dropped=$(echo "$stats" | awk '/RX:/{getline; print $4+0}')
++	tx_bytes=$(echo "$stats"   | awk '/TX:/{getline; print $1+0}')
++	tx_packets=$(echo "$stats" | awk '/TX:/{getline; print $2+0}')
++	tx_dropped=$(echo "$stats" | awk '/TX:/{getline; print $4+0}')
++
++	# Also check for any bridge forwarding errors via brctl if available
++	local fwd_errors=0
++	if command -v brctl > /dev/null 2>&1; then
++		fwd_errors=$(brctl showstp br-lan 2>/dev/null | awk '/forward transitions/{sum+=$NF} END{print sum+0}')
++	fi
++
++	printf '{"available":true,"rx_bytes":%d,"rx_packets":%d,"rx_dropped":%d,"tx_bytes":%d,"tx_packets":%d,"tx_dropped":%d,"fwd_errors":%d}' \
++		"${rx_bytes:-0}" "${rx_packets:-0}" "${rx_dropped:-0}" \
++		"${tx_bytes:-0}" "${tx_packets:-0}" "${tx_dropped:-0}" \
++		"${fwd_errors:-0}"
++}
++
++get_npu_bypass() {
++	# Determines if the NPU is actively offloading traffic.
++	# Primary indicator: offload_bound > 0 (live PPE entries in hardware).
++	# This works in both Router and AP mode — no WAN assumption needed.
++
++	# Check UCI for hw offload setting
++	local hw_offload
++	hw_offload=$(uci get firewall.@defaults[0].flow_offloading_hw 2>/dev/null)
++
++	# Read PPE bound entry count directly from debugfs
++	local offload_bound=0
++	local ppe_bind="/sys/kernel/debug/ppe/bind"
++	if [ -r "$ppe_bind" ]; then
++		offload_bound=$(wc -l < "$ppe_bind" 2>/dev/null || echo 0)
++		# Subtract 1 if file has a header line (starts with non-numeric)
++		local first
++		first=$(head -1 "$ppe_bind" 2>/dev/null)
++		case "$first" in [0-9]*) ;; *) offload_bound=$(( offload_bound - 1 )) ;; esac
++		[ "$offload_bound" -lt 0 ] && offload_bound=0
++	fi
++
++	# CPU % is sampled by npu-jitter-daemon over a steady ~2s background window
++	# and published in the jitter json, so it reflects real system load and is
++	# NOT inflated by this RPC's own per-poll work (the old in-RPC /proc/stat
++	# delta measured its own overhead -> ~15-20% at idle). Read the cached value.
++	local cpu_pct=0
++	if [ -f /tmp/npu-jitter.json ]; then
++		cpu_pct=$(sed -n 's/.*"cpu_pct":\([0-9][0-9]*\).*/\1/p' /tmp/npu-jitter.json)
++		[ -n "$cpu_pct" ] || cpu_pct=0
++	fi
++
++	# Get WAN TX throughput delta (bytes/sec → Mbps) — router mode only
++	local wan_mbps=0
++	local tx_file="/tmp/npu-wan-tx.prev"
++	local wan_dev
++	wan_dev=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@.l3_device" 2>/dev/null)
++
++	if [ -n "$wan_dev" ]; then
++		local cur_tx
++		cur_tx=$(cat "/sys/class/net/${wan_dev}/statistics/tx_bytes" 2>/dev/null || echo 0)
++		if [ -f "$tx_file" ]; then
++			local prev_tx prev_time cur_time elapsed delta
++			prev_tx=$(awk '{print $1}' "$tx_file" 2>/dev/null || echo 0)
++			prev_time=$(awk '{print $2}' "$tx_file" 2>/dev/null || echo 0)
++			cur_time=$(date +%s)
++			elapsed=$(( cur_time - prev_time ))
++			if [ "$elapsed" -gt 0 ] && [ "$cur_tx" -ge "$prev_tx" ]; then
++				delta=$(( cur_tx - prev_tx ))
++				wan_mbps=$(( delta * 8 / elapsed / 1000000 ))
++			fi
++		fi
++		printf "%s %s" "$cur_tx" "$(date +%s)" > "$tx_file"
++	fi
++
++	# Determine NPU path status using PPE bound entries as ground truth
++	local npu_active="false"
++	local path="cpu"
++	if [ "$hw_offload" = "1" ] && [ "$offload_bound" -gt 0 ]; then
++		npu_active="true"
++		path="npu"
++	elif [ "$hw_offload" = "1" ]; then
++		path="npu_idle"
++	fi
++
++	printf '{"hw_offload_enabled":%s,"cpu_pct":%d,"wan_mbps":%d,"offload_bound":%d,"npu_active":%s,"path":"%s"}' \
++		"$([ "$hw_offload" = "1" ] && echo true || echo false)" \
++		"${cpu_pct:-0}" "${wan_mbps:-0}" "${offload_bound:-0}" "$npu_active" "$path"
++}
++
++get_conflict_alerts() {
++	local alerts=""
++	local alert_count=0
++
++	# ── Alert 1: Ghost Shaper ──────────────────────────────────────────────
++	# NPU HW offload is ON + CAKE is configured on WAN = NPU bypasses CAKE.
++	# Bufferbloat management is inactive for offloaded flows.
++	local hw_offload
++	hw_offload=$(uci get firewall.@defaults[0].flow_offloading_hw 2>/dev/null)
++
++	local cake_on_wan="false"
++	local wan_dev
++	wan_dev=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@.l3_device" 2>/dev/null)
++	if [ -n "$wan_dev" ] && command -v tc > /dev/null 2>&1; then
++		if tc qdisc show dev "$wan_dev" 2>/dev/null | grep -q "^qdisc cake"; then
++			cake_on_wan="true"
++		fi
++	fi
++
++	if [ "$hw_offload" = "1" ] && [ "$cake_on_wan" = "true" ]; then
++		[ -n "$alerts" ] && alerts="${alerts},"
++		alerts="${alerts}{\"id\":\"ghost_shaper\",\"severity\":\"warning\",\"title\":\"Ghost Shaper Active\",\"message\":\"NPU HW offload is bypassing CAKE SQM. Offloaded flows skip bufferbloat management — latency protection is inactive under load.\"}"
++		alert_count=$((alert_count + 1))
++	fi
++
++	# ── Alert 2: Physical Bottleneck ──────────────────────────────────────
++	# WAN interface has hardware errors — cable/SFP issue, not software bloat.
++	local rx_errors=0
++	if [ -n "$wan_dev" ]; then
++		rx_errors=$(cat "/sys/class/net/${wan_dev}/statistics/rx_errors" 2>/dev/null || echo 0)
++	fi
++
++	if [ "${rx_errors:-0}" -gt 0 ]; then
++		[ -n "$alerts" ] && alerts="${alerts},"
++		alerts="${alerts}{\"id\":\"physical_bottleneck\",\"severity\":\"error\",\"title\":\"Physical Bottleneck\",\"message\":\"Hardware errors detected on WAN (${rx_errors} rx_errors). Check WAN cable or SFP. Latency stats may be misleading.\"}"
++		alert_count=$((alert_count + 1))
++	fi
++
++	# ── Alert 3: NPU Bypass + High Latency ────────────────────────────────
++	# NPU is on but jitter result shows high latency — NPU not helping or
++	# the path has a real latency problem.
++	local jitter_file="/tmp/npu-jitter.json"
++	if [ "$hw_offload" = "1" ] && [ -f "$jitter_file" ]; then
++		local last_ping
++		last_ping=$(jsonfilter -i "$jitter_file" -e "@.last_ping" 2>/dev/null)
++		# Warn if ping > 60ms with hw offload on (something is wrong)
++		if [ -n "$last_ping" ] && awk "BEGIN{exit !($last_ping > 60)}"; then
++			[ -n "$alerts" ] && alerts="${alerts},"
++			alerts="${alerts}{\"id\":\"npu_bypass_latency\",\"severity\":\"warning\",\"title\":\"NPU Bypass Detected\",\"message\":\"HW offload is enabled but ISP latency is high (${last_ping}ms). Latency management may be skipped by hardware acceleration.\"}"
++			alert_count=$((alert_count + 1))
++		fi
++	fi
++
++	printf '{"alert_count":%d,"alerts":[%s]}' "$alert_count" "$alerts"
++}
++
++get_eth_stats() {
++	printf '{"ports":['
++	local first=1
++	for iface in wan lan1 lan2 lan3 lan4; do
++		local sys="/sys/class/net/$iface"
++		[ -d "$sys" ] || continue
++		local operstate up=false
++		operstate=$(cat "$sys/operstate" 2>/dev/null || echo "unknown")
++		[ "$operstate" = "up" ] && up=true
++		local speed
++		speed=$(cat "$sys/speed" 2>/dev/null || echo "")
++		case "$speed" in ''|*[!0-9]*) speed=0 ;; esac
++		local tx_bytes rx_bytes tx_errors rx_errors
++		tx_bytes=$(cat "$sys/statistics/tx_bytes" 2>/dev/null || echo 0)
++		rx_bytes=$(cat "$sys/statistics/rx_bytes" 2>/dev/null || echo 0)
++		tx_errors=$(cat "$sys/statistics/tx_errors" 2>/dev/null || echo 0)
++		rx_errors=$(cat "$sys/statistics/rx_errors" 2>/dev/null || echo 0)
++		[ "$first" = "1" ] || printf ","
++		printf '{"iface":"%s","up":%s,"speed":%d,"tx_bytes":%d,"rx_bytes":%d,"tx_errors":%d,"rx_errors":%d}' \
++			"$iface" "$up" "$speed" "$tx_bytes" "$rx_bytes" "$tx_errors" "$rx_errors"
++		first=0
++	done
++	printf ']}'
++}
++
++case "$1" in
++	list)
++		echo '{"getStatus":{},"getPpeEntries":{},"getTokenInfo":{},"getFrameEngine":{},"getTxStats":{},"getVlanOffload":{},"setVlanOffload":{"enabled":"int"},"getFlowOffload":{},"setFlowOffload":{"enabled":"int"},"getPppoeOffload":{},"setPppoeOffload":{"enabled":"int"},"getDeviceMode":{},"getWanHealth":{},"getJitterResult":{},"getWifiStats":{},"getBridgeStats":{},"getNpuBypass":{},"getConflictAlerts":{},"getEthStats":{}}'
++		;;
++	call)
++		case "$2" in
++			getStatus)
++				get_status
++				;;
++			getPpeEntries)
++				get_ppe_entries
++				;;
++			getTokenInfo)
++				get_token_info
++				;;
++			getFrameEngine)
++				get_frame_engine
++				;;
++			getTxStats)
++				get_tx_stats
++				;;
++			getVlanOffload)
++				get_vlan_offload
++				;;
++			setVlanOffload)
++				read input
++				set_vlan_offload "$input"
++				;;
++			getFlowOffload)
++				get_flow_offload
++				;;
++			setFlowOffload)
++				read input
++				set_flow_offload "$input"
++				;;
++			getPppoeOffload)
++				get_pppoe_offload
++				;;
++			setPppoeOffload)
++				read input
++				set_pppoe_offload "$input"
++				;;
++			getDeviceMode)
++				get_device_mode
++				;;
++			getWanHealth)
++				get_wan_health
++				;;
++			getJitterResult)
++				get_jitter_result
++				;;
++			getWifiStats)
++				get_wifi_stats
++				;;
++			getBridgeStats)
++				get_bridge_stats
++				;;
++			getNpuBypass)
++				get_npu_bypass
++				;;
++			getConflictAlerts)
++				get_conflict_alerts
++				;;
++			getEthStats)
++				get_eth_stats
++				;;
++			*)
++				echo '{"error":"Invalid method"}'
++				;;
++		esac
++		;;
++esac
+--- a/package/luci-app-airoha-flowsense/Makefile
++++ b/package/luci-app-airoha-flowsense/Makefile
+@@ -3,11 +3,11 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_VERSION:=1.1.9
+-PKG_RELEASE:=5
++PKG_RELEASE:=8
+ PKG_LICENSE:=Apache-2.0
+ 
+ LUCI_TITLE:=LuCI Airoha FlowSense — Offload & PPE Monitor
+-LUCI_DEPENDS:=+luci-base @TARGET_airoha
++LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +ucode-mod-fs +ucode-mod-ubus +ucode-mod-uci +ucode-mod-nl80211 +ucode-mod-uloop @TARGET_airoha
+ 
+ include $(TOPDIR)/feeds/luci/luci.mk
+ 
+@@ -25,7 +25,8 @@
+ # set) and online.
+ chmod 0755 "$${IPKG_INSTROOT}/etc/init.d/npu-jitter" \
+            "$${IPKG_INSTROOT}/usr/libexec/npu-jitter-daemon" \
+-           "$${IPKG_INSTROOT}/usr/libexec/rpcd/luci.airoha_flowsense" 2>/dev/null
++           "$${IPKG_INSTROOT}/usr/libexec/rpcd/luci.airoha_flowsense" \
++           "$${IPKG_INSTROOT}/usr/share/luci-airoha-flowsense/backend.sh" 2>/dev/null
+ [ -n "$${IPKG_INSTROOT}" ] || {
+ 	/etc/init.d/npu-jitter enable 2>/dev/null
+ 	/etc/init.d/npu-jitter restart 2>/dev/null
+--- a/package/luci-app-airoha-flowsense/root/usr/libexec/rpcd/luci.airoha_flowsense
++++ b/package/luci-app-airoha-flowsense/root/usr/libexec/rpcd/luci.airoha_flowsense
+@@ -1,1362 +1,1142 @@
+-#!/bin/sh
+-
+-# Airoha FlowSense RPC backend for LuCI (Offload & PPE Monitor)
+-
+-. /lib/functions.sh
+-
+-get_status() {
+-	# === NPU Status ===
+-	local npu_fw="/lib/firmware/airoha/en7581_MT7996_npu_rv32.bin"
+-	local npu_ver="Unknown"
+-
+-	if [ -f "$npu_fw" ]; then
+-		npu_ver=$(strings "$npu_fw" 2>/dev/null | grep -oE '([0-9]+\.[0-9]+\.[0-9]+-)?TLB[0-9.]+[-_v0-9]*' | head -1)
+-		[ -z "$npu_ver" ] && npu_ver="Unknown"
+-	fi
+-
+-	local npu_loaded="false"
+-	local npu_device=""
+-	local npu_driver_path="/sys/bus/platform/drivers/airoha-npu"
+-
+-	if [ -d "$npu_driver_path" ]; then
+-		npu_device=$(ls -1 "$npu_driver_path" 2>/dev/null | grep '\.npu$' | head -1)
+-		if [ -n "$npu_device" ]; then
+-			npu_loaded="true"
+-		fi
+-	fi
+-
+-	local npu_clock=0
+-	if [ -f "/sys/kernel/debug/clk/npu/clk_rate" ]; then
+-		npu_clock=$(cat /sys/kernel/debug/clk/npu/clk_rate 2>/dev/null || echo 0)
+-	fi
+-
+-	local npu_cores=$(grep -c "airoha-npu-wdt" /proc/interrupts 2>/dev/null || echo 0)
+-
+-	local offload_bound=$(cat /sys/kernel/debug/ppe/bind 2>/dev/null | grep -c "^[0-9a-fA-F]")
+-	local offload_total=$(cat /sys/kernel/debug/ppe/entries 2>/dev/null | grep -c "^[0-9a-fA-F]")
+-
+-	local mem_info=$(dmesg | grep "reserved mem.*npu" | head -4)
+-	local regions="[]"
+-
+-	if [ -n "$mem_info" ]; then
+-		regions=$(echo "$mem_info" | awk '
+-		BEGIN { printf "[" }
+-		{
+-			if (NR > 1) printf ","
+-			match($0, /0x[0-9a-fA-F]+\.\.0x[0-9a-fA-F]+/)
+-			range = substr($0, RSTART, RLENGTH)
+-			split(range, a, "\\.\\.")
+-			match($0, /\([0-9]+ [KMG]i?B\)/)
+-			size = substr($0, RSTART+1, RLENGTH-2)
+-			match($0, /non-reusable [^ ]+/)
+-			name = substr($0, RSTART+13)
+-			gsub(/@.*/, "", name)
+-			printf "{\"name\":\"%s\",\"start\":\"%s\",\"end\":\"%s\",\"size\":\"%s\"}", name, a[1], a[2], size
+-		}
+-		END { printf "]" }
+-		')
+-	fi
+-
+-	# === CPU Frequency Status ===
+-	local cpufreq_path="/sys/devices/system/cpu/cpufreq/policy0"
+-	local cpu_cur_freq=0
+-	local cpu_hw_freq=0
+-	local cpu_governor="unknown"
+-	local cpu_avail_governors=""
+-	local cpu_min_freq=0
+-	local cpu_max_freq=0
+-	local cpu_avail_freqs=""
+-
+-	if [ -d "$cpufreq_path" ]; then
+-		cpu_cur_freq=$(cat "$cpufreq_path/scaling_cur_freq" 2>/dev/null || echo 0)
+-		cpu_hw_freq=$(cat "$cpufreq_path/cpuinfo_cur_freq" 2>/dev/null || echo 0)
+-		cpu_governor=$(cat "$cpufreq_path/scaling_governor" 2>/dev/null || echo "unknown")
+-		cpu_avail_governors=$(cat "$cpufreq_path/scaling_available_governors" 2>/dev/null || echo "")
+-		cpu_min_freq=$(cat "$cpufreq_path/scaling_min_freq" 2>/dev/null || echo 0)
+-		cpu_max_freq=$(cat "$cpufreq_path/scaling_max_freq" 2>/dev/null || echo 0)
+-		cpu_avail_freqs=$(cat "$cpufreq_path/scaling_available_frequencies" 2>/dev/null || echo "")
+-	fi
+-
+-	# Read actual PLL frequency from hardware (detects overclock)
+-	local pll_freq=0
+-	if command -v devmem > /dev/null 2>&1; then
+-		local pcw_raw=$(devmem 0x1fa202b4 2>/dev/null)
+-		local chg_raw=$(devmem 0x1fa202b8 2>/dev/null)
+-		if [ -n "$pcw_raw" ] && [ -n "$chg_raw" ]; then
+-			pcw_raw=$((pcw_raw))
+-			chg_raw=$((chg_raw))
+-			local pcw_int=$(( (pcw_raw >> 24) & 0x7F ))
+-			local pll_posdiv=$(( (chg_raw >> 4) & 7 ))
+-			if [ "$pll_posdiv" -eq 0 ]; then
+-				pll_freq=$((pcw_int * 50))
+-			else
+-				pll_freq=$((pcw_int * 50 / (1 << pll_posdiv)))
+-			fi
+-		fi
+-	fi
+-
+-	# Count online CPUs
+-	local cpu_count=0
+-	if [ -d "/sys/devices/system/cpu" ]; then
+-		cpu_count=$(ls -d /sys/devices/system/cpu/cpu[0-9]* 2>/dev/null | wc -l)
+-	fi
+-
+-	printf '{"npu_version":"%s","npu_loaded":%s,"npu_device":"%s","npu_clock":%d,"npu_cores":%d,"offload_bound":%d,"offload_total":%d,"memory_regions":%s,"cpu_cur_freq":%d,"cpu_hw_freq":%d,"cpu_governor":"%s","cpu_avail_governors":"%s","cpu_min_freq":%d,"cpu_max_freq":%d,"cpu_avail_freqs":"%s","cpu_count":%d,"pll_freq_mhz":%d}' \
+-		"${npu_ver:-Unknown}" "$npu_loaded" "${npu_device:-}" "${npu_clock:-0}" "${npu_cores:-0}" "${offload_bound:-0}" "${offload_total:-0}" "$regions" \
+-		"${cpu_cur_freq:-0}" "${cpu_hw_freq:-0}" "${cpu_governor:-unknown}" "${cpu_avail_governors:-}" "${cpu_min_freq:-0}" "${cpu_max_freq:-0}" "${cpu_avail_freqs:-}" "${cpu_count:-0}" "${pll_freq:-0}"
+-}
+-
+-get_ppe_entries() {
+-	local bind_file="/sys/kernel/debug/ppe/bind"
+-	local entries_file="/sys/kernel/debug/ppe/entries"
+-
+-	# Parse a PPE file into JSON entries array (awk function reused for both files)
+-	parse_ppe() {
+-		local file="$1" state_filter="$2" limit="$3"
+-		awk -v state_filter="$state_filter" -v limit="$limit" '
+-		BEGIN { total=0; shown=0; n4=0; n6=0 }
+-		/^[0-9a-fA-F]+ / {
+-			state = $2
+-			if (state_filter != "" && state != state_filter) next
+-			total++
+-			if ($3 == "IPv4") n4++
+-			if ($3 == "IPv6") n6++
+-			if (shown >= limit) next
+-			shown++
+-			if ($3 == "IPv4" || $3 == "IPv6") { type=$3; subtype=$4 }
+-			else if ($3 == "L2B" || $4 == "L2B") { type="L2B"; subtype="" }
+-			else { type=$3; subtype=$4 }
+-			orig=""; match($0,/orig=[^ ]+/); if(RSTART>0) orig=substr($0,RSTART+5,RLENGTH-5)
+-			new_flow=""; match($0,/new=[^ ]+/); if(RSTART>0) new_flow=substr($0,RSTART+4,RLENGTH-4)
+-			eth=""; match($0,/eth=[^ ]+/); if(RSTART>0) eth=substr($0,RSTART+4,RLENGTH-4)
+-			entry[shown]=sprintf("{\"index\":\"%s\",\"state\":\"%s\",\"type\":\"%s\",\"proto\":\"%s\",\"orig\":\"%s\",\"new_flow\":\"%s\",\"eth\":\"%s\"}",$1,state,type,subtype,orig,new_flow,eth)
+-		}
+-		END {
+-			printf "{\"total\":%d,\"ipv4\":%d,\"ipv6\":%d,\"entries\":[",total,n4,n6
+-			for(i=1;i<=shown;i++){if(i>1)printf ","; printf "%s",entry[i]}
+-			printf "]}"
+-		}
+-		' "$file" 2>/dev/null || echo '{"total":0,"ipv4":0,"ipv6":0,"entries":[]}'
+-	}
+-
+-	local bnd_json unb_json
+-
+-	if [ -f "$bind_file" ]; then
+-		local _bnd_parsed=$(parse_ppe "$bind_file" "" 25)
+-
+-		# The bind file may be a plain-text count ("946\n" or "946" no newline)
+-		# OR a line-per-entry table. Try both and take the larger value.
+-		# Only override parse_ppe's total when we have something bigger.
+-		local _cnt_direct=$(tr -d '[:space:]' < "$bind_file" 2>/dev/null)
+-		case "$_cnt_direct" in ''|*[!0-9]*) _cnt_direct=0 ;; esac
+-		local _cnt_wc=$(wc -l < "$bind_file" 2>/dev/null | tr -d '[:space:]')
+-		case "$_cnt_wc" in ''|*[!0-9]*) _cnt_wc=0 ;; esac
+-		local _bnd_total=$(( _cnt_direct > _cnt_wc ? _cnt_direct : _cnt_wc ))
+-
+-		if [ "$_bnd_total" -gt 0 ] 2>/dev/null; then
+-			bnd_json=$(printf '%s' "$_bnd_parsed" | sed 's/^{"total":[0-9]*/{"total":'"$_bnd_total"'/')
+-		else
+-			# Both external methods gave 0 — trust parse_ppe's own count
+-			bnd_json="$_bnd_parsed"
+-		fi
+-	else
+-		bnd_json='{"total":0,"ipv4":0,"ipv6":0,"entries":[]}'
+-	fi
+-
+-	if [ -f "$entries_file" ]; then
+-		unb_json=$(parse_ppe "$entries_file" "UNB" 25)
+-	else
+-		unb_json='{"total":0,"ipv4":0,"ipv6":0,"entries":[]}'
+-	fi
+-
+-	# Per-band BND counts: collect client MACs per band, match against eth= in bind file
+-	local macs0 macs1 macs2 mldif mldsdir mst mmac
+-	macs0=$(iw dev 2>/dev/null | awk '/Interface phy[0-9]*\.0-/{print $2}' | while read -r iface; do
+-		iw dev "$iface" station dump 2>/dev/null | awk '/^Station/{print $2}'
+-	done)
+-	macs1=$(iw dev 2>/dev/null | awk '/Interface phy[0-9]*\.1-/{print $2}' | while read -r iface; do
+-		iw dev "$iface" station dump 2>/dev/null | awk '/^Station/{print $2}'
+-	done)
+-	macs2=$(iw dev 2>/dev/null | awk '/Interface phy[0-9]*\.2-/{print $2}' | while read -r iface; do
+-		iw dev "$iface" station dump 2>/dev/null | awk '/^Station/{print $2}'
+-	done)
+-	# MLO: MLD clients live on ap-mld* (no phyX.N- name), so the scan above misses
+-	# them and their offloaded flows never set band_bnd -> the frontend never leaves
+-	# the exact byte-rate. Classify each MLD station into every band it has a
+-	# link-N debugfs dir on.
+-	for mldif in $(iw dev 2>/dev/null | awk '/Interface/{i=$2} /type AP/{print i}'); do
+-		case "$mldif" in *-mld*) ;; *) continue ;; esac
+-		mldsdir="/sys/kernel/debug/ieee80211/phy0/netdev:${mldif}/stations"
+-		[ -d "$mldsdir" ] || continue
+-		for mst in "$mldsdir"/*/; do
+-			[ -d "$mst" ] || continue
+-			mmac=$(basename "$mst")
+-			[ -d "${mst}link-0" ] && macs0="${macs0}
+-${mmac}"
+-			[ -d "${mst}link-1" ] && macs1="${macs1}
+-${mmac}"
+-			[ -d "${mst}link-2" ] && macs2="${macs2}
+-${mmac}"
+-		done
+-	done
+-	macs0=$(printf '%s\n' "$macs0" | grep -v '^[[:space:]]*$' | tr '\n' '|' | sed 's/|$//')
+-	macs1=$(printf '%s\n' "$macs1" | grep -v '^[[:space:]]*$' | tr '\n' '|' | sed 's/|$//')
+-	macs2=$(printf '%s\n' "$macs2" | grep -v '^[[:space:]]*$' | tr '\n' '|' | sed 's/|$//')
+-
+-	local band_bnd="[0,0,0]"
+-	if [ -f "$bind_file" ]; then
+-		band_bnd=$(awk -v m0="$macs0" -v m1="$macs1" -v m2="$macs2" '
+-		function has(macs, eth,    n,arr,i,low) {
+-			if (macs == "") return 0
+-			low = tolower(eth)
+-			n = split(macs, arr, "|")
+-			for (i=1; i<=n; i++) if (arr[i] != "" && index(low, tolower(arr[i])) > 0) return 1
+-			return 0
+-		}
+-		/^[0-9a-fA-F]+ BND / {
+-			eth=""; match($0,/eth=[^ \t]+/); if (RSTART>0) eth=substr($0,RSTART+4,RLENGTH-4)
+-			# an MLD client is listed on EVERY band it has a link on, so
+-			# count its flows on each (else-if starved the higher bands)
+-			if (has(m0,eth)) c0++
+-			if (has(m1,eth)) c1++
+-			if (has(m2,eth)) c2++
+-		}
+-		END { printf "[%d,%d,%d]", c0+0, c1+0, c2+0 }
+-		' "$bind_file" 2>/dev/null || printf "[0,0,0]")
+-	fi
+-	bnd_json=$(printf '%s' "$bnd_json" | sed 's/}$/,"band_bnd":'"$band_bnd"'}/')
+-
+-	# Per-band UNB counts: IP-based matching (UNB flows lack eth= MAC info)
+-	# Cross-reference WiFi client MACs with ARP neighbour table to get per-band IPs,
+-	# then match UNB orig= source IP against those sets.
+-	local neigh
+-	neigh=$(ip neigh show 2>/dev/null | grep ' lladdr ')
+-	local ips0 ips1 ips2
+-	ips0=$(printf '%s\n' "$neigh" | awk -v macs="$macs0" '
+-		BEGIN{n=split(macs,a,"|");for(i=1;i<=n;i++)if(a[i]!="")m[tolower(a[i])]=1}
+-		m[tolower($5)]{printf "%s|",$1}' | sed 's/|$//')
+-	ips1=$(printf '%s\n' "$neigh" | awk -v macs="$macs1" '
+-		BEGIN{n=split(macs,a,"|");for(i=1;i<=n;i++)if(a[i]!="")m[tolower(a[i])]=1}
+-		m[tolower($5)]{printf "%s|",$1}' | sed 's/|$//')
+-	ips2=$(printf '%s\n' "$neigh" | awk -v macs="$macs2" '
+-		BEGIN{n=split(macs,a,"|");for(i=1;i<=n;i++)if(a[i]!="")m[tolower(a[i])]=1}
+-		m[tolower($5)]{printf "%s|",$1}' | sed 's/|$//')
+-
+-	local band_unb="[0,0,0]"
+-	if [ -f "$entries_file" ]; then
+-		band_unb=$(awk -v i0="$ips0" -v i1="$ips1" -v i2="$ips2" '
+-		function has(ips, ip,    n,arr,i) {
+-			if (ips == "") return 0
+-			n = split(ips, arr, "|")
+-			for (i=1; i<=n; i++) if (arr[i] == ip) return 1
+-			return 0
+-		}
+-		/^[0-9a-fA-F]+ UNB / {
+-			src=""
+-			match($0,/orig=[^ \t]+/)
+-			if (RSTART>0) {
+-				orig=substr($0,RSTART+5,RLENGTH-5)
+-				if (substr(orig,1,1) != "[") { n=split(orig,p,":"); src=p[1] }
+-			}
+-			if (src != "") {
+-				if (has(i0,src)) c0++
+-				if (has(i1,src)) c1++
+-				if (has(i2,src)) c2++
+-			}
+-		}
+-		END { printf "[%d,%d,%d]", c0+0, c1+0, c2+0 }
+-		' "$entries_file" 2>/dev/null || printf "[0,0,0]")
+-	fi
+-	unb_json=$(printf '%s' "$unb_json" | sed 's/}$/,"band_unb":'"$band_unb"'}/')
+-
+-	# Per-port BND counts for LAN ports using bridge FDB learned MACs
+-	local macs_p1 macs_p2 macs_p3 macs_p4
+-	macs_p1=$(bridge fdb show dev lan1 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
+-	macs_p2=$(bridge fdb show dev lan2 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
+-	macs_p3=$(bridge fdb show dev lan3 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
+-	macs_p4=$(bridge fdb show dev lan4 2>/dev/null | grep -v " self\| permanent" | awk '{print $1}' | tr '\n' '|' | sed 's/|$//')
+-
+-	local port_bnd="[0,0,0,0]"
+-	if [ -f "$bind_file" ]; then
+-		port_bnd=$(awk -v m1="$macs_p1" -v m2="$macs_p2" -v m3="$macs_p3" -v m4="$macs_p4" '
+-		function has(macs, eth,    n,arr,i,low) {
+-			if (macs == "") return 0
+-			low = tolower(eth)
+-			n = split(macs, arr, "|")
+-			for (i=1; i<=n; i++) if (arr[i] != "" && index(low, tolower(arr[i])) > 0) return 1
+-			return 0
+-		}
+-		/^[0-9a-fA-F]+ BND / {
+-			eth=""; match($0,/eth=[^ \t]+/); if (RSTART>0) eth=substr($0,RSTART+4,RLENGTH-4)
+-			if      (has(m1,eth)) c1++
+-			else if (has(m2,eth)) c2++
+-			else if (has(m3,eth)) c3++
+-			else if (has(m4,eth)) c4++
+-		}
+-		END { printf "[%d,%d,%d,%d]", c1+0, c2+0, c3+0, c4+0 }
+-		' "$bind_file" 2>/dev/null || printf "[0,0,0,0]")
+-	fi
+-	bnd_json=$(printf '%s' "$bnd_json" | sed 's/}$/,"port_bnd":'"$port_bnd"'}/')
+-
+-	# Per-client BND counts: for each connected WiFi station, how many bound (offloaded)
+-	# flows carry its MAC in eth=. Reuses the per-band station MAC lists (macs0/1/2) and
+-	# the same eth= match as band_bnd/port_bnd. Counts per station independently (a
+-	# client<->client flow can credit both ends; the common client<->WAN flow matches
+-	# only the client MAC, so no double count in practice).
+-	# Per-client BND counts + IP/hostname. Feeds awk three tagged streams: @NEIGH lines
+-	# (ip neigh) -> mac->ipv4, @LEASE lines (/tmp/dhcp.leases) -> mac->hostname, then the
+-	# raw bind table for the eth= match. Marker prefixes keep them apart (bind rows start
+-	# with a hex index, never @NEIGH/@LEASE). Counts per station; IP/host are best-effort.
+-	local client_bnd="[]"
+-	if [ -f "$bind_file" ]; then
+-		client_bnd=$(
+-		{
+-			printf '%s\n' "$neigh" | sed 's/^/@NEIGH /'
+-			sed 's/^/@LEASE /' /tmp/dhcp.leases 2>/dev/null
+-			cat "$bind_file"
+-		} | awk -v m0="$macs0" -v m1="$macs1" -v m2="$macs2" '
+-		BEGIN {
+-			ntot=0
+-			c=split(m0,a,"|"); for(i=1;i<=c;i++) if(a[i]!=""){ mac[++ntot]=tolower(a[i]); bnd_band[ntot]=0; cnt[ntot]=0 }
+-			c=split(m1,a,"|"); for(i=1;i<=c;i++) if(a[i]!=""){ mac[++ntot]=tolower(a[i]); bnd_band[ntot]=1; cnt[ntot]=0 }
+-			c=split(m2,a,"|"); for(i=1;i<=c;i++) if(a[i]!=""){ mac[++ntot]=tolower(a[i]); bnd_band[ntot]=2; cnt[ntot]=0 }
+-		}
+-		$1=="@NEIGH" { ipx=$2; mcx=tolower($6); if(index(ipx,":")==0 && index(ipx,".")>0 && mcx!="" && !(mcx in mac2ip)) mac2ip[mcx]=ipx; next }
+-		$1=="@LEASE" { lm=tolower($3); lh=$5; gsub(/["\\]/,"",lh); if(lm!="" && lh!="" && lh!="*") mac2host[lm]=lh; next }
+-		/^[0-9a-fA-F]+ BND / {
+-			eth=""; match($0,/eth=[^ \t]+/); if(RSTART>0) eth=tolower(substr($0,RSTART+4,RLENGTH-4))
+-			if(eth=="") next
+-			for(i=1;i<=ntot;i++) if(index(eth,mac[i])>0) cnt[i]++
+-		}
+-		END {
+-			printf "["
+-			for(i=1;i<=ntot;i++){
+-				ip = (mac[i] in mac2ip) ? mac2ip[mac[i]] : ""
+-				host = (mac[i] in mac2host) ? mac2host[mac[i]] : ""
+-				if(i>1)printf ","
+-				printf "{\"mac\":\"%s\",\"ip\":\"%s\",\"host\":\"%s\",\"band\":%d,\"bnd\":%d}",mac[i],ip,host,bnd_band[i],cnt[i]
+-			}
+-			printf "]"
+-		}
+-		' 2>/dev/null || printf "[]")
+-	fi
+-	bnd_json=$(printf '%s' "$bnd_json" | sed 's/}$/,"client_bnd":'"$client_bnd"'}/')
+-
+-	printf '{"bnd":%s,"unb":%s}' "$bnd_json" "$unb_json"
+-}
+-
+-get_token_info() {
+-	# Per-band WiFi station stats (count, retries) from iw — works regardless of debugfs.
+-	local sta_json="" band
+-	for band in 0 1 2; do
+-		local stats=$(
+-			for iface in $(iw dev 2>/dev/null | awk '/Interface phy0\.'$band'-/{print $2}'); do
+-				iw dev "$iface" station dump 2>/dev/null
+-			done | awk '
+-			BEGIN { n=0; tp=0; tr=0 }
+-			/^Station/ { n++ }
+-			/tx packets:/ { tp += $3 }
+-			/tx retries:/ { tr += $3 }
+-			END { printf "%d %d %d", n, tp, tr }'
+-		)
+-		set -- $stats
+-		[ -n "$sta_json" ] && sta_json="${sta_json},"
+-		sta_json="${sta_json}{\"band\":${band},\"count\":${1:-0},\"tx_packets\":${2:-0},\"tx_retries\":${3:-0}}"
+-	done
+-
+-	# PLE/HIF pool from hw-queues — drops toward zero before mt7996 SER.
+-	local hw_queues="/sys/kernel/debug/ieee80211/phy0/mt76/hw-queues"
+-	local ple_free=0 hif_used=0 hif_reserved=0
+-	if [ -f "$hw_queues" ]; then
+-		local hex
+-		hex=$(awk '/Total free page:/ {print $4; exit}' "$hw_queues" 2>/dev/null)
+-		[ -n "$hex" ] && ple_free=$(printf "%d" "$hex" 2>/dev/null || echo 0)
+-		hex=$(awk '/HIF free page:/ {print $6; exit}' "$hw_queues" 2>/dev/null)
+-		[ -n "$hex" ] && hif_reserved=$(printf "%d" "$hex" 2>/dev/null || echo 0)
+-		hex=$(awk '/HIF free page:/ {print $8; exit}' "$hw_queues" 2>/dev/null)
+-		[ -n "$hex" ] && hif_used=$(printf "%d" "$hex" 2>/dev/null || echo 0)
+-	fi
+-
+-	printf '{"ple_free":%d,"hif_used":%d,"hif_reserved":%d,"tx_queues":[],"station_counts":[%s]}' \
+-		"$ple_free" "$hif_used" "$hif_reserved" "$sta_json"
+-}
+-
+-
+-
+-
+-get_frame_engine() {
+-	if ! command -v devmem > /dev/null 2>&1; then
+-		echo '{"error":"devmem not available"}'
+-		return
+-	fi
+-
+-	# PSE queue status (IQ=hi16, OQ=lo16) and drop counts for each port
+-	local i reg_q reg_d pse_ports=""
+-	for i in 0 1 2 3 4 5 6 7 8 9; do
+-		reg_q=$(printf "0x%x" $((0x1fb50150 + i * 4)))
+-		reg_d=$(printf "0x%x" $((0x1fb50120 + i * 4)))
+-		local qval=$(($(devmem $reg_q)))
+-		local dval=$(($(devmem $reg_d)))
+-		local iq=$(( (qval >> 16) & 0xFFFF ))
+-		local oq=$(( qval & 0xFFFF ))
+-		[ -n "$pse_ports" ] && pse_ports="${pse_ports},"
+-		pse_ports="${pse_ports}{\"port\":${i},\"iq\":${iq},\"oq\":${oq},\"drops\":${dval}}"
+-	done
+-
+-	# PSE shared buffer
+-	local psb=$(($(devmem 0x1fb50104)))
+-	local pse_used=$(( (psb >> 16) & 0xFFFF ))
+-	local pse_free=$(( psb & 0x7FFF ))
+-
+-	# GDM counters (TX_OK, TX_DROP, RX_OK, RX_FC_DROP, RX_OVER_DROP)
+-	# Read as hex to handle large 32-bit counters
+-	local gdm1_tx=$(($(devmem 0x1fb50604)))
+-	local gdm1_txd=$(($(devmem 0x1fb50608)))
+-	local gdm1_rx=$(($(devmem 0x1fb50648)))
+-	local gdm1_rxd=$(($(devmem 0x1fb5064c)))
+-
+-	local gdm2_tx=$(($(devmem 0x1fb51604)))
+-	local gdm2_txd=$(($(devmem 0x1fb51608)))
+-	local gdm2_rx=$(($(devmem 0x1fb51648)))
+-	local gdm2_rxd=$(($(devmem 0x1fb5164c)))
+-
+-	local gdm4_tx=$(($(devmem 0x1fb52604)))
+-	local gdm4_txd=$(($(devmem 0x1fb52608)))
+-	local gdm4_rx=$(($(devmem 0x1fb52648)))
+-	local gdm4_rxd=$(($(devmem 0x1fb5264c)))
+-
+-	# CDM counters (TX_OK, RXCPU_OK, RXHWF_OK, RXCPU_DROP, RXHWF_DROP)
+-	local cdm1_tx=$(($(devmem 0x1fb50580)))
+-	local cdm1_rxcpu=$(($(devmem 0x1fb50590)))
+-	local cdm1_rxhwf=$(($(devmem 0x1fb50594)))
+-	local cdm1_rxcpud=$(($(devmem 0x1fb505a0)))
+-	local cdm1_rxhwfd=$(($(devmem 0x1fb505a4)))
+-
+-	local cdm2_tx=$(($(devmem 0x1fb51580)))
+-	local cdm2_rxcpu=$(($(devmem 0x1fb51590)))
+-	local cdm2_rxhwf=$(($(devmem 0x1fb51594)))
+-	local cdm2_rxcpud=$(($(devmem 0x1fb515a0)))
+-	local cdm2_rxhwfd=$(($(devmem 0x1fb515a4)))
+-
+-	printf '{"pse_ports":[%s],"pse_used":%d,"pse_free":%d,' "$pse_ports" "$pse_used" "$pse_free"
+-	printf '"gdm1":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm1_tx" "$gdm1_txd" "$gdm1_rx" "$gdm1_rxd"
+-	printf '"gdm2":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm2_tx" "$gdm2_txd" "$gdm2_rx" "$gdm2_rxd"
+-	printf '"gdm4":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm4_tx" "$gdm4_txd" "$gdm4_rx" "$gdm4_rxd"
+-	printf '"cdm1":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d},' "$cdm1_tx" "$cdm1_rxcpu" "$cdm1_rxhwf" "$cdm1_rxcpud" "$cdm1_rxhwfd"
+-	printf '"cdm2":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}}' "$cdm2_tx" "$cdm2_rxcpu" "$cdm2_rxhwf" "$cdm2_rxcpud" "$cdm2_rxhwfd"
+-}
+-
+-get_tx_stats() {
+-	local stats_file="/sys/kernel/debug/ieee80211/phy0/mt76/tx_stats"
+-
+-	if [ ! -f "$stats_file" ]; then
+-		echo '{"bands":[]}'
+-		return
+-	fi
+-
+-	awk '
+-	BEGIN {
+-		band = -1
+-		printf "{\"bands\":["
+-		first = 1
+-	}
+-	/Phy band [0-9]/ {
+-		if (band >= 0) {
+-			if (!first) printf ","
+-			first = 0
+-			drops = attempts - success
+-			if (drops < 0) drops = 0
+-			printf "{\"band\":%d,\"attempts\":%d,\"success\":%d,\"drops\":%d,\"per\":%d,\"ba_miss\":%d}", \
+-				band, attempts, success, drops, per, ba_miss
+-		}
+-		gsub(/.*band /, ""); band = $1 + 0
+-		attempts = 0; success = 0; per = 0; ba_miss = 0
+-	}
+-	/BA miss count:/ { ba_miss = $NF + 0 }
+-	/Tx attempts:/ { attempts = $3 + 0 }
+-	/Tx success:/ { success = $3 + 0 }
+-	/Tx PER:/ { p = $NF; gsub(/%/, "", p); per = p + 0 }
+-	END {
+-		if (band >= 0) {
+-			if (!first) printf ","
+-			drops = attempts - success
+-			if (drops < 0) drops = 0
+-			printf "{\"band\":%d,\"attempts\":%d,\"success\":%d,\"drops\":%d,\"per\":%d,\"ba_miss\":%d}", \
+-				band, attempts, success, drops, per, ba_miss
+-		}
+-		printf "]}"
+-	}
+-	' "$stats_file" 2>/dev/null || echo '{"bands":[]}'
+-}
+-
+-get_vlan_offload() {
+-	local val
+-	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null)
+-	printf '{"enabled":%d}' "${val:-0}"
+-}
+-
+-set_vlan_offload() {
+-	local enabled
+-	enabled=$(echo "$1" | jsonfilter -e "@.enabled" 2>/dev/null)
+-
+-	# jsonfilter returns empty string for integer 0; treat empty as 0
+-	[ -z "$enabled" ] && enabled="0"
+-
+-	if [ "$enabled" != "0" ] && [ "$enabled" != "1" ]; then
+-		echo '{"error":"enabled must be 0 or 1"}'
+-		return
+-	fi
+-
+-	if ! echo "$enabled" > /proc/sys/net/bridge/bridge-nf-filter-vlan-tagged 2>/dev/null; then
+-		echo '{"error":"failed - bridge module may not be loaded"}'
+-		return
+-	fi
+-
+-	# Persist across reboots
+-	echo "net.bridge.bridge-nf-filter-vlan-tagged=$enabled" > /etc/sysctl.d/14-vlan-offload.conf
+-	chmod 644 /etc/sysctl.d/14-vlan-offload.conf
+-	printf '{"result":"ok","enabled":%d}' "$enabled"
+-}
+-
+-get_flow_offload() {
+-	local fo foh
+-	fo=$(uci get firewall.@defaults[0].flow_offloading 2>/dev/null)
+-	foh=$(uci get firewall.@defaults[0].flow_offloading_hw 2>/dev/null)
+-	if [ "$fo" = "1" ] && [ "$foh" = "1" ]; then
+-		printf '{"enabled":1}'
+-	else
+-		printf '{"enabled":0}'
+-	fi
+-}
+-
+-set_flow_offload() {
+-	local enabled
+-	enabled=$(echo "$1" | jsonfilter -e "@.enabled" 2>/dev/null)
+-
+-	[ -z "$enabled" ] && enabled="0"
+-
+-	if [ "$enabled" != "0" ] && [ "$enabled" != "1" ]; then
+-		echo '{"error":"enabled must be 0 or 1"}'
+-		return
+-	fi
+-
+-	if [ "$enabled" = "1" ]; then
+-		uci set firewall.@defaults[0].flow_offloading='1'
+-		uci set firewall.@defaults[0].flow_offloading_hw='1'
+-	else
+-		uci delete firewall.@defaults[0].flow_offloading 2>/dev/null
+-		uci delete firewall.@defaults[0].flow_offloading_hw 2>/dev/null
+-	fi
+-	uci commit firewall
+-	# Emit the same config.change event rpcd sends after a LuCI commit,
+-	# so procd reloads all firewall subscribers (firewall itself plus
+-	# bridge-hw-offload) instead of only firewall.
+-	ubus call service event '{ "type": "config.change", "data": { "package": "firewall" } }' >/dev/null 2>&1
+-	/etc/init.d/firewall reload >/dev/null 2>&1 &
+-	printf '{"result":"ok","enabled":%d}' "$enabled"
+-}
+-
+-get_pppoe_offload() {
+-	local val
+-	val=$(cat /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null)
+-	printf '{"enabled":%d}' "${val:-0}"
+-}
+-
+-set_pppoe_offload() {
+-	local enabled
+-	enabled=$(echo "$1" | jsonfilter -e "@.enabled" 2>/dev/null)
+-
+-	[ -z "$enabled" ] && enabled="0"
+-
+-	if [ "$enabled" != "0" ] && [ "$enabled" != "1" ]; then
+-		echo '{"error":"enabled must be 0 or 1"}'
+-		return
+-	fi
+-
+-	if ! echo "$enabled" > /proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged 2>/dev/null; then
+-		echo '{"error":"failed - bridge module may not be loaded"}'
+-		return
+-	fi
+-
+-	# Persist across reboots
+-	echo "net.bridge.bridge-nf-filter-pppoe-tagged=$enabled" > /etc/sysctl.d/15-pppoe-offload.conf
+-	chmod 644 /etc/sysctl.d/15-pppoe-offload.conf
+-	printf '{"result":"ok","enabled":%d}' "$enabled"
+-}
+-
+-get_device_mode() {
+-	local mode="router"
+-	local reason=""
+-
+-	# Primary check: has the user explicitly configured this as a dumb AP?
+-	local dhcp_ignore
+-	dhcp_ignore=$(uci get dhcp.lan.ignore 2>/dev/null)
+-	if [ "$dhcp_ignore" = "1" ]; then
+-		mode="ap"
+-		reason="dhcp_disabled"
+-	fi
+-
+-	# Secondary check: is the WAN interface up with a real IP?
+-	if [ "$mode" = "router" ]; then
+-		local wan_up wan_ip
+-		wan_up=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@.up" 2>/dev/null)
+-		wan_ip=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@['ipv4-address'][0].address" 2>/dev/null)
+-		if [ "$wan_up" != "true" ] || [ -z "$wan_ip" ]; then
+-			mode="ap"
+-			reason="no_wan"
+-		fi
+-	fi
+-
+-	# Fallback: check if default route points to a local gateway (upstream router)
+-	if [ "$mode" = "router" ]; then
+-		local gw
+-		gw=$(ip route show default 2>/dev/null | awk '/default via/{print $3; exit}')
+-		if [ -n "$gw" ]; then
+-			# If gateway is in 192.168.x.x or 10.x.x.x range, we're behind another router
+-			case "$gw" in
+-				192.168.*.*|10.*.*.*)
+-					# Only treat as AP if we have no public WAN IP
+-					local wan_ip2
+-					wan_ip2=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@['ipv4-address'][0].address" 2>/dev/null)
+-					if [ -z "$wan_ip2" ]; then
+-						mode="ap"
+-						reason="local_gateway"
+-					fi
+-					;;
+-			esac
+-		fi
+-	fi
+-
+-	printf '{"mode":"%s","reason":"%s"}' "$mode" "$reason"
+-}
+-
+-
+-get_wan_health() {
+-	# Get WAN interface logical status
+-	local wan_status
+-	wan_status=$(ubus call network.interface.wan status 2>/dev/null)
+-
+-	if [ -z "$wan_status" ]; then
+-		echo '{"available":false}'
+-		return
+-	fi
+-
+-	local up l3_device uptime
+-	up=$(echo "$wan_status" | jsonfilter -e "@.up" 2>/dev/null)
+-	l3_device=$(echo "$wan_status" | jsonfilter -e "@.l3_device" 2>/dev/null)
+-	uptime=$(echo "$wan_status" | jsonfilter -e "@.uptime" 2>/dev/null)
+-
+-	# Get device-level statistics via ip -s link
+-	local rx_bytes=0 tx_bytes=0 rx_errors=0 tx_errors=0 rx_dropped=0 tx_dropped=0 collisions=0
+-	if [ -n "$l3_device" ]; then
+-		local stats
+-		stats=$(ip -s link show "$l3_device" 2>/dev/null)
+-		if [ -n "$stats" ]; then
+-			# ip -s link output: RX line followed by bytes/packets/errors/dropped/...
+-			# TX line followed by same
+-			rx_bytes=$(echo "$stats" | awk '/^    [0-9]/{if(rx==1){print $1+0; rx=0}} /RX:/{rx=1}')
+-			tx_bytes=$(echo "$stats" | awk '/^    [0-9]/{if(tx==1){print $1+0; tx=0}} /TX:/{tx=1}')
+-			rx_errors=$(echo "$stats" | awk '/RX:/{getline; print $3+0}')
+-			tx_errors=$(echo "$stats" | awk '/TX:/{getline; print $3+0}')
+-			rx_dropped=$(echo "$stats" | awk '/RX:/{getline; print $4+0}')
+-			tx_dropped=$(echo "$stats" | awk '/TX:/{getline; print $4+0}')
+-		fi
+-	fi
+-
+-	printf '{"available":true,"up":%s,"device":"%s","uptime":%d,"rx_bytes":%d,"tx_bytes":%d,"rx_errors":%d,"tx_errors":%d,"rx_dropped":%d,"tx_dropped":%d}' \
+-		"${up:-false}" "${l3_device:-}" "${uptime:-0}" \
+-		"${rx_bytes:-0}" "${tx_bytes:-0}" \
+-		"${rx_errors:-0}" "${tx_errors:-0}" \
+-		"${rx_dropped:-0}" "${tx_dropped:-0}"
+-}
+-
+-get_jitter_result() {
+-	local result_file="/tmp/npu-jitter.json"
+-	if [ -f "$result_file" ]; then
+-		cat "$result_file"
+-	else
+-		echo '{"jitter":0,"last_ping":0,"samples":0,"target":"1.1.1.1","reachable":false,"available":false}'
+-	fi
+-}
+-
+-get_wifi_stats() {
+-	# Collect per-band station stats from all AP interfaces using iw.
+-	# MT7996 appears as a single phy0 with sub-interfaces (phy0.0-ap0,
+-	# phy0.1-ap0, phy0.2-ap0), so we loop over interfaces and detect
+-	# each one's actual operating frequency to classify its band.
+-
+-	if ! command -v iw > /dev/null 2>&1; then
+-		echo '{"available":false,"bands":[]}'
+-		return
+-	fi
+-
+-	# Find all AP interfaces
+-	local all_ifaces
+-	all_ifaces=$(iw dev 2>/dev/null | awk '/Interface/{iface=$2} /type AP/{print iface}')
+-
+-	[ -z "$all_ifaces" ] && { printf '{"available":true,"bands":[]}'; return; }
+-
+-	# Accumulate station dumps and interface names per band index (0=2.4G, 1=5G, 2=6G)
+-	local dump0="" dump1="" dump2=""
+-	local ifaces0="" ifaces1="" ifaces2=""
+-	# Per-band uplink rx_fragments (MLO: summed across each band's link-N dirs).
+-	local rxfrag0=0 rxfrag1=0 rxfrag2=0
+-	local is_mld=0   # set when an MLO (*-mld*) AP interface is present
+-
+-	for iface in $all_ifaces; do
+-		# MLO/MLD interface (e.g. ap-mld0): an MLD spans all bands under a
+-		# single netdev, so the phyX.N-apY name trick and the single-channel
+-		# frequency fallback don't apply. Classify each station by its
+-		# per-link debugfs instead (link-0/1/2 = 2.4/5/6 GHz on MT7996).
+-		case "$iface" in
+-		*-mld*)
+-			is_mld=1
+-			local mdbg="/sys/kernel/debug/ieee80211/phy0/netdev:${iface}/stations"
+-			local mfull b s bmacs bd frag
+-			mfull=$(iw dev "$iface" station dump 2>/dev/null)
+-			for b in 0 1 2; do
+-				case "$b" in
+-					0) ifaces0="${ifaces0} ${iface}" ;;
+-					1) ifaces1="${ifaces1} ${iface}" ;;
+-					2) ifaces2="${ifaces2} ${iface}" ;;
+-				esac
+-				bmacs=""; frag=0
+-				[ -d "$mdbg" ] && for s in "$mdbg"/*/; do
+-					if [ -d "${s}link-${b}" ]; then
+-						bmacs="${bmacs} $(basename "$s")"
+-						frag=$((frag + $(cat "${s}link-${b}/rx_fragments" 2>/dev/null || echo 0)))
+-					fi
+-				done
+-				case "$b" in 0) rxfrag0=$frag ;; 1) rxfrag1=$frag ;; 2) rxfrag2=$frag ;; esac
+-				[ -z "$bmacs" ] && continue
+-				# Keep the MLD station visible on every linked band for
+-				# counts/signal/rate, but STRIP its byte counters: iw shows one
+-				# MLD-aggregate value which would double-count into every band.
+-				# Per-band throughput for MLD traffic comes from the hw_
+-				# fields (MIB + fw stats) computed below instead.
+-				bd=$(printf '%s\n' "$mfull" | awk -v macs="$bmacs" '
+-					BEGIN { n = split(macs, a, " "); for (i = 1; i <= n; i++) want[tolower(a[i])] = 1 }
+-					/^Station/ { keep = (tolower($2) in want) }
+-					keep && /(tx|rx) bytes:/ { next }
+-					keep && /(tx|rx) duration:/ { next }
+-					keep { print }')
+-				case "$b" in
+-					0) dump0="${dump0}
+-${bd}" ;;
+-					1) dump1="${dump1}
+-${bd}" ;;
+-					2) dump2="${dump2}
+-${bd}" ;;
+-				esac
+-			done
+-			continue
+-			;;
+-		esac
+-
+-		# Determine band index.
+-		# Primary: parse interface name (phyX.N-apY → N is band index:
+-		#   0=2.4 GHz, 1=5 GHz, 2=6 GHz on MT7996).
+-		# Fallback: read operating frequency from iw dev info.
+-		local band_idx
+-		band_idx=$(printf '%s' "$iface" | sed -n 's/^[^.]*\.\([0-9][0-9]*\)-.*/\1/p')
+-
+-		if [ -z "$band_idx" ]; then
+-			local freq
+-			freq=$(iw dev "$iface" info 2>/dev/null | grep 'channel' | \
+-				grep -oE '[0-9]+' | awk '$0+0>1000{print $0+0; exit}')
+-			if [ -z "$freq" ] || [ "$freq" -le 0 ] 2>/dev/null; then
+-				continue
+-			elif [ "$freq" -ge 5925 ]; then
+-				band_idx=2
+-			elif [ "$freq" -ge 5000 ]; then
+-				band_idx=1
+-			else
+-				band_idx=0
+-			fi
+-		fi
+-
+-		# Always register interface for tx_bytes tracking (independent of client state)
+-		case "$band_idx" in
+-			0) ifaces0="${ifaces0} ${iface}" ;;
+-			1) ifaces1="${ifaces1} ${iface}" ;;
+-			2) ifaces2="${ifaces2} ${iface}" ;;
+-		esac
+-
+-		# Standard (non-MLO) per-band uplink rx_fragments. Each band is its own
+-		# AP netdev and the station's rx_fragments sits DIRECTLY under
+-		# stations/<MAC>/ (no link-N subdir, unlike the MLD case above). Sum this
+-		# iface's clients into the band total so the gauge's uplink half lights up
+-		# on a standard 3-radio setup too. Additive — MLO path unaffected.
+-		local sdbg="/sys/kernel/debug/ieee80211/phy0/netdev:${iface}/stations"
+-		local ss sfrag=0
+-		[ -d "$sdbg" ] && for ss in "$sdbg"/*/; do
+-			[ -f "${ss}rx_fragments" ] && sfrag=$((sfrag + $(cat "${ss}rx_fragments" 2>/dev/null || echo 0)))
+-		done
+-		case "$band_idx" in
+-			0) rxfrag0=$((rxfrag0 + sfrag)) ;;
+-			1) rxfrag1=$((rxfrag1 + sfrag)) ;;
+-			2) rxfrag2=$((rxfrag2 + sfrag)) ;;
+-		esac
+-
+-		# Station dump for client stats — skip band if no clients
+-		local d
+-		d=$(iw dev "$iface" station dump 2>/dev/null)
+-		[ -z "$d" ] && continue
+-
+-		case "$band_idx" in
+-			0) dump0="${dump0}
+-${d}" ;;
+-			1) dump1="${dump1}
+-${d}" ;;
+-			2) dump2="${dump2}
+-${d}" ;;
+-		esac
+-	done
+-
+-	# Compute per-band TX throughput from mac80211 per-station tx bytes.
+-	# The sysfs netdev tx_bytes counter is bypassed by MT7996 HW DMA.
+-	# iw station dump 'tx bytes:' comes from mac80211 per-sta counters
+-	# which are updated before frames enter the hardware TX queue.
+-	local now; now=$(date +%s 2>/dev/null || awk '{printf "%d",$1}' /proc/uptime)
+-
+-	# Per-band tx+rx byte totals (mac80211 per-sta counters via iw). expected
+-	# throughput reads 0 on MT7996 fw, so the gauge needle is driven from these
+-	# real byte deltas instead. Both directions so uploads light the gauge too.
+-	local sta_tx0 sta_tx1 sta_tx2 sta_rx0 sta_rx1 sta_rx2
+-	sta_tx0=$(printf '%s\n' "$dump0" | awk '/tx bytes:/{t+=$NF} END{printf "%d",t+0}')
+-	sta_tx1=$(printf '%s\n' "$dump1" | awk '/tx bytes:/{t+=$NF} END{printf "%d",t+0}')
+-	sta_tx2=$(printf '%s\n' "$dump2" | awk '/tx bytes:/{t+=$NF} END{printf "%d",t+0}')
+-	sta_rx0=$(printf '%s\n' "$dump0" | awk '/rx bytes:/{t+=$NF} END{printf "%d",t+0}')
+-	sta_rx1=$(printf '%s\n' "$dump1" | awk '/rx bytes:/{t+=$NF} END{printf "%d",t+0}')
+-	sta_rx2=$(printf '%s\n' "$dump2" | awk '/rx bytes:/{t+=$NF} END{printf "%d",t+0}')
+-
+-	# awk reads OLD prev_file and computes Mbps deltas before we overwrite it.
+-	# prev format: now tx0 tx1 tx2 rx0 rx1 rx2  (7 fields; older 4-field files
+-	# just skip the rx delta for one poll)
+-	local _rates
+-	_rates=$(awk -v now="$now" \
+-		-v t0="$sta_tx0" -v t1="$sta_tx1" -v t2="$sta_tx2" \
+-		-v r0="$sta_rx0" -v r1="$sta_rx1" -v r2="$sta_rx2" \
+-		'BEGIN {
+-			pf = "/tmp/npu-wifi-bytes.prev"
+-			tx0="0.0"; tx1="0.0"; tx2="0.0"; rx0="0.0"; rx1="0.0"; rx2="0.0"
+-			if ((getline line < pf) > 0) {
+-				n = split(line, a)
+-				pt = a[1]+0; dt = now - pt
+-				if (pt > 0 && now > pt) {
+-					d=t0-a[2]; if(d<0)d=0; tx0=sprintf("%.1f", d/dt/125000)
+-					d=t1-a[3]; if(d<0)d=0; tx1=sprintf("%.1f", d/dt/125000)
+-					d=t2-a[4]; if(d<0)d=0; tx2=sprintf("%.1f", d/dt/125000)
+-					if (n >= 7) {
+-						d=r0-a[5]; if(d<0)d=0; rx0=sprintf("%.1f", d/dt/125000)
+-						d=r1-a[6]; if(d<0)d=0; rx1=sprintf("%.1f", d/dt/125000)
+-						d=r2-a[7]; if(d<0)d=0; rx2=sprintf("%.1f", d/dt/125000)
++#!/usr/bin/env ucode
++
++// Airoha FlowSense RPC backend (ucode plugin for rpcd-mod-ucode).
++//
++// Ported from Gilly r7. Run as an rpcd exec plugin: one ucode process per
++// query replaces shell pipelines while isolating kernel-blocked Wi-Fi reads
++// from the rpcd event loop. A native in-process plugin is unsafe on this driver.
++// backend.sh is kept alongside as a manual fallback/debug tool; nothing calls it.
++
++'use strict';
++
++import { readfile, writefile, open, popen, glob, lsdir, stat, chmod } from 'fs';
++import { cursor } from 'uci';
++import { connect } from 'ubus';
++import * as nl from 'nl80211';
++
++const PPE_BIND = '/sys/kernel/debug/ppe/bind';
++const PPE_ENTRIES = '/sys/kernel/debug/ppe/entries';
++const PHY_DBG = '/sys/kernel/debug/ieee80211/phy0';
++const JITTER_FILE = '/tmp/npu-jitter.json';
++
++let ubus_conn;
++
++function ubus_call(obj, method, args) {
++	if (!ubus_conn)
++		ubus_conn = connect();
++	return ubus_conn?.call(obj, method, args ?? {});
++}
++
++function slurp(path) {
++	return readfile(path);
++}
++
++function slurp_lines(path) {
++	const data = readfile(path);
++	return data ? split(data, '\n') : [];
++}
++
++function num(value, dflt) {
++	if (value == null)
++		return dflt ?? 0;
++	const n = +trim('' + value);
++	return (n == n) ? n : (dflt ?? 0);
++}
++
++function read_num(path, dflt) {
++	return num(readfile(path), dflt);
++}
++
++function read_str(path, dflt) {
++	const v = readfile(path);
++	return v != null ? trim(v) : (dflt ?? '');
++}
++
++// like $(cat file): strip the trailing newline only, keep inner/trailing spaces
++function read_line_raw(path, dflt) {
++	let v = readfile(path);
++	if (v == null)
++		return dflt ?? '';
++	while (length(v) && (substr(v, -1) == '\n' || substr(v, -1) == '\r'))
++		v = substr(v, 0, length(v) - 1);
++	return v;
++}
++
++// busybox devmem prints "0xNNNNNNNN"; ucode has no int(str, base)
++function hexval(s) {
++	if (!s)
++		return 0;
++	s = trim(s);
++	if (index(s, '0x') == 0 || index(s, '0X') == 0)
++		s = substr(s, 2);
++	let v = 0;
++	for (let i = 0; i < length(s); i++) {
++		const c = ord(s, i);
++		let d = -1;
++		if (c >= 48 && c <= 57) d = c - 48;
++		else if (c >= 97 && c <= 102) d = c - 87;
++		else if (c >= 65 && c <= 70) d = c - 55;
++		else break;
++		v = v * 16 + d;
++	}
++	return v;
++}
++
++// One shell for N registers instead of one per register
++function devmem_many(addrs) {
++	const cmd = join('; ', map(addrs, a => sprintf('devmem 0x%x', a)));
++	const p = popen(cmd);
++	if (!p)
++		return [];
++	const out = p.read('all');
++	p.close();
++	const vals = [];
++	for (let line in split(trim(out ?? ''), '\n'))
++		push(vals, hexval(line));
++	return vals;
++}
++
++function count_hex_lines(path) {
++	let n = 0;
++	for (let line in slurp_lines(path))
++		if (match(line, /^[0-9a-fA-F]/))
++			n++;
++	return n;
++}
++
++// AP interfaces from netlink, with the band index encoded in phyN.<band>-...
++function ap_interfaces() {
++	const res = nl.request(nl.const.NL80211_CMD_GET_INTERFACE, nl.const.NLM_F_DUMP) ?? [];
++	const out = [];
++	for (let i in res) {
++		if (!i.ifname)
++			continue;
++		if (i.iftype != null && i.iftype != nl.const.NL80211_IFTYPE_AP)
++			continue;
++		const m = match(i.ifname, /^[^.]+\.([0-9]+)-/);
++		let band = m ? +m[1] : null;
++		if (band == null) {
++			const freq = i.wiphy_freq ?? 0;
++			if (freq >= 5925) band = 2;
++			else if (freq >= 5000) band = 1;
++			else if (freq > 0) band = 0;
++		}
++		push(out, { ifname: i.ifname, band, mld: (index(i.ifname, '-mld') >= 0) });
++	}
++	return out;
++}
++
++function stations(ifname) {
++	return nl.request(nl.const.NL80211_CMD_GET_STATION, nl.const.NLM_F_DUMP, { dev: ifname }) ?? [];
++}
++
++
++// dmesg only grows; the NPU reservations are printed once at boot
++let npu_regions_cache;
++function npu_memory_regions() {
++	if (npu_regions_cache != null)
++		return npu_regions_cache;
++	const p = popen('dmesg');
++	if (!p)
++		return [];
++	const out = p.read('all') ?? '';
++	p.close();
++	const regions = [];
++	for (let line in split(out, '\n')) {
++		if (!match(line, /reserved mem.*npu/))
++			continue;
++		if (length(regions) >= 4)
++			break;
++		const range = match(line, /0x([0-9a-fA-F]+)\.\.0x([0-9a-fA-F]+)/);
++		const size = match(line, /\(([0-9]+ [KMG]i?B)\)/);
++		const name = match(line, /non-reusable ([^ @]+)/);
++		if (!range)
++			continue;
++		push(regions, {
++			name: name ? name[1] : '',
++			start: `0x${range[1]}`,
++			end: `0x${range[2]}`,
++			size: size ? size[1] : ''
++		});
++	}
++	if (length(regions))
++		npu_regions_cache = regions;
++	return regions;
++}
++
++// firmware blob never changes while rpcd runs
++let npu_version_cache;
++function npu_version() {
++	if (npu_version_cache != null)
++		return npu_version_cache;
++	npu_version_cache = 'Unknown';
++	const p = popen("strings /lib/firmware/airoha/en7581_MT7996_npu_rv32.bin 2>/dev/null | " +
++		"grep -oE '([0-9]+\\.[0-9]+\\.[0-9]+-)?TLB[0-9.]+[-_v0-9]*' | head -1");
++	if (p) {
++		const out = trim(p.read('all') ?? '');
++		p.close();
++		if (out != '')
++			npu_version_cache = out;
++	}
++	return npu_version_cache;
++}
++
++function wan_device() {
++	return ubus_call('network.interface.wan', 'status')?.l3_device;
++}
++
++function iface_stat(dev, name) {
++	return read_num(`/sys/class/net/${dev}/statistics/${name}`, 0);
++}
++
++function set_sysctl_toggle(req, proc_path, conf_path, conf_key) {
++	let enabled = req.args?.enabled;
++	enabled = (enabled == null) ? 0 : +enabled;
++	if (enabled != 0 && enabled != 1)
++		return { error: 'enabled must be 0 or 1' };
++	const fd = open(proc_path, 'w');
++	if (!fd)
++		return { error: 'failed - bridge module may not be loaded' };
++	fd.write(`${enabled}`);
++	fd.close();
++	writefile(conf_path, `${conf_key}=${enabled}\n`);
++	chmod(conf_path, 0o644);
++	return { result: 'ok', enabled };
++}
++
++// ---------------------------------------------------------------- PPE tables
++
++function parse_ppe(path, state_filter, limit) {
++	const out = { total: 0, ipv4: 0, ipv6: 0, entries: [] };
++	for (let line in slurp_lines(path)) {
++		if (!match(line, /^[0-9a-fA-F]+ /))
++			continue;
++		const f = split(trim(line), /\s+/);
++		const state = f[1];
++		if (state_filter != '' && state != state_filter)
++			continue;
++		out.total++;
++		if (f[2] == 'IPv4') out.ipv4++;
++		if (f[2] == 'IPv6') out.ipv6++;
++		if (length(out.entries) >= limit)
++			continue;
++
++		let type = f[2], subtype = f[3] ?? '';
++		if (f[2] != 'IPv4' && f[2] != 'IPv6' && (f[2] == 'L2B' || f[3] == 'L2B')) {
++			type = 'L2B';
++			subtype = '';
++		}
++		const orig = match(line, /orig=([^ \t]+)/);
++		const nf = match(line, /new=([^ \t]+)/);
++		const eth = match(line, /eth=([^ \t]+)/);
++		push(out.entries, {
++			index: f[0], state, type, proto: subtype,
++			orig: orig ? orig[1] : '',
++			new_flow: nf ? nf[1] : '',
++			eth: eth ? eth[1] : ''
++		});
++	}
++	return out;
++}
++
++// per-band client MACs; an MLD station counts on every band it holds a link on
++function station_macs_by_band() {
++	const bands = [ [], [], [] ];
++	let mlo = false;
++	for (let ifc in ap_interfaces()) {
++		if (ifc.mld) {
++			mlo = true;
++			for (let dir in glob(`${PHY_DBG}/netdev:${ifc.ifname}/stations/*`) ?? []) {
++				const mac = lc(substr(dir, rindex(dir, '/') + 1));
++				for (let b = 0; b < 3; b++)
++					if (stat(`${dir}/link-${b}`)?.type == 'directory')
++						push(bands[b], mac);
++			}
++			continue;
++		}
++		if (ifc.band == null || ifc.band > 2)
++			continue;
++		for (let s in stations(ifc.ifname))
++			if (s.mac)
++				push(bands[ifc.band], lc(s.mac));
++	}
++	return { bands, mlo };
++}
++
++function mac_in(list, haystack) {
++	if (!length(list) || !haystack)
++		return false;
++	const low = lc(haystack);
++	for (let m in list)
++		if (m != '' && index(low, m) >= 0)
++			return true;
++	return false;
++}
++
++function arp_ipv4_by_mac() {
++	const map = {};
++	let first = true;
++	for (let line in slurp_lines('/proc/net/arp')) {
++		if (first) { first = false; continue; }          // header
++		const f = split(trim(line), /\s+/);
++		if (length(f) < 4)
++			continue;
++		const ip = f[0], mac = lc(f[3]);
++		if (mac == '' || mac == '00:00:00:00:00:00' || map[mac] != null)
++			continue;
++		map[mac] = ip;
++	}
++	return map;
++}
++
++function dhcp_hostname_by_mac() {
++	const map = {};
++	for (let line in slurp_lines('/tmp/dhcp.leases')) {
++		const f = split(trim(line), /\s+/);
++		if (length(f) < 4)
++			continue;
++		const mac = lc(f[1]), host = f[3];
++		if (mac != '' && host != '' && host != '*')
++			map[mac] = host;
++	}
++	return map;
++}
++
++// one `bridge fdb show` instead of one per port
++function fdb_macs_by_port() {
++	const ports = {};
++	const p = popen('bridge fdb show 2>/dev/null');
++	if (!p)
++		return ports;
++	const out = p.read('all') ?? '';
++	p.close();
++	for (let line in split(out, '\n')) {
++		if (index(line, ' self') >= 0 || index(line, ' permanent') >= 0)
++			continue;
++		const f = split(trim(line), /\s+/);
++		if (length(f) < 3 || f[1] != 'dev')
++			continue;
++		if (!ports[f[2]])
++			ports[f[2]] = [];
++		push(ports[f[2]], lc(f[0]));
++	}
++	return ports;
++}
++
++// ------------------------------------------------------------- WiFi stats
++
++function round1(v) {
++	return +sprintf('%.1f', v);
++}
++
++function state_read(path) {
++	const raw = readfile(path);
++	if (!raw)
++		return null;
++	const f = split(trim(raw), /\s+/);
++	const out = [];
++	for (let v in f)
++		push(out, +v);
++	return length(out) ? out : null;
++}
++
++// mt76 per-band MAC counters (survive NPU offload)
++function band_bytes_mib() {
++	const mib = [ 0, 0, 0 ];
++	let band = -1;
++	for (let line in slurp_lines(`${PHY_DBG}/mt76/band_bytes`)) {
++		let m = match(line, /Phy band ([0-9]+)/);
++		if (m) { band = +m[1]; continue; }
++		m = match(line, /rx_ampdu_bytes:\s+([0-9]+)/);
++		if (m && band >= 0 && band < 3)
++			mib[band] = +m[1];
++	}
++	return mib;
++}
++
++// per-station firmware ADM tx_bytes, keyed by band
++function fw_tx_bytes_by_band() {
++	const tx = [ 0, 0, 0 ];
++	const paths = [];
++	for (let g in glob(`${PHY_DBG}/netdev:*/stations/*/stats`) ?? [])
++		push(paths, g);
++	for (let g in glob(`${PHY_DBG}/netdev:*/stations/*/link-*/stats`) ?? [])
++		push(paths, g);
++	for (let path in paths) {
++		let band = -1;
++		let m = match(path, /\/link-([0-9])\/stats$/);
++		if (m) band = +m[1];
++		else if ((m = match(path, /netdev:phy0\.([0-9])-/))) band = +m[1];
++		if (band < 0 || band > 2)
++			continue;
++		for (let line in slurp_lines(path)) {
++			const v = match(line, /^tx_bytes:\s+([0-9]+)/);
++			if (v) { tx[band] += +v[1]; break; }
++		}
++	}
++	return tx;
++}
++
++function tx_stats_by_band() {
++	const per = [ 0, 0, 0 ], txok = [ 0, 0, 0 ];
++	let band = -1;
++	for (let line in slurp_lines(`${PHY_DBG}/mt76/tx_stats`)) {
++		let m = match(line, /Phy band ([0-9]+)/);
++		if (m) { band = +m[1]; continue; }
++		if (band < 0 || band > 2)
++			continue;
++		if ((m = match(line, /Tx PER:\s+([0-9.]+)/))) per[band] = int(+m[1]);
++		else if ((m = match(line, /Tx success:\s+([0-9]+)/))) txok[band] = +m[1];
++	}
++	return { per, txok };
++}
++
++// CPU is independent of the optional ping service. Reuse a within-second
++// result instead of converting a zero interval into 0% on a second dashboard.
++function cpu_sample() {
++	const path = '/tmp/flowsense-cpu.json';
++	const line = match(readfile('/proc/stat') ?? '', /^cpu\s+([^\n]+)/);
++	if (!line) return { pct: null };
++	const c = map(split(trim(line[1]), /\s+/), v => +v);
++	let total = 0;
++	for (let i = 0; i < 8; i++) total += c[i] ?? 0;
++	const idle = c[3] + c[4], now = time();
++	let prev;
++	try { prev = json(readfile(path)); } catch (e) { }
++	if (prev && now == prev.time && total >= prev.total) return prev;
++	let pct = null;
++	if (prev && now > prev.time && now - prev.time <= 30 && total > prev.total && idle >= prev.idle)
++		pct = max(0, min(100, int(100.0 * (total - prev.total - idle + prev.idle) / (total - prev.total))));
++	const result = { time: now, total, idle, pct };
++	writefile(path, sprintf('%J', result));
++	return result;
++}
++
++const methods = {
++	getStatus: {
++		call: function() {
++			const drv = '/sys/bus/platform/drivers/airoha-npu';
++			let npu_device = '';
++			for (let e in lsdir(drv) ?? [])
++				if (match(e, /\.npu$/)) { npu_device = e; break; }
++
++			let npu_cores = 0;
++			for (let line in slurp_lines('/proc/interrupts'))
++				if (index(line, 'airoha-npu-wdt') >= 0)
++					npu_cores++;
++
++			let cpu_count = 0;
++			for (let e in lsdir('/sys/devices/system/cpu') ?? [])
++				if (match(e, /^cpu[0-9]+$/))
++					cpu_count++;
++
++			// PLL registers expose the real (possibly overclocked) frequency
++			let pll_freq = 0;
++			const regs = devmem_many([ 0x1fa202b4, 0x1fa202b8 ]);
++			if (length(regs) == 2) {
++				const pcw_int = (regs[0] >> 24) & 0x7F;
++				const posdiv = (regs[1] >> 4) & 7;
++				pll_freq = posdiv ? (pcw_int * 50 / (1 << posdiv)) : (pcw_int * 50);
++			}
++
++			const cpufreq = '/sys/devices/system/cpu/cpufreq/policy0';
++			return {
++				npu_version: npu_version(),
++				npu_loaded: (npu_device != ''),
++				npu_device,
++				npu_clock: read_num('/sys/kernel/debug/clk/npu/clk_rate', 0),
++				npu_cores,
++				offload_bound: count_hex_lines(PPE_BIND),
++				offload_total: count_hex_lines(PPE_ENTRIES),
++				memory_regions: npu_memory_regions(),
++				cpu_cur_freq: read_num(`${cpufreq}/scaling_cur_freq`, 0),
++				cpu_hw_freq: read_num(`${cpufreq}/cpuinfo_cur_freq`, 0),
++				cpu_governor: read_str(`${cpufreq}/scaling_governor`, 'unknown'),
++				cpu_avail_governors: read_line_raw(`${cpufreq}/scaling_available_governors`, ''),
++				cpu_min_freq: read_num(`${cpufreq}/scaling_min_freq`, 0),
++				cpu_max_freq: read_num(`${cpufreq}/scaling_max_freq`, 0),
++				cpu_avail_freqs: read_line_raw(`${cpufreq}/scaling_available_frequencies`, ''),
++				cpu_count,
++				pll_freq_mhz: int(pll_freq)
++			};
++		}
++	},
++
++	getPpeEntries: {
++		call: function() {
++			const bnd = parse_ppe(PPE_BIND, '', 25);
++			const unb = parse_ppe(PPE_ENTRIES, 'UNB', 25);
++
++			// the bind file is sometimes a plain count rather than a table
++			const raw = readfile(PPE_BIND);
++			if (raw != null) {
++				const direct = +trim(raw);
++				let lines = 0;
++				for (let l in split(raw, '\n'))
++					if (l != '') lines++;
++				const best = (direct == direct && direct > lines) ? direct : lines;
++				if (best > 0 && best > bnd.total)
++					bnd.total = best;
++			}
++
++			const sm = station_macs_by_band();
++			const fdb = fdb_macs_by_port();
++			const arp = arp_ipv4_by_mac();
++			const hosts = dhcp_hostname_by_mac();
++
++			const band_bnd = [ 0, 0, 0 ];
++			const port_bnd = [ 0, 0, 0, 0 ];
++			const client_bnd = [];
++			for (let b = 0; b < 3; b++)
++				for (let mac in sm.bands[b])
++					push(client_bnd, { mac, ip: arp[mac] ?? '', host: hosts[mac] ?? '', band: b, bnd: 0 });
++
++			const port_lists = [
++				fdb.lan1 ?? [], fdb.lan2 ?? [], fdb.lan3 ?? [], fdb.lan4 ?? []
++			];
++
++			for (let line in slurp_lines(PPE_BIND)) {
++				if (!match(line, /^[0-9a-fA-F]+ BND /))
++					continue;
++				const m = match(line, /eth=([^ \t]+)/);
++				if (!m)
++					continue;
++				const eth = lc(m[1]);
++				for (let b = 0; b < 3; b++)
++					if (mac_in(sm.bands[b], eth))
++						band_bnd[b]++;
++				for (let p = 0; p < 4; p++)
++					if (mac_in(port_lists[p], eth)) { port_bnd[p]++; break; }
++				for (let c in client_bnd)
++					if (index(eth, c.mac) >= 0)
++						c.bnd++;
++			}
++
++			// UNB rows carry no MAC: match the source IP against each band's clients
++			const band_ips = [ [], [], [] ];
++			for (let b = 0; b < 3; b++)
++				for (let mac in sm.bands[b])
++					if (arp[mac] != null)
++						push(band_ips[b], arp[mac]);
++
++			const band_unb = [ 0, 0, 0 ];
++			for (let line in slurp_lines(PPE_ENTRIES)) {
++				if (!match(line, /^[0-9a-fA-F]+ UNB /))
++					continue;
++				const m = match(line, /orig=([^ \t]+)/);
++				if (!m || substr(m[1], 0, 1) == '[')
++					continue;
++				const src = split(m[1], ':')[0];
++				for (let b = 0; b < 3; b++)
++					for (let ip in band_ips[b])
++						if (ip == src) { band_unb[b]++; break; }
++			}
++
++			bnd.band_bnd = band_bnd;
++			bnd.port_bnd = port_bnd;
++			bnd.client_bnd = client_bnd;
++			unb.band_unb = band_unb;
++			return { bnd, unb };
++		}
++	},
++
++	getTokenInfo: {
++		call: function() {
++			const counts = [];
++			for (let band = 0; band < 3; band++) {
++				let n = 0, tx_packets = 0, tx_retries = 0;
++				for (let ifc in ap_interfaces()) {
++					if (ifc.band != band || ifc.mld)
++						continue;
++					for (let s in stations(ifc.ifname)) {
++						n++;
++						tx_packets += s.sta_info?.tx_packets ?? 0;
++						tx_retries += s.sta_info?.tx_retries ?? 0;
+ 					}
+ 				}
+-			}
+-			printf "%s %s %s %s %s %s\n", tx0, tx1, tx2, rx0, rx1, rx2
+-		}' /dev/null)
+-	echo "$now $sta_tx0 $sta_tx1 $sta_tx2 $sta_rx0 $sta_rx1 $sta_rx2" > /tmp/npu-wifi-bytes.prev
+-	local tx0_mbps tx1_mbps tx2_mbps rx0_mbps rx1_mbps rx2_mbps
+-	tx0_mbps=$(echo "$_rates" | awk '{print $1}')
+-	tx1_mbps=$(echo "$_rates" | awk '{print $2}')
+-	tx2_mbps=$(echo "$_rates" | awk '{print $3}')
+-	rx0_mbps=$(echo "$_rates" | awk '{print $4}')
+-	rx1_mbps=$(echo "$_rates" | awk '{print $5}')
+-	rx2_mbps=$(echo "$_rates" | awk '{print $6}')
+-
+-	# HW (offload-surviving) per-band byte rates — exact where available:
+-	#  - hwrx (uplink): per-band MAC MIB rx_ampdu_bytes (mt76 band_bytes debugfs,
+-	#    driver patch 041). Counts at the MAC: sees NPU/WED-offloaded traffic AND
+-	#    every link of an MLD station. u32 accumulators -> modular delta.
+-	#  - hwtx (downlink): sum of per-station fw ADM tx_bytes ('stats' debugfs,
+-	#    driver patches 038/039). Exact for normal stations and an MLD's setup
+-	#    link; the fw does not account an MLD's secondary-link DL (air_mbps
+-	#    remains the fallback for that case). Legacy clients on an MLD SSID have
+-	#    no per-band path and are skipped here (covered by iw exact + air est).
+-	local hwrx0=0 hwrx1=0 hwrx2=0 hwtx0=0 hwtx1=0 hwtx2=0
+-	local BB=/sys/kernel/debug/ieee80211/phy0/mt76/band_bytes
+-	if [ -r "$BB" ]; then
+-		local mib_cur stx0=0 stx1=0 stx2=0 sf sv sb
+-		mib_cur=$(awk '/Phy band/{b=$3} /rx_ampdu_bytes:/{v[b]=$2} END{printf "%.0f %.0f %.0f", v[0]+0, v[1]+0, v[2]+0}' "$BB" 2>/dev/null)
+-		for sf in /sys/kernel/debug/ieee80211/phy0/netdev:*/stations/*/stats \
+-			  /sys/kernel/debug/ieee80211/phy0/netdev:*/stations/*/link-*/stats; do
+-			[ -r "$sf" ] || continue
+-			case "$sf" in
+-				*/link-0/stats) sb=0 ;;
+-				*/link-1/stats) sb=1 ;;
+-				*/link-2/stats) sb=2 ;;
+-				*netdev:phy0.0-*) sb=0 ;;
+-				*netdev:phy0.1-*) sb=1 ;;
+-				*netdev:phy0.2-*) sb=2 ;;
+-				*) continue ;;
+-			esac
+-			sv=$(awk '/^tx_bytes:/{print $2}' "$sf" 2>/dev/null)
+-			case "$sb" in
+-				0) stx0=$((stx0 + ${sv:-0})) ;;
+-				1) stx1=$((stx1 + ${sv:-0})) ;;
+-				2) stx2=$((stx2 + ${sv:-0})) ;;
+-			esac
+-		done
+-		local _hw
+-		_hw=$(awk -v now="$now" -v m="$mib_cur" -v t0="$stx0" -v t1="$stx1" -v t2="$stx2" '
+-			BEGIN {
+-				pf = "/tmp/npu-wifi-hwbytes.prev"
+-				r0="0.0"; r1="0.0"; r2="0.0"; x0="0.0"; x1="0.0"; x2="0.0"
+-				split(m, c)
+-				have = ((getline line < pf) > 0)
+-				close(pf)
+-				if (have) {
+-					n = split(line, a); pt = a[1]+0; dt = now - pt
+-					if (pt > 0 && now <= pt) {
+-						# same-second duplicate/concurrent call: replay the
+-						# stored rates WITHOUT moving the baseline, so a
+-						# double-polling frontend does not read 0 and reset
+-						# the delta window every tick.
+-						if (n >= 13) { r0=a[8]; r1=a[9]; r2=a[10]; x0=a[11]; x1=a[12]; x2=a[13] }
+-						printf "%s %s %s %s %s %s\n", r0, r1, r2, x0, x1, x2
+-						exit
++				push(counts, { band, count: n, tx_packets, tx_retries });
++			}
++
++			let ple_free = 0, hif_used = 0, hif_reserved = 0;
++			for (let line in slurp_lines(`${PHY_DBG}/mt76/hw-queues`)) {
++				let m = match(line, /Total free page:\s+(\S+)/);
++				if (m && !ple_free) ple_free = hexval(m[1]);
++				m = match(line, /HIF free page:\s+\S+\s+\S+\s+(\S+)\s+\S+\s+(\S+)/);
++				if (m && !hif_reserved) { hif_reserved = hexval(m[1]); hif_used = hexval(m[2]); }
++			}
++
++			return { ple_free, hif_used, hif_reserved, tx_queues: [], station_counts: counts };
++		}
++	},
++
++	getFrameEngine: {
++		call: function() {
++			const addrs = [];
++			for (let i = 0; i < 10; i++) push(addrs, 0x1fb50150 + i * 4);   // PSE queue
++			for (let i = 0; i < 10; i++) push(addrs, 0x1fb50120 + i * 4);   // PSE drops
++			push(addrs, 0x1fb50104);                                        // shared buffer
++			for (let base in [ 0x1fb50600, 0x1fb51600, 0x1fb52600 ])        // GDM1/2/4
++				for (let off in [ 0x04, 0x08, 0x48, 0x4c ])
++					push(addrs, base + off);
++			for (let base in [ 0x1fb50580, 0x1fb51580 ])                    // CDM1/2
++				for (let off in [ 0x00, 0x10, 0x14, 0x20, 0x24 ])
++					push(addrs, base + off);
++
++			const v = devmem_many(addrs);
++			if (length(v) != length(addrs))
++				return { error: 'devmem not available' };
++
++			const pse_ports = [];
++			for (let i = 0; i < 10; i++)
++				push(pse_ports, {
++					port: i,
++					iq: (v[i] >> 16) & 0xFFFF,
++					oq: v[i] & 0xFFFF,
++					drops: v[10 + i]
++				});
++
++			const psb = v[20];
++			let n = 21;
++			const gdm = [];
++			for (let g = 0; g < 3; g++, n += 4)
++				push(gdm, { tx: v[n], tx_drop: v[n + 1], rx: v[n + 2], rx_drop: v[n + 3] });
++			const cdm = [];
++			for (let c = 0; c < 2; c++, n += 5)
++				push(cdm, {
++					tx: v[n], rx_cpu: v[n + 1], rx_hwf: v[n + 2],
++					rx_cpu_drop: v[n + 3], rx_hwf_drop: v[n + 4]
++				});
++
++			return {
++				pse_ports,
++				pse_used: (psb >> 16) & 0xFFFF,
++				pse_free: psb & 0x7FFF,
++				gdm1: gdm[0], gdm2: gdm[1], gdm4: gdm[2],
++				cdm1: cdm[0], cdm2: cdm[1]
++			};
++		}
++	},
++
++	getTxStats: {
++		call: function() {
++			const bands = [];
++			let band = -1, attempts = 0, success = 0, per = 0, ba_miss = 0;
++			const flush = () => {
++				if (band < 0)
++					return;
++				let drops = attempts - success;
++				if (drops < 0) drops = 0;
++				push(bands, { band, attempts, success, drops, per, ba_miss });
++			};
++			for (let line in slurp_lines(`${PHY_DBG}/mt76/tx_stats`)) {
++				let m = match(line, /Phy band ([0-9]+)/);
++				if (m) {
++					flush();
++					band = +m[1]; attempts = 0; success = 0; per = 0; ba_miss = 0;
++					continue;
++				}
++				if ((m = match(line, /BA miss count:\s+([0-9]+)/))) ba_miss = +m[1];
++				else if ((m = match(line, /Tx attempts:\s+([0-9]+)/))) attempts = +m[1];
++				else if ((m = match(line, /Tx success:\s+([0-9]+)/))) success = +m[1];
++				else if ((m = match(line, /Tx PER:\s+([0-9.]+)/))) per = int(+m[1]);
++			}
++			flush();
++			return { bands };
++		}
++	},
++
++	getVlanOffload: {
++		call: function() {
++			return { enabled: read_num('/proc/sys/net/bridge/bridge-nf-filter-vlan-tagged', 0) };
++		}
++	},
++
++	setVlanOffload: {
++		args: { enabled: 0 },
++		call: function(req) {
++			return set_sysctl_toggle(req, '/proc/sys/net/bridge/bridge-nf-filter-vlan-tagged',
++				'/etc/sysctl.d/14-vlan-offload.conf', 'net.bridge.bridge-nf-filter-vlan-tagged');
++		}
++	},
++
++	getFlowOffload: {
++		call: function() {
++			const uci = cursor();
++			const fo = uci.get('firewall', '@defaults[0]', 'flow_offloading');
++			const foh = uci.get('firewall', '@defaults[0]', 'flow_offloading_hw');
++			return { enabled: (fo == '1' && foh == '1') ? 1 : 0 };
++		}
++	},
++
++	setFlowOffload: {
++		args: { enabled: 0 },
++		call: function(req) {
++			let enabled = req.args?.enabled;
++			enabled = (enabled == null) ? 0 : +enabled;
++			if (enabled != 0 && enabled != 1)
++				return { error: 'enabled must be 0 or 1' };
++			const uci = cursor();
++			if (enabled == 1) {
++				uci.set('firewall', '@defaults[0]', 'flow_offloading', '1');
++				uci.set('firewall', '@defaults[0]', 'flow_offloading_hw', '1');
++			} else {
++				uci.delete('firewall', '@defaults[0]', 'flow_offloading');
++				uci.delete('firewall', '@defaults[0]', 'flow_offloading_hw');
++			}
++			uci.commit('firewall');
++			system('/etc/init.d/firewall reload >/dev/null 2>&1 &');
++			return { result: 'ok', enabled };
++		}
++	},
++
++	getPppoeOffload: {
++		call: function() {
++			return { enabled: read_num('/proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged', 0) };
++		}
++	},
++
++	setPppoeOffload: {
++		args: { enabled: 0 },
++		call: function(req) {
++			return set_sysctl_toggle(req, '/proc/sys/net/bridge/bridge-nf-filter-pppoe-tagged',
++				'/etc/sysctl.d/15-pppoe-offload.conf', 'net.bridge.bridge-nf-filter-pppoe-tagged');
++		}
++	},
++
++	getDeviceMode: {
++		call: function() {
++			const uci = cursor();
++			if (uci.get('dhcp', 'lan', 'ignore') == '1')
++				return { mode: 'ap', reason: 'dhcp_disabled' };
++
++			const wan = ubus_call('network.interface.wan', 'status');
++			const wan_ip = wan?.['ipv4-address']?.[0]?.address;
++			if (wan?.up !== true || !wan_ip)
++				return { mode: 'ap', reason: 'no_wan' };
++
++			// behind another router: default gateway is RFC1918 and we have no WAN IP
++			for (let line in slurp_lines('/proc/net/route')) {
++				const f = split(line, /\s+/);
++				if (length(f) < 3 || f[1] != '00000000')
++					continue;
++				const g = f[2];
++				if (length(g) != 8)
++					continue;
++				const b = [];
++				for (let i = 6; i >= 0; i -= 2)
++					push(b, hexval(substr(g, i, 2)));
++				if ((b[0] == 192 && b[1] == 168) || b[0] == 10)
++					if (!wan_ip)
++						return { mode: 'ap', reason: 'local_gateway' };
++			}
++			return { mode: 'router', reason: '' };
++		}
++	},
++
++	getWanHealth: {
++		call: function() {
++			const wan = ubus_call('network.interface.wan', 'status');
++			if (!wan)
++				return { available: false };
++			const dev = wan.l3_device ?? '';
++			return {
++				available: true,
++				up: wan.up === true,
++				device: dev,
++				uptime: wan.uptime ?? 0,
++				rx_bytes: dev ? iface_stat(dev, 'rx_bytes') : 0,
++				tx_bytes: dev ? iface_stat(dev, 'tx_bytes') : 0,
++				rx_errors: dev ? iface_stat(dev, 'rx_errors') : 0,
++				tx_errors: dev ? iface_stat(dev, 'tx_errors') : 0,
++				rx_dropped: dev ? iface_stat(dev, 'rx_dropped') : 0,
++				tx_dropped: dev ? iface_stat(dev, 'tx_dropped') : 0
++			};
++		}
++	},
++
++	getJitterResult: {
++		call: function() {
++			const data = readfile(JITTER_FILE);
++			if (data) {
++				try { return json(data); } catch (e) { }
++			}
++			return {
++				jitter: 0, last_ping: 0, samples: 0,
++				target: '1.1.1.1', reachable: false, available: false
++			};
++		}
++	},
++
++	getWifiStats: {
++		call: function() {
++			const ifaces = ap_interfaces();
++			if (!length(ifaces))
++				return { available: true, bands: [] };
++
++			const acc = [];
++			for (let b = 0; b < 3; b++)
++				push(acc, {
++					stations: 0, tx_packets: 0, tx_retries: 0, tx_failed: 0,
++					sum_phy: 0, phy_n: 0, sum_sig: 0, sig_n: 0, min_sig: 0,
++					tx_bytes: 0, rx_bytes: 0, tx_dur: 0, rx_dur: 0,
++					sum_txrate: 0, txrate_n: 0, sum_rxrate: 0, rxrate_n: 0,
++					rxfrag: 0
++				});
++
++			const add_station = function(a, si, with_bytes) {
++				a.stations++;
++				a.tx_packets += si?.tx_packets ?? 0;
++				a.tx_retries += si?.tx_retries ?? 0;
++				a.tx_failed += si?.tx_failed ?? 0;
++				const txr = (si?.tx_bitrate?.bitrate32 ?? 0) / 10;   // 100kbps -> Mbps
++				const rxr = (si?.rx_bitrate?.bitrate32 ?? 0) / 10;
++				if (txr > 0) { a.sum_phy += txr; a.phy_n++; a.sum_txrate += txr; a.txrate_n++; }
++				if (rxr > 0) { a.sum_rxrate += rxr; a.rxrate_n++; }
++				const sig = si?.signal_avg;
++				if (sig != null) {
++					a.sum_sig += sig; a.sig_n++;
++					if (a.sig_n == 1 || sig < a.min_sig) a.min_sig = sig;
++				}
++				// an MLD station reports one aggregate byte/duration figure for all
++				// its links, so counting it per band would multiply the traffic
++				if (with_bytes) {
++					a.tx_bytes += si?.tx_bytes64 ?? 0;
++					a.rx_bytes += si?.rx_bytes64 ?? 0;
++					a.tx_dur += si?.tx_duration ?? 0;
++					a.rx_dur += si?.rx_duration ?? 0;
++				}
++			};
++
++			let mlo = false;
++			for (let ifc in ifaces) {
++				const base = `${PHY_DBG}/netdev:${ifc.ifname}/stations`;
++				if (ifc.mld) {
++					mlo = true;
++					const by_mac = {};
++					for (let s in stations(ifc.ifname))
++						if (s.mac) by_mac[lc(s.mac)] = s.sta_info;
++					for (let dir in glob(`${base}/*`) ?? []) {
++						const mac = lc(substr(dir, rindex(dir, '/') + 1));
++						for (let b = 0; b < 3; b++) {
++							if (stat(`${dir}/link-${b}`)?.type != 'directory')
++								continue;
++							if (by_mac[mac])
++								add_station(acc[b], by_mac[mac], false);
++							acc[b].rxfrag += read_num(`${dir}/link-${b}/rx_fragments`, 0);
++						}
+ 					}
+-					if (pt > 0 && now > pt) {
+-						for (b = 0; b < 3; b++) {
+-							d = c[b+1] - a[2+b]
+-							if (d < 0) d += 4294967296       # u32 wrap
+-							if (d < 0 || d > 2147483648) d = 0   # sanity
+-							mb[b] = d * 8 / dt / 1000000
++					continue;
++				}
++				if (ifc.band == null || ifc.band > 2)
++					continue;
++				const a = acc[ifc.band];
++				for (let s in stations(ifc.ifname))
++					add_station(a, s.sta_info, true);
++				for (let dir in glob(`${base}/*`) ?? [])
++					a.rxfrag += read_num(`${dir}/rx_fragments`, 0);
++			}
++
++			const now = time();
++
++			// --- mac80211 byte rates (exact when the flow is not offloaded)
++			const bytes_prev = state_read('/tmp/npu-wifi-bytes.prev');
++			const tx_mbps = [ 0, 0, 0 ], rx_mbps = [ 0, 0, 0 ];
++			if (bytes_prev && length(bytes_prev) >= 4) {
++				const dt = now - bytes_prev[0];
++				if (bytes_prev[0] > 0 && dt > 0)
++					for (let b = 0; b < 3; b++) {
++						let d = acc[b].tx_bytes - bytes_prev[1 + b];
++						if (d < 0) d = 0;
++						tx_mbps[b] = round1(d / dt / 125000);
++						if (length(bytes_prev) >= 7) {
++							d = acc[b].rx_bytes - bytes_prev[4 + b];
++							if (d < 0) d = 0;
++							rx_mbps[b] = round1(d / dt / 125000);
+ 						}
+-						r0=sprintf("%.1f",mb[0]); r1=sprintf("%.1f",mb[1]); r2=sprintf("%.1f",mb[2])
+-						d=t0-a[5]; if(d<0)d=0; x0=sprintf("%.1f", d*8/dt/1000000)
+-						d=t1-a[6]; if(d<0)d=0; x1=sprintf("%.1f", d*8/dt/1000000)
+-						d=t2-a[7]; if(d<0)d=0; x2=sprintf("%.1f", d*8/dt/1000000)
++					}
++			}
++			writefile('/tmp/npu-wifi-bytes.prev',
++				`${now} ${acc[0].tx_bytes} ${acc[1].tx_bytes} ${acc[2].tx_bytes} ` +
++				`${acc[0].rx_bytes} ${acc[1].rx_bytes} ${acc[2].rx_bytes}`);
++
++			// --- hardware rates: MAC MIB uplink + firmware ADM downlink
++			const hw_rx = [ 0, 0, 0 ], hw_tx = [ 0, 0, 0 ];
++			const mib = band_bytes_mib();
++			const fwtx = fw_tx_bytes_by_band();
++			if (stat(`${PHY_DBG}/mt76/band_bytes`)?.type == 'file') {
++				const hp = state_read('/tmp/npu-wifi-hwbytes.prev');
++				let replayed = false;
++				if (hp && length(hp) >= 13 && hp[0] > 0 && now <= hp[0]) {
++					// duplicate call within the same second: replay, keep the baseline
++					for (let b = 0; b < 3; b++) {
++						hw_rx[b] = hp[7 + b];
++						hw_tx[b] = hp[10 + b];
++					}
++					replayed = true;
++				} else if (hp && length(hp) >= 7 && hp[0] > 0 && now > hp[0]) {
++					const dt = now - hp[0];
++					for (let b = 0; b < 3; b++) {
++						let d = mib[b] - hp[1 + b];
++						if (d < 0) d += 4294967296;                 // u32 wrap
++						if (d < 0 || d > 2147483648) d = 0;
++						hw_rx[b] = round1(d * 8 / dt / 1000000);
++						d = fwtx[b] - hp[4 + b];
++						if (d < 0) d = 0;
++						hw_tx[b] = round1(d * 8 / dt / 1000000);
+ 					}
+ 				}
+-				printf "%d %.0f %.0f %.0f %.0f %.0f %.0f %s %s %s %s %s %s\n", now, c[1]+0, c[2]+0, c[3]+0, t0, t1, t2, r0, r1, r2, x0, x1, x2 > pf
+-				printf "%s %s %s %s %s %s\n", r0, r1, r2, x0, x1, x2
+-			}' /dev/null)
+-		hwrx0=$(echo "$_hw"|awk '{print $1}'); hwrx1=$(echo "$_hw"|awk '{print $2}'); hwrx2=$(echo "$_hw"|awk '{print $3}')
+-		hwtx0=$(echo "$_hw"|awk '{print $4}'); hwtx1=$(echo "$_hw"|awk '{print $5}'); hwtx2=$(echo "$_hw"|awk '{print $6}')
+-	fi
+-
+-	# Per-band Tx PER (packet error rate) from mt76 debugfs — the consistent
+-	# per-MPDU hardware error metric. Surfaced below as retry_pct because the
+-	# station-dump ratio (per-MPDU tx_retries vs per-MSDU tx_packets) over-reads
+-	# 2-5x on EHT/6 GHz and isn't a real health signal.
+-	local band_per_0=0 band_per_1=0 band_per_2=0
+-	local band_txok_0=0 band_txok_1=0 band_txok_2=0
+-	eval "$(awk '
+-		/Phy band [0-9]/ { b = $NF + 0 }
+-		/Tx PER:/ { v = $3; gsub(/%/, "", v); if (b >= 0 && b <= 2) printf "band_per_%d=%d;", b, v + 0 }
+-		/Tx success:/ { if (b >= 0 && b <= 2) printf "band_txok_%d=%.0f;", b, $3 + 0 }
+-	' /sys/kernel/debug/ieee80211/phy0/mt76/tx_stats 2>/dev/null)"
+-
+-	# Per-band total frame rate (frames/s): downlink Tx-success MPDUs (mt76 tx_stats,
+-	# per Phy band, survives NPU offload) + uplink rx_fragments (per link). Drives the
+-	# MLO per-band frames arc + BND glow (offload hides bytes, not frames).
+-	local fcur0=$((band_txok_0 + rxfrag0)) fcur1=$((band_txok_1 + rxfrag1)) fcur2=$((band_txok_2 + rxfrag2))
+-	local _fps frames0 frames1 frames2
+-	_fps=$(awk -v now="$now" -v c0="$fcur0" -v c1="$fcur1" -v c2="$fcur2" '
+-		BEGIN {
+-			pf = "/tmp/npu-wifi-frames.prev"
+-			f0="0"; f1="0"; f2="0"
+-			if ((getline line < pf) > 0) {
+-				n = split(line, a); pt = a[1]+0; dt = now - pt
+-				if (pt > 0 && now > pt) {
+-					d=c0-a[2]; if(d<0)d=0; f0=sprintf("%d", d/dt)
+-					d=c1-a[3]; if(d<0)d=0; f1=sprintf("%d", d/dt)
+-					d=c2-a[4]; if(d<0)d=0; f2=sprintf("%d", d/dt)
++				if (!replayed)
++					writefile('/tmp/npu-wifi-hwbytes.prev',
++						`${now} ${mib[0]} ${mib[1]} ${mib[2]} ${fwtx[0]} ${fwtx[1]} ${fwtx[2]} ` +
++						`${hw_rx[0]} ${hw_rx[1]} ${hw_rx[2]} ${hw_tx[0]} ${hw_tx[1]} ${hw_tx[2]}`);
++			}
++
++			// --- per-band PER + frame rate
++			const ts = tx_stats_by_band();
++			const fcur = [ 0, 0, 0 ], frames = [ 0, 0, 0 ];
++			for (let b = 0; b < 3; b++)
++				fcur[b] = ts.txok[b] + acc[b].rxfrag;
++			const fprev = state_read('/tmp/npu-wifi-frames.prev');
++			if (fprev && length(fprev) >= 4 && fprev[0] > 0 && now > fprev[0]) {
++				const dt = now - fprev[0];
++				for (let b = 0; b < 3; b++) {
++					let d = fcur[b] - fprev[1 + b];
++					if (d < 0) d = 0;
++					frames[b] = int(d / dt);
+ 				}
+ 			}
+-			printf "%s %s %s\n", f0, f1, f2
+-		}' /dev/null)
+-	echo "$now $fcur0 $fcur1 $fcur2" > /tmp/npu-wifi-frames.prev
+-	frames0=$(echo "$_fps" | awk '{print $1}')
+-	frames1=$(echo "$_fps" | awk '{print $2}')
+-	frames2=$(echo "$_fps" | awk '{print $3}')
+-
+-	# Per-band OFFLOADED throughput estimate from radio AIRTIME. Airtime survives NPU
+-	# offload (the MAC spends airtime on every frame regardless of who bridges it),
+-	# unlike the byte counters the NPU bypasses. Per band bytes ~= duration*bitrate,
+-	# deltaed over the poll interval, * efficiency to approximate goodput (retries +
+-	# PHY/MAC overhead). tx/rx duration + bitrate come from the station dumps already
+-	# collected above (no extra iw calls). Frontend uses this when a band is offloaded
+-	# (BND>0), the exact mac80211 byte-rate otherwise.
+-	#
+-	# EFFICIENCY IS AUTO-CALIBRATED per band: whenever a band carries real traffic but
+-	# is NOT offloaded (BND==0), the exact byte-rate IS the true throughput, so
+-	# exact/raw-airtime = the live efficiency for that band's RF/rate/retry conditions.
+-	# EMA-learn it and apply it when the band offloads. `npu-monitor.settings.air_eff`
+-	# (default 80) is the SEED/fallback until a band has a calibration sample.
+-	local AIR_EFF; AIR_EFF=$(uci -q get npu-monitor.settings.air_eff 2>/dev/null)
+-	case "$AIR_EFF" in ''|*[!0-9]*) AIR_EFF=80 ;; esac
+-	{ [ "$AIR_EFF" -ge 1 ] && [ "$AIR_EFF" -le 200 ]; } 2>/dev/null || AIR_EFF=80
+-	local a0 a1 a2
+-	_airsum() { printf '%s\n' "$1" | awk '
+-		/tx duration:/{td+=$3+0} /rx duration:/{rd+=$3+0}
+-		/tx bitrate:/{tr+=$3+0;trn++} /rx bitrate:/{rr+=$3+0;rrn++}
+-		END{printf "%.0f %.0f %.1f %.1f", td+0, rd+0, (trn?tr/trn:0), (rrn?rr/rrn:0)}'; }
+-	a0=$(_airsum "$dump0"); a1=$(_airsum "$dump1"); a2=$(_airsum "$dump2")
+-	# Per-band BND count (gates auto-calibration to non-offloaded bands). Reuse client
+-	# MACs from the dumps + the bind table (same match as getPpeEntries).
+-	local bn0=0 bn1=0 bn2=0
+-	if [ -f /sys/kernel/debug/ppe/bind ]; then
+-		local pm0 pm1 pm2 _bn
+-		pm0=$(printf '%s\n' "$dump0" | awk '/^Station/{print $2}' | tr '\n' '|' | sed 's/|$//')
+-		pm1=$(printf '%s\n' "$dump1" | awk '/^Station/{print $2}' | tr '\n' '|' | sed 's/|$//')
+-		pm2=$(printf '%s\n' "$dump2" | awk '/^Station/{print $2}' | tr '\n' '|' | sed 's/|$//')
+-		_bn=$(awk -v m0="$pm0" -v m1="$pm1" -v m2="$pm2" '
+-			function has(macs, eth,   n,arr,i,low){ if(macs=="")return 0; low=tolower(eth); n=split(macs,arr,"|"); for(i=1;i<=n;i++) if(arr[i]!=""&&index(low,tolower(arr[i]))>0)return 1; return 0 }
+-			/^[0-9a-fA-F]+ BND /{ eth=""; match($0,/eth=[^ \t]+/); if(RSTART>0)eth=substr($0,RSTART+4,RLENGTH-4); if(has(m0,eth))c0++; if(has(m1,eth))c1++; if(has(m2,eth))c2++ }
+-			END{printf "%d %d %d", c0+0,c1+0,c2+0}' /sys/kernel/debug/ppe/bind 2>/dev/null)
+-		bn0=$(echo "$_bn"|awk '{print $1}'); bn1=$(echo "$_bn"|awk '{print $2}'); bn2=$(echo "$_bn"|awk '{print $3}')
+-	fi
+-	local _air
+-	_air=$(awk -v now="$now" -v seed="$AIR_EFF" -v a0="$a0" -v a1="$a1" -v a2="$a2" \
+-		-v tx0="$tx0_mbps" -v rx0="$rx0_mbps" -v tx1="$tx1_mbps" -v rx1="$rx1_mbps" -v tx2="$tx2_mbps" -v rx2="$rx2_mbps" \
+-		-v bn0="$bn0" -v bn1="$bn1" -v bn2="$bn2" '
+-		BEGIN {
+-			split(a0,x0); split(a1,x1); split(a2,x2)
+-			ctd[0]=x0[1]+0; crd[0]=x0[2]+0; btr[0]=x0[3]+0; brr[0]=x0[4]+0
+-			ctd[1]=x1[1]+0; crd[1]=x1[2]+0; btr[1]=x1[3]+0; brr[1]=x1[4]+0
+-			ctd[2]=x2[1]+0; crd[2]=x2[2]+0; btr[2]=x2[3]+0; brr[2]=x2[4]+0
+-			ex[0]=tx0+rx0; ex[1]=tx1+rx1; ex[2]=tx2+rx2
+-			bn[0]=bn0+0; bn[1]=bn1+0; bn[2]=bn2+0
+-			seedf=seed/100; if(seedf<0.3)seedf=0.3; if(seedf>1)seedf=1
+-			FLOOR=15; ALPHA=0.25   # need >15 Mbps raw airtime to sample; EMA weight 0.25
+-			for (b=0;b<3;b++) { eff[b]=seedf; air[b]="0.0" }
+-			pf="/tmp/npu-wifi-airtime.prev"
+-			if ((getline line < pf) > 0) {
+-				n=split(line,p); pt=p[1]+0; dt=now-pt
+-				for (b=0;b<3;b++) { e=p[9+b]+0; if(e>=0.3 && e<=1.0) eff[b]=e }   # learned eff from state
+-				if (pt>0 && now>pt) {
+-					for (b=0;b<3;b++) {
+-						dtd=ctd[b]-p[2+b]; if(dtd<0)dtd=0
+-						drd=crd[b]-p[5+b]; if(drd<0)drd=0
+-						raw=(dtd*btr[b] + drd*brr[b])/1000000/dt   # Mbps, no efficiency factor
+-						if (raw != raw || raw > 20000) raw=0       # guard NaN / counter-wrap spikes
+-						if (bn[b]==0 && raw>FLOOR && ex[b]>FLOOR) {   # calibrate only on non-offloaded traffic
+-							s=ex[b]/raw
+-							if (s>=0.3 && s<=1.0) eff[b]=eff[b]*(1-ALPHA) + s*ALPHA
++			writefile('/tmp/npu-wifi-frames.prev', `${now} ${fcur[0]} ${fcur[1]} ${fcur[2]}`);
++
++			// --- airtime-derived throughput for offloaded bands, efficiency auto-learned
++			let seed = num(cursor().get('npu-monitor', 'settings', 'air_eff'), 80);
++			if (seed < 1 || seed > 200) seed = 80;
++			let seedf = seed / 100;
++			if (seedf < 0.3) seedf = 0.3;
++			if (seedf > 1) seedf = 1;
++
++			const bnd_per_band = [ 0, 0, 0 ];
++			if (stat(PPE_BIND)?.type == 'file') {
++				const sm = station_macs_by_band();
++				for (let line in slurp_lines(PPE_BIND)) {
++					if (!match(line, /^[0-9a-fA-F]+ BND /))
++						continue;
++					const m = match(line, /eth=([^ \t]+)/);
++					if (!m)
++						continue;
++					for (let b = 0; b < 3; b++)
++						if (mac_in(sm.bands[b], m[1]))
++							bnd_per_band[b]++;
++				}
++			}
++
++			const air = [ 0, 0, 0 ], eff = [ seedf, seedf, seedf ];
++			const ap = state_read('/tmp/npu-wifi-airtime.prev');
++			const FLOOR = 15, ALPHA = 0.25;
++			if (ap && length(ap) >= 10) {
++				// fields 8..10 hold the learned efficiencies (the shell read 9..11,
++				// so band 0 used band 1's value and band 2 never learned at all)
++				for (let b = 0; b < 3; b++) {
++					const e = ap[7 + b];
++					if (e >= 0.3 && e <= 1.0)
++						eff[b] = e;
++				}
++				const dt = now - ap[0];
++				if (ap[0] > 0 && dt > 0)
++					for (let b = 0; b < 3; b++) {
++						let dtd = acc[b].tx_dur - ap[1 + b];
++						if (dtd < 0) dtd = 0;
++						let drd = acc[b].rx_dur - ap[4 + b];
++						if (drd < 0) drd = 0;
++						const btr = acc[b].txrate_n ? acc[b].sum_txrate / acc[b].txrate_n : 0;
++						const brr = acc[b].rxrate_n ? acc[b].sum_rxrate / acc[b].rxrate_n : 0;
++						let raw = (dtd * btr + drd * brr) / 1000000 / dt;
++						if (raw != raw || raw > 20000) raw = 0;
++						const exact = tx_mbps[b] + rx_mbps[b];
++						if (bnd_per_band[b] == 0 && raw > FLOOR && exact > FLOOR) {
++							const sc = exact / raw;
++							if (sc >= 0.3 && sc <= 1.0)
++								eff[b] = eff[b] * (1 - ALPHA) + sc * ALPHA;
+ 						}
+-						air[b]=sprintf("%.1f", raw*eff[b])
++						air[b] = round1(raw * eff[b]);
+ 					}
++			}
++			writefile('/tmp/npu-wifi-airtime.prev',
++				`${now} ${int(acc[0].tx_dur)} ${int(acc[1].tx_dur)} ${int(acc[2].tx_dur)} ` +
++				`${int(acc[0].rx_dur)} ${int(acc[1].rx_dur)} ${int(acc[2].rx_dur)} ` +
++				sprintf('%.3f %.3f %.3f', eff[0], eff[1], eff[2]));
++
++			const bands = [];
++			for (let b = 0; b < 3; b++) {
++				const a = acc[b];
++				if (!a.stations)
++					continue;
++				push(bands, {
++					band: b,
++					stations: a.stations,
++					tx_packets: a.tx_packets,
++					tx_retries: a.tx_retries,
++					tx_failed: a.tx_failed,
++					avg_phy_rate: a.phy_n ? round1(a.sum_phy / a.phy_n) : 0,
++					retry_pct: ts.per[b],
++					avg_signal: a.sig_n ? int(a.sum_sig / a.sig_n) : 0,
++					min_signal: a.min_sig,
++					tx_mbps: tx_mbps[b],
++					rx_mbps: rx_mbps[b],
++					air_mbps: air[b],
++					hw_tx_mbps: hw_tx[b],
++					hw_rx_mbps: hw_rx[b],
++					air_eff: int(eff[b] * 100),
++					frames_ps: frames[b],
++					tx_bytes_raw: a.tx_bytes
++				});
++			}
++
++			return { available: true, mlo, bands };
++		}
++	},
++
++	getBridgeStats: {
++		call: function() {
++			if (stat('/sys/class/net/br-lan')?.type != 'directory')
++				return { available: false };
++			return {
++				available: true,
++				rx_bytes: iface_stat('br-lan', 'rx_bytes'),
++				rx_packets: iface_stat('br-lan', 'rx_packets'),
++				rx_dropped: iface_stat('br-lan', 'rx_dropped'),
++				tx_bytes: iface_stat('br-lan', 'tx_bytes'),
++				tx_packets: iface_stat('br-lan', 'tx_packets'),
++				tx_dropped: iface_stat('br-lan', 'tx_dropped'),
++				fwd_errors: 0
++			};
++		}
++	},
++
++	getNpuBypass: {
++		call: function() {
++			const uci = cursor();
++			const hw_offload = (uci.get('firewall', '@defaults[0]', 'flow_offloading_hw') == '1');
++
++			// same count as the shell: raw line count minus a non-numeric header
++			let offload_bound = 0;
++			const bind_lines = slurp_lines(PPE_BIND);
++			if (length(bind_lines)) {
++				offload_bound = length(bind_lines);
++				if (bind_lines[length(bind_lines) - 1] == '')
++					offload_bound--;
++				if (length(bind_lines[0]) && !match(bind_lines[0], /^[0-9]/))
++					offload_bound--;
++				if (offload_bound < 0)
++					offload_bound = 0;
++			}
++
++			const cpu = cpu_sample();
++			const cpu_pct = cpu.pct;
++			// WAN TX delta, router mode only
++			let wan_mbps = 0;
++			const dev = wan_device();
++			if (dev) {
++				const cur_tx = iface_stat(dev, 'tx_bytes');
++				const now = time();
++				const prev = readfile('/tmp/npu-wan-tx.prev');
++				if (prev) {
++					const p = split(trim(prev), /\s+/);
++					const prev_tx = num(p[0], 0), prev_time = num(p[1], 0);
++					const elapsed = now - prev_time;
++					if (elapsed > 0 && cur_tx >= prev_tx)
++						wan_mbps = int((cur_tx - prev_tx) * 8 / elapsed / 1000000);
+ 				}
+-			}
+-			close(pf)
+-			printf "%.0f %.0f %.0f %.0f %.0f %.0f %.0f %.3f %.3f %.3f\n", now, ctd[0],ctd[1],ctd[2],crd[0],crd[1],crd[2], eff[0],eff[1],eff[2] > pf
+-			printf "%s %s %s %.0f %.0f %.0f\n", air[0],air[1],air[2], eff[0]*100,eff[1]*100,eff[2]*100
+-		}' /dev/null)
+-	local air0 air1 air2 aireff0 aireff1 aireff2
+-	air0=$(echo "$_air"|awk '{print $1}'); air1=$(echo "$_air"|awk '{print $2}'); air2=$(echo "$_air"|awk '{print $3}')
+-	aireff0=$(echo "$_air"|awk '{print $4}'); aireff1=$(echo "$_air"|awk '{print $5}'); aireff2=$(echo "$_air"|awk '{print $6}')
+-
+-	local bands_json=""
+-	for band_idx in 0 1 2; do
+-		local dump tx_mbps rx_mbps band_per frames_ps air_mbps air_eff hw_tx hw_rx
+-		case "$band_idx" in
+-			0) dump="$dump0"; tx_mbps="$tx0_mbps"; rx_mbps="$rx0_mbps"; band_per="$band_per_0"; frames_ps="$frames0"; air_mbps="$air0"; air_eff="$aireff0"; hw_tx="$hwtx0"; hw_rx="$hwrx0" ;;
+-			1) dump="$dump1"; tx_mbps="$tx1_mbps"; rx_mbps="$rx1_mbps"; band_per="$band_per_1"; frames_ps="$frames1"; air_mbps="$air1"; air_eff="$aireff1"; hw_tx="$hwtx1"; hw_rx="$hwrx1" ;;
+-			2) dump="$dump2"; tx_mbps="$tx2_mbps"; rx_mbps="$rx2_mbps"; band_per="$band_per_2"; frames_ps="$frames2"; air_mbps="$air2"; air_eff="$aireff2"; hw_tx="$hwtx2"; hw_rx="$hwrx2" ;;
+-		esac
+-		[ -z "$dump" ] && continue
+-
+-		local stats
+-		stats=$(echo "$dump" | awk -v band_per="${band_per:-0}" '
+-		BEGIN {
+-			stations=0; tx_pkts=0; tx_retries=0; tx_failed=0
+-			sum_phy=0; phy_count=0
+-			sum_sig=0; sig_count=0; min_sig=0
+-		}
+-		/^Station / { stations++ }
+-		/tx packets:/ { tx_pkts += $3+0 }
+-		/tx retries:/ { tx_retries += $3+0 }
+-		/tx failed:/ { tx_failed += $3+0 }
+-		/tx bitrate:/ { sum_phy += $3+0; phy_count++ }
+-		/signal avg:/ {
+-			for (i = 1; i <= NF; i++) {
+-				if ($i ~ /^-[0-9]+$/) {
+-					sig = $i+0
+-					sum_sig += sig; sig_count++
+-					if (sig_count == 1 || sig < min_sig) min_sig = sig
+-					break
++				writefile('/tmp/npu-wan-tx.prev', `${cur_tx} ${now}`);
++			}
++
++			let npu_active = false, path = 'cpu';
++			if (hw_offload && offload_bound > 0) { npu_active = true; path = 'npu'; }
++			else if (hw_offload) path = 'npu_idle';
++
++			return {
++				hw_offload_enabled: hw_offload,
++				cpu_pct, cpu_available: cpu.pct != null, wan_mbps, offload_bound, npu_active, path
++			};
++		}
++	},
++
++	getConflictAlerts: {
++		call: function() {
++			const uci = cursor();
++			const hw_offload = (uci.get('firewall', '@defaults[0]', 'flow_offloading_hw') == '1');
++			const alerts = [];
++			const dev = wan_device();
++
++			let cake_on_wan = false;
++			if (dev) {
++				const p = popen(`tc qdisc show dev ${dev} 2>/dev/null`);
++				if (p) {
++					const out = p.read('all') ?? '';
++					p.close();
++					cake_on_wan = (match(out, /^qdisc cake/) != null);
+ 				}
+ 			}
+-		}
+-		END {
+-			avg_phy = (phy_count > 0) ? sum_phy/phy_count : 0
+-			# Real per-MPDU Tx PER from mt76 debugfs (passed in) as retry/error %;
+-			# raw tx_retries/tx_packets still emitted below but their ratio
+-			# over-reads on EHT (per-MPDU vs per-MSDU) so it is not used for health.
+-			retry_pct = band_per + 0
+-			avg_sig = (sig_count > 0) ? int(sum_sig / sig_count) : 0
+-			printf "%d %d %d %d %.1f %d %d %d", \
+-				stations, tx_pkts, tx_retries, tx_failed, avg_phy, retry_pct, avg_sig, min_sig
+-		}')
+-
+-		set -- $stats
+-		[ -n "$bands_json" ] && bands_json="${bands_json},"
+-		local sta_tx_raw
+-		case "$band_idx" in
+-			0) sta_tx_raw="$sta_tx0" ;;
+-			1) sta_tx_raw="$sta_tx1" ;;
+-			2) sta_tx_raw="$sta_tx2" ;;
+-		esac
+-		bands_json="${bands_json}{\"band\":${band_idx},\"stations\":${1:-0},\"tx_packets\":${2:-0},\"tx_retries\":${3:-0},\"tx_failed\":${4:-0},\"avg_phy_rate\":${5:-0},\"retry_pct\":${6:-0},\"avg_signal\":${7:-0},\"min_signal\":${8:-0},\"tx_mbps\":${tx_mbps},\"rx_mbps\":${rx_mbps:-0},\"air_mbps\":${air_mbps:-0},\"hw_tx_mbps\":${hw_tx:-0},\"hw_rx_mbps\":${hw_rx:-0},\"air_eff\":${air_eff:-0},\"frames_ps\":${frames_ps:-0},\"tx_bytes_raw\":${sta_tx_raw:-0}}"
+-	done
+-
+-	printf '{"available":true,"mlo":%s,"bands":[%s]}' "$([ "$is_mld" = 1 ] && echo true || echo false)" "$bands_json"
+-}
+-
+-get_bridge_stats() {
+-	# Check br-lan for tx_dropped (CPU can't feed WiFi chip fast enough)
+-	# and overall packet rates for bridge activity indication
+-
+-	local stats
+-	stats=$(ip -s link show br-lan 2>/dev/null)
+-
+-	if [ -z "$stats" ]; then
+-		echo '{"available":false}'
+-		return
+-	fi
+-
+-	local rx_bytes rx_packets rx_dropped tx_bytes tx_packets tx_dropped
+-	rx_bytes=$(echo "$stats"   | awk '/RX:/{getline; print $1+0}')
+-	rx_packets=$(echo "$stats" | awk '/RX:/{getline; print $2+0}')
+-	rx_dropped=$(echo "$stats" | awk '/RX:/{getline; print $4+0}')
+-	tx_bytes=$(echo "$stats"   | awk '/TX:/{getline; print $1+0}')
+-	tx_packets=$(echo "$stats" | awk '/TX:/{getline; print $2+0}')
+-	tx_dropped=$(echo "$stats" | awk '/TX:/{getline; print $4+0}')
+-
+-	# Also check for any bridge forwarding errors via brctl if available
+-	local fwd_errors=0
+-	if command -v brctl > /dev/null 2>&1; then
+-		fwd_errors=$(brctl showstp br-lan 2>/dev/null | awk '/forward transitions/{sum+=$NF} END{print sum+0}')
+-	fi
+-
+-	printf '{"available":true,"rx_bytes":%d,"rx_packets":%d,"rx_dropped":%d,"tx_bytes":%d,"tx_packets":%d,"tx_dropped":%d,"fwd_errors":%d}' \
+-		"${rx_bytes:-0}" "${rx_packets:-0}" "${rx_dropped:-0}" \
+-		"${tx_bytes:-0}" "${tx_packets:-0}" "${tx_dropped:-0}" \
+-		"${fwd_errors:-0}"
+-}
+-
+-get_npu_bypass() {
+-	# Determines if the NPU is actively offloading traffic.
+-	# Primary indicator: offload_bound > 0 (live PPE entries in hardware).
+-	# This works in both Router and AP mode — no WAN assumption needed.
+-
+-	# Check UCI for hw offload setting
+-	local hw_offload
+-	hw_offload=$(uci get firewall.@defaults[0].flow_offloading_hw 2>/dev/null)
+-
+-	# Read PPE bound entry count directly from debugfs
+-	local offload_bound=0
+-	local ppe_bind="/sys/kernel/debug/ppe/bind"
+-	if [ -r "$ppe_bind" ]; then
+-		offload_bound=$(wc -l < "$ppe_bind" 2>/dev/null || echo 0)
+-		# Subtract 1 if file has a header line (starts with non-numeric)
+-		local first
+-		first=$(head -1 "$ppe_bind" 2>/dev/null)
+-		case "$first" in [0-9]*) ;; *) offload_bound=$(( offload_bound - 1 )) ;; esac
+-		[ "$offload_bound" -lt 0 ] && offload_bound=0
+-	fi
+-
+-	# CPU % is sampled by npu-jitter-daemon over a steady ~2s background window
+-	# and published in the jitter json, so it reflects real system load and is
+-	# NOT inflated by this RPC's own per-poll work (the old in-RPC /proc/stat
+-	# delta measured its own overhead -> ~15-20% at idle). Read the cached value.
+-	local cpu_pct=0
+-	if [ -f /tmp/npu-jitter.json ]; then
+-		cpu_pct=$(sed -n 's/.*"cpu_pct":\([0-9][0-9]*\).*/\1/p' /tmp/npu-jitter.json)
+-		[ -n "$cpu_pct" ] || cpu_pct=0
+-	fi
+-
+-	# Get WAN TX throughput delta (bytes/sec → Mbps) — router mode only
+-	local wan_mbps=0
+-	local tx_file="/tmp/npu-wan-tx.prev"
+-	local wan_dev
+-	wan_dev=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@.l3_device" 2>/dev/null)
+-
+-	if [ -n "$wan_dev" ]; then
+-		local cur_tx
+-		cur_tx=$(cat "/sys/class/net/${wan_dev}/statistics/tx_bytes" 2>/dev/null || echo 0)
+-		if [ -f "$tx_file" ]; then
+-			local prev_tx prev_time cur_time elapsed delta
+-			prev_tx=$(awk '{print $1}' "$tx_file" 2>/dev/null || echo 0)
+-			prev_time=$(awk '{print $2}' "$tx_file" 2>/dev/null || echo 0)
+-			cur_time=$(date +%s)
+-			elapsed=$(( cur_time - prev_time ))
+-			if [ "$elapsed" -gt 0 ] && [ "$cur_tx" -ge "$prev_tx" ]; then
+-				delta=$(( cur_tx - prev_tx ))
+-				wan_mbps=$(( delta * 8 / elapsed / 1000000 ))
+-			fi
+-		fi
+-		printf "%s %s" "$cur_tx" "$(date +%s)" > "$tx_file"
+-	fi
+-
+-	# Determine NPU path status using PPE bound entries as ground truth
+-	local npu_active="false"
+-	local path="cpu"
+-	if [ "$hw_offload" = "1" ] && [ "$offload_bound" -gt 0 ]; then
+-		npu_active="true"
+-		path="npu"
+-	elif [ "$hw_offload" = "1" ]; then
+-		path="npu_idle"
+-	fi
+-
+-	printf '{"hw_offload_enabled":%s,"cpu_pct":%d,"wan_mbps":%d,"offload_bound":%d,"npu_active":%s,"path":"%s"}' \
+-		"$([ "$hw_offload" = "1" ] && echo true || echo false)" \
+-		"${cpu_pct:-0}" "${wan_mbps:-0}" "${offload_bound:-0}" "$npu_active" "$path"
+-}
+-
+-get_conflict_alerts() {
+-	local alerts=""
+-	local alert_count=0
+-
+-	# ── Alert 1: Ghost Shaper ──────────────────────────────────────────────
+-	# NPU HW offload is ON + CAKE is configured on WAN = NPU bypasses CAKE.
+-	# Bufferbloat management is inactive for offloaded flows.
+-	local hw_offload
+-	hw_offload=$(uci get firewall.@defaults[0].flow_offloading_hw 2>/dev/null)
+-
+-	local cake_on_wan="false"
+-	local wan_dev
+-	wan_dev=$(ubus call network.interface.wan status 2>/dev/null | jsonfilter -e "@.l3_device" 2>/dev/null)
+-	if [ -n "$wan_dev" ] && command -v tc > /dev/null 2>&1; then
+-		if tc qdisc show dev "$wan_dev" 2>/dev/null | grep -q "^qdisc cake"; then
+-			cake_on_wan="true"
+-		fi
+-	fi
+-
+-	if [ "$hw_offload" = "1" ] && [ "$cake_on_wan" = "true" ]; then
+-		[ -n "$alerts" ] && alerts="${alerts},"
+-		alerts="${alerts}{\"id\":\"ghost_shaper\",\"severity\":\"warning\",\"title\":\"Ghost Shaper Active\",\"message\":\"NPU HW offload is bypassing CAKE SQM. Offloaded flows skip bufferbloat management — latency protection is inactive under load.\"}"
+-		alert_count=$((alert_count + 1))
+-	fi
+-
+-	# ── Alert 2: Physical Bottleneck ──────────────────────────────────────
+-	# WAN interface has hardware errors — cable/SFP issue, not software bloat.
+-	local rx_errors=0
+-	if [ -n "$wan_dev" ]; then
+-		rx_errors=$(cat "/sys/class/net/${wan_dev}/statistics/rx_errors" 2>/dev/null || echo 0)
+-	fi
+-
+-	if [ "${rx_errors:-0}" -gt 0 ]; then
+-		[ -n "$alerts" ] && alerts="${alerts},"
+-		alerts="${alerts}{\"id\":\"physical_bottleneck\",\"severity\":\"error\",\"title\":\"Physical Bottleneck\",\"message\":\"Hardware errors detected on WAN (${rx_errors} rx_errors). Check WAN cable or SFP. Latency stats may be misleading.\"}"
+-		alert_count=$((alert_count + 1))
+-	fi
+-
+-	# ── Alert 3: NPU Bypass + High Latency ────────────────────────────────
+-	# NPU is on but jitter result shows high latency — NPU not helping or
+-	# the path has a real latency problem.
+-	local jitter_file="/tmp/npu-jitter.json"
+-	if [ "$hw_offload" = "1" ] && [ -f "$jitter_file" ]; then
+-		local last_ping
+-		last_ping=$(jsonfilter -i "$jitter_file" -e "@.last_ping" 2>/dev/null)
+-		# Warn if ping > 60ms with hw offload on (something is wrong)
+-		if [ -n "$last_ping" ] && awk "BEGIN{exit !($last_ping > 60)}"; then
+-			[ -n "$alerts" ] && alerts="${alerts},"
+-			alerts="${alerts}{\"id\":\"npu_bypass_latency\",\"severity\":\"warning\",\"title\":\"NPU Bypass Detected\",\"message\":\"HW offload is enabled but ISP latency is high (${last_ping}ms). Latency management may be skipped by hardware acceleration.\"}"
+-			alert_count=$((alert_count + 1))
+-		fi
+-	fi
+-
+-	printf '{"alert_count":%d,"alerts":[%s]}' "$alert_count" "$alerts"
+-}
+-
+-get_eth_stats() {
+-	printf '{"ports":['
+-	local first=1
+-	for iface in wan lan1 lan2 lan3 lan4; do
+-		local sys="/sys/class/net/$iface"
+-		[ -d "$sys" ] || continue
+-		local operstate up=false
+-		operstate=$(cat "$sys/operstate" 2>/dev/null || echo "unknown")
+-		[ "$operstate" = "up" ] && up=true
+-		local speed
+-		speed=$(cat "$sys/speed" 2>/dev/null || echo "")
+-		case "$speed" in ''|*[!0-9]*) speed=0 ;; esac
+-		local tx_bytes rx_bytes tx_errors rx_errors
+-		tx_bytes=$(cat "$sys/statistics/tx_bytes" 2>/dev/null || echo 0)
+-		rx_bytes=$(cat "$sys/statistics/rx_bytes" 2>/dev/null || echo 0)
+-		tx_errors=$(cat "$sys/statistics/tx_errors" 2>/dev/null || echo 0)
+-		rx_errors=$(cat "$sys/statistics/rx_errors" 2>/dev/null || echo 0)
+-		[ "$first" = "1" ] || printf ","
+-		printf '{"iface":"%s","up":%s,"speed":%d,"tx_bytes":%d,"rx_bytes":%d,"tx_errors":%d,"rx_errors":%d}' \
+-			"$iface" "$up" "$speed" "$tx_bytes" "$rx_bytes" "$tx_errors" "$rx_errors"
+-		first=0
+-	done
+-	printf ']}'
+-}
+-
+-case "$1" in
+-	list)
+-		echo '{"getStatus":{},"getPpeEntries":{},"getTokenInfo":{},"getFrameEngine":{},"getTxStats":{},"getVlanOffload":{},"setVlanOffload":{"enabled":"int"},"getFlowOffload":{},"setFlowOffload":{"enabled":"int"},"getPppoeOffload":{},"setPppoeOffload":{"enabled":"int"},"getDeviceMode":{},"getWanHealth":{},"getJitterResult":{},"getWifiStats":{},"getBridgeStats":{},"getNpuBypass":{},"getConflictAlerts":{},"getEthStats":{}}'
+-		;;
+-	call)
+-		case "$2" in
+-			getStatus)
+-				get_status
+-				;;
+-			getPpeEntries)
+-				get_ppe_entries
+-				;;
+-			getTokenInfo)
+-				get_token_info
+-				;;
+-			getFrameEngine)
+-				get_frame_engine
+-				;;
+-			getTxStats)
+-				get_tx_stats
+-				;;
+-			getVlanOffload)
+-				get_vlan_offload
+-				;;
+-			setVlanOffload)
+-				read input
+-				set_vlan_offload "$input"
+-				;;
+-			getFlowOffload)
+-				get_flow_offload
+-				;;
+-			setFlowOffload)
+-				read input
+-				set_flow_offload "$input"
+-				;;
+-			getPppoeOffload)
+-				get_pppoe_offload
+-				;;
+-			setPppoeOffload)
+-				read input
+-				set_pppoe_offload "$input"
+-				;;
+-			getDeviceMode)
+-				get_device_mode
+-				;;
+-			getWanHealth)
+-				get_wan_health
+-				;;
+-			getJitterResult)
+-				get_jitter_result
+-				;;
+-			getWifiStats)
+-				get_wifi_stats
+-				;;
+-			getBridgeStats)
+-				get_bridge_stats
+-				;;
+-			getNpuBypass)
+-				get_npu_bypass
+-				;;
+-			getConflictAlerts)
+-				get_conflict_alerts
+-				;;
+-			getEthStats)
+-				get_eth_stats
+-				;;
+-			*)
+-				echo '{"error":"Invalid method"}'
+-				;;
+-		esac
+-		;;
+-esac
++			if (hw_offload && cake_on_wan)
++				push(alerts, {
++					id: 'ghost_shaper', severity: 'warning', title: 'Ghost Shaper Active',
++					message: 'NPU HW offload is bypassing CAKE SQM. Offloaded flows skip bufferbloat management — latency protection is inactive under load.'
++				});
++
++			const rx_errors = dev ? iface_stat(dev, 'rx_errors') : 0;
++			if (rx_errors > 0)
++				push(alerts, {
++					id: 'physical_bottleneck', severity: 'error', title: 'Physical Bottleneck',
++					message: `Hardware errors detected on WAN (${rx_errors} rx_errors). Check WAN cable or SFP. Latency stats may be misleading.`
++				});
++
++			if (hw_offload) {
++				const jit = readfile(JITTER_FILE);
++				const m = jit ? match(jit, /"last_ping":([0-9.]+)/) : null;
++				if (m && +m[1] > 60)
++					push(alerts, {
++						id: 'npu_bypass_latency', severity: 'warning', title: 'NPU Bypass Detected',
++						message: `HW offload is enabled but ISP latency is high (${m[1]}ms). Latency management may be skipped by hardware acceleration.`
++					});
++			}
++
++			return { alert_count: length(alerts), alerts };
++		}
++	},
++
++	getEthStats: {
++		call: function() {
++			const ports = [];
++			for (let iface in [ 'wan', 'lan1', 'lan2', 'lan3', 'lan4' ]) {
++				if (stat(`/sys/class/net/${iface}`)?.type != 'directory')
++					continue;
++				let speed = read_num(`/sys/class/net/${iface}/speed`, 0);
++				if (speed < 0) speed = 0;
++				push(ports, {
++					iface,
++					up: (read_str(`/sys/class/net/${iface}/operstate`, 'unknown') == 'up'),
++					speed,
++					tx_bytes: iface_stat(iface, 'tx_bytes'),
++					rx_bytes: iface_stat(iface, 'rx_bytes'),
++					tx_errors: iface_stat(iface, 'tx_errors'),
++					rx_errors: iface_stat(iface, 'rx_errors')
++				});
++			}
++			return { ports };
++		}
++	}
++};
++
++// rpcd exec-plugin ABI: JSON signatures on list, JSON result on call.
++if (ARGV[0] == 'list') {
++	const signatures = {};
++	for (let name, method in methods) signatures[name] = method.args ?? {};
++	print(sprintf('%J\n', signatures));
++} else if (ARGV[0] == 'call' && methods[ARGV[1]]) {
++	let args = {};
++	try { args = json(readfile('/dev/stdin') || '{}'); } catch (e) { exit(2); }
++	try { print(sprintf('%J\n', methods[ARGV[1]].call({ args }))); }
++	catch (e) { print(sprintf('%J\n', { available: false, error: '' + e })); }
++} else {
++	exit(2);
++}
++

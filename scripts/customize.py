@@ -101,6 +101,18 @@ def verify(openwrt):
         raise RuntimeError('FlowSense mean RTT display is missing from rootfs')
     if 'npu-monitor.jitter.enabled' not in (root / 'etc/init.d/npu-jitter').read_text():
         raise RuntimeError('FlowSense sampler opt-out is missing from rootfs')
+    backend = (root / 'usr/libexec/rpcd/luci.airoha_flowsense').read_text()
+    if not backend.startswith('#!/usr/bin/env ucode') or 'function cpu_sample()' not in backend:
+        raise RuntimeError('Isolated FlowSense ucode backend missing from rootfs')
+    if (root / 'usr/share/rpcd/ucode/luci.airoha_flowsense.uc').exists():
+        raise RuntimeError('Duplicate native FlowSense RPC plugin would conflict')
+    if not (root / 'etc/rc.d/S98w1700k-monitor').is_symlink():
+        raise RuntimeError('Restore-safe monitor startup missing from rootfs')
+    rtmon = root / 'usr/sbin/mwan3rtmon'
+    if not rtmon.exists() or 'Refresh before filtering non-main tables' not in rtmon.read_text():
+        raise RuntimeError('Patched nft mwan3 missing from image')
+    if not (root / 'usr/share/rpcd/ucode/mwan3').exists():
+        raise RuntimeError('mwan3 nft RPC plugin missing from image')
     if 'channelsForRadio' not in channel or 'scanInterface' not in channel:
         raise RuntimeError('Single-wiphy fix is missing from image rootfs')
     acl = json.loads((root / 'usr/share/rpcd/acl.d/luci-app-attendedsysupgrade.json').read_text(encoding='utf-8'))

@@ -110,6 +110,8 @@ configure() {
     # An optional lock uses normal src-git name URL^FULL_COMMIT lines.
     cp "$feeds_file" feeds.conf
     ./scripts/feeds update -a 2>&1 | tee "$LOGS/feeds-update.log"
+    python3 "$ROOT/scripts/extra-packages.py" "$OPENWRT" "$CACHE/extra-packages" 2>&1 | tee "$LOGS/extra-packages.log"
+    ./scripts/feeds update -i packages luci 2>&1 | tee "$LOGS/extra-packages-index.log"
     # Keep exact feed revisions even when installation or defconfig fails.
     ./scripts/feeds list -s -f > "$WORK/feeds.lock"
     ./scripts/feeds uninstall -a 2>&1 | tee "$LOGS/feeds-uninstall.log"
@@ -259,6 +261,7 @@ collect() {
     find "$target" -maxdepth 1 -type f -exec cp -t "$dest/firmware" {} +
     cp "$OPENWRT/.config" "$dest/openwrt.config"
     cp "$WORK/feeds.lock" "$dest/feeds.lock"
+    cp "$WORK/extra-packages.json" "$dest/extra-packages.json"
     cp "$WORK/distfeeds.json" "$dest/distfeeds-source.json"
     cp "$OPENWRT/files/etc/apk/repositories.d/distfeeds.list" "$dest/distfeeds.list"
     cp "$OPENWRT/files/etc/vermagic.txt" "$dest/vermagic.txt"

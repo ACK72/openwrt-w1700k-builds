@@ -36,6 +36,17 @@ The netdev-add packet-steering hook follows the narrowly scoped suggestion in
 Gilly1970/Gemtek-W1700K-6.18 at f72939518d0bd3f02c26f42a4d08c4452cb48a9f.
 It does not import that tree's PCIe IRQ-affinity or packet-steering policy.
 
+FlowSense ucode parsing is adapted from Gilly1970/Gemtek-W1700K-6.18
+commit 4a1e35762e382dfaf2306da9b079c548e2f3d632 (Apache-2.0).
+ACK72 keeps rpcd exec process isolation for potentially blocking Wi-Fi reads,
+adds independent CPU sampling and restore-safe monitor startup. The low-rate
+RTT/jitter algorithm and recent reply history remain the ACK72 implementation.
+
+The nft-native mwan3 and luci-app-mwan3 recipes come from dl12345's repositories,
+with commits and archive checksums in configs/extra-packages.json (GPL-2.0).
+They are built from source into the image. The mwan3 route-state refresh fix is
+applied before compilation; no third-party binary package is downloaded at boot.
+
 Corresponding customization source, patches and build scripts:
 Project source and releases: see the firmware's configured release repository.
 The exact builder commit, source and feed revisions are retained with each

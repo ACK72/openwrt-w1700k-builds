@@ -1,0 +1,25 @@
+--- a/usr/sbin/mwan3rtmon
++++ b/usr/sbin/mwan3rtmon
+@@ -648,6 +648,11 @@
+ 	let cmd = event.cmd;
+ 	let route = event.msg;
+ 
++	// Refresh before filtering non-main tables. Hotplug installs the interface
++	// default after the main-table event; ignoring that installation leaves
++	// ROUTE_STATUS stale until the 20-second sweep and causes false failover.
++	arm_route_state_refresh();
++
+ 	// Routes in rt_table_lookup tables are mirrored into mwan3_custom_v4/v6.
+ 
+ 	if (extra_table_set[route.table]) {
+@@ -682,10 +687,6 @@
+ 		else
+ 			connected_timer.set(DEBOUNCE_MS);
+ 	}
+-
+-	// Re-evaluate every interface's default-route state on any routing change.
+-
+-	arm_route_state_refresh();
+ 
+ 	// -- Update per-interface routing tables --
+ 

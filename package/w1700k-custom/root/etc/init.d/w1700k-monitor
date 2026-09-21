@@ -1,0 +1,13 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: Apache-2.0
+# Old backups contain 10_disable_services disabling the former jitter daemon.
+# Run after uci-defaults on every boot; explicit UCI opt-out remains supported.
+START=98
+
+boot() {
+    local enabled
+    enabled=$(uci -q get npu-monitor.jitter.enabled || uci -q get 'npu-monitor.@jitter[0].enabled')
+    [ "$enabled" != 0 ] || return 0
+    /etc/init.d/npu-jitter enable
+    /etc/init.d/npu-jitter start
+}

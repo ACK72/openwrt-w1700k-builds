@@ -1,0 +1,18 @@
+[
+  {
+    "repo": "dl12345/mwan3",
+    "tag": "v3.6.12-1",
+    "commit": "cdd4fc56f4de9ccf56d40d6dc04a5b6a4e5a0ae6",
+    "url": "https://codeload.github.com/dl12345/mwan3/tar.gz/cdd4fc56f4de9ccf56d40d6dc04a5b6a4e5a0ae6",
+    "sha256": "e0367e077ae3160974d48131b0e5a2586fcf1ed8c5135b314c01972e52d61a96",
+    "destination": "feeds/packages/net/mwan3"
+  },
+  {
+    "repo": "dl12345/luci-app-mwan3",
+    "tag": "v3.6.12-1",
+    "commit": "1e8513a69cff32da3dd82c342151cdb4a991c2b7",
+    "url": "https://codeload.github.com/dl12345/luci-app-mwan3/tar.gz/1e8513a69cff32da3dd82c342151cdb4a991c2b7",
+    "sha256": "5f70e5c0f8558a6d55db38f533b6960c881cdb7f4348c2120ce15e417d3d39e3",
+    "destination": "feeds/luci/applications/luci-app-mwan3"
+  }
+]

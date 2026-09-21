@@ -1,0 +1,57 @@
+From: ACK72
+Subject: [PATCH] flowsense: distinguish unavailable CPU samples from zero load
+
+SPDX-License-Identifier: Apache-2.0
+
+--- a/package/luci-app-airoha-flowsense/htdocs/luci-static/resources/view/airoha_flowsense/status.js
++++ b/package/luci-app-airoha-flowsense/htdocs/luci-static/resources/view/airoha_flowsense/status.js
+@@ -715,7 +715,8 @@
+ 
+ 	var npuActive = bypass.npu_active  === true;
+ 	var hwEnabled = bypass.hw_offload_enabled === true;
+-	var cpuPct    = bypass.cpu_pct  || 0;
++	var cpuAvailable = typeof bypass.cpu_pct === 'number' && isFinite(bypass.cpu_pct) && bypass.cpu_available !== false;
++	var cpuPct = cpuAvailable ? bypass.cpu_pct : 0;
+ 	var wanMbps   = bypass.wan_mbps || 0;
+ 
+ 	// Latency — jitter daemon pings upstream and works in both router and AP mode
+@@ -754,7 +755,7 @@
+ 		          :                      '#00cc44';
+ 	}
+ 	return {
+-		npuActive:npuActive, hwEnabled:hwEnabled, cpuPct:cpuPct, wanMbps:wanMbps,
++		npuActive:npuActive, hwEnabled:hwEnabled, cpuPct:cpuPct, cpuLabel:cpuAvailable ? cpuPct+'%' : 'N/A', cpuAvailable:cpuAvailable, wanMbps:wanMbps,
+ 		hwBuf:hwBuf, mode:mode,
+ 		latMs:latMs, latency:latency, errCount:errCount, eastAlarm:eastAlarm,
+ 		wbDelta:wbDelta, worstSignal:worstSignal,
+@@ -966,7 +967,7 @@
+ 	p.push('<text x="150" y="128" text-anchor="middle" font-family="monospace" font-size="7" letter-spacing="1" fill="var(--soc-muted)">' + (governor || '') + '</text>');
+ 
+ 	// big LOAD readout — centre stage (no needle), load-coloured + unit + offloaded sub-line
+-	p.push('<text x="150" y="162" text-anchor="middle" font-family="monospace" font-size="34" font-weight="700" fill="' + loadCol + '" filter="url(#f-cn-soft)">' + cpuPct + '</text>');
++	p.push('<text x="150" y="162" text-anchor="middle" font-family="monospace" font-size="34" font-weight="700" fill="' + loadCol + '" filter="url(#f-cn-soft)">' + (cs.cpuAvailable ? cpuPct : '--') + '</text>');
+ 	p.push('<text x="150" y="178" text-anchor="middle" font-family="monospace" font-size="8" letter-spacing="3" fill="var(--soc-muted)">LOAD</text>');
+ 	p.push('<text x="150" y="226" text-anchor="middle" font-family="monospace" font-size="7.5" font-weight="600" fill="var(--soc-muted)">' + offloadPct + '% OFFLOADED</text>');
+ 
+@@ -1372,8 +1373,8 @@
+ 	var northVal   = cs.npuActive ? 'ACTIVE' : (cs.hwEnabled ? 'IDLE' : 'CPU PATH');
+ 	var northColor = cs.npuActive ? '#00c8ff' : (cs.hwEnabled ? '#888' : '#ff6b35');
+ 	var northSub   = mode === 'ap'
+-		? 'CPU: '+cs.cpuPct+'%  |  Bridge drops Δ: '+bridgeDelta
+-		: 'CPU: '+cs.cpuPct+'%  |  WAN: '+cs.wanMbps+' Mbps';
++		? 'CPU: '+cs.cpuLabel+'  |  Bridge drops Δ: '+bridgeDelta
++		: 'CPU: '+cs.cpuLabel+'  |  WAN: '+cs.wanMbps+' Mbps';
+ 
+ 	// East card: Integrity
+ 	var eastVal, eastSub;
+@@ -1443,8 +1444,8 @@
+ 	setCard(divs[0], cs.npuActive?'ACTIVE':(cs.hwEnabled?'IDLE':'CPU PATH'),
+ 		cs.npuActive?'#00c8ff':(cs.hwEnabled?'#888':'#ff6b35'),
+ 		mode==='ap'
+-			?'CPU: '+cs.cpuPct+'%  |  Bridge drops Δ: '+bridgeDelta2
+-			:'CPU: '+cs.cpuPct+'%  |  WAN: '+cs.wanMbps+' Mbps');
++			?'CPU: '+cs.cpuLabel+'  |  Bridge drops Δ: '+bridgeDelta2
++			:'CPU: '+cs.cpuLabel+'  |  WAN: '+cs.wanMbps+' Mbps');
+ 
+ 	if (mode === 'router') {
+ 		setCard(divs[1], cs.eastAlarm?cs.errCount+' ERROR'+(cs.errCount>1?'S':''):'CLEAN',
