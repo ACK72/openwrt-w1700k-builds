@@ -8,6 +8,7 @@ This project builds images that include OpenWrt, Airoha NPU firmware, and additi
 In LuCI's **Attended Sysupgrade**, use **Check for GitHub firmware** to select and install a stable or RC image.
 
 See [network steering](docs/network-steering.md) for IRQ/NAPI placement and optional RPS/RFS configuration.
+See [Frame Engine counters](docs/frame-engine.md) for cumulative traffic totals and timed drop measurements.
 
 ## Based on
 

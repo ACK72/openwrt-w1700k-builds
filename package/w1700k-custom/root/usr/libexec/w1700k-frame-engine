@@ -1,0 +1,102 @@
+#!/usr/bin/env ucode
+// SPDX-License-Identifier: Apache-2.0
+// W1700K Frame Engine sampling shared by both LuCI monitors.
+import { readfile, realpath, glob, popen } from 'fs';
+
+function driver_counters() {
+	let stats = {}, result = {};
+	for (let id in [ 1, 2, 4 ])
+		result[`gdm${id}`] = { available: false, source: 'driver', interfaces: [], tx: 0, rx: 0, tx_drop: 0, rx_drop: 0 };
+	// ndo_get_stats64 accumulates and clears GDM MIB under the driver lock.
+	// Read its cumulative values once, never read/select/clear raw GDM MIB here.
+	for (let line in split(readfile('/proc/net/dev') ?? '', '\n')) {
+		let m = match(line, /^\s*([^\s:]+):\s*(.+)$/);
+		if (!m)
+			continue;
+		let values = split(trim(m[2]), /\s+/);
+		if (length(values) == 16 && !length(filter(values, v => !match(v, /^\d+$/))))
+			stats[m[1]] = map(values, v => +v);
+	}
+	for (let path in glob('/sys/class/net/*')) {
+		if (split(realpath(`${path}/device/driver`) ?? '', '/')[-1] != 'airoha_eth')
+			continue;
+		// Follow the physical DT port, including its optional NBQ child. This
+		// survives interface renaming and avoids counting DSA/VLAN children twice.
+		let m = match(realpath(`${path}/of_node`) ?? '', /\/ethernet@1fb50000\/ethernet@([124])(\/[^\/]+)?$/);
+		if (!m)
+			continue;
+		let name = split(path, '/')[-1], row = result[`gdm${m[1]}`], v = stats[name];
+		push(row.interfaces, name);
+		if (!v) {
+			row.incomplete = true;
+			continue;
+		}
+		row.tx += v[9]; row.rx += v[1];
+		row.tx_drop += v[11]; row.rx_drop += v[3];
+		row.available = true;
+	}
+	for (let row in values(result)) {
+		row.available = row.available && !row.incomplete;
+		if (!row.available)
+			row.tx = row.rx = row.tx_drop = row.rx_drop = null;
+	}
+	return result;
+}
+
+function registers(addresses) {
+	// Addresses are fixed constants, never RPC or interface input.
+	let process = popen(join('; ', map(addresses, a => sprintf('devmem 0x%x 32', a))));
+	if (!process)
+		return null;
+	let output = process.read('all'), status = process.close();
+	let lines = split(trim(output ?? ''), '\n');
+	if (status != 0 || length(lines) != length(addresses))
+		return null;
+	let result = [];
+	for (let line in lines) {
+		if (!match(line, /^0x[0-9a-fA-F]{1,8}$/))
+			return null;
+		let number = 0;
+		for (let i = 2; i < length(line); i++) {
+			let c = ord(lc(line), i);
+			number = number * 16 + (c <= 57 ? c - 48 : c - 87);
+		}
+		push(result, number);
+	}
+	return result;
+}
+
+function collect() {
+	let result = driver_counters();
+	result.schema = 1;
+	result.boot_id = trim(readfile('/proc/sys/kernel/random/boot_id') ?? '');
+	if (trim(readfile('/tmp/sysinfo/board_name') ?? '') != 'gemtek,w1700k-ubi') {
+		result.error = 'Unsupported Frame Engine';
+		return result;
+	}
+	let addresses = [];
+	for (let i = 0; i < 10; i++) push(addresses, 0x1fb50150 + i * 4);
+	for (let i = 0; i < 10; i++) push(addresses, 0x1fb50120 + i * 4);
+	push(addresses, 0x1fb50104);
+	for (let base in [ 0x1fb50580, 0x1fb51580 ])
+		for (let offset in [ 0, 0x10, 0x14, 0x20, 0x24 ]) push(addresses, base + offset);
+	let v = registers(addresses);
+	result.sample_uptime = +(split(trim(readfile('/proc/uptime') ?? ''), /\s+/)[0]);
+	if (!v) {
+		result.error = 'Frame Engine counters unavailable';
+		return result;
+	}
+	result.pse_ports = [];
+	for (let i = 0; i < 10; i++)
+		push(result.pse_ports, { port: i, iq: (v[i] >> 16) & 0xffff, oq: v[i] & 0xffff, drops: v[10 + i] });
+	result.pse_used = (v[20] >> 16) & 0xffff;
+	result.pse_free = v[20] & 0x7fff;
+	for (let i = 0; i < 2; i++) {
+		let n = 21 + i * 5;
+		result[`cdm${i + 1}`] = { tx: v[n], rx_cpu: v[n + 1], rx_hwf: v[n + 2], rx_cpu_drop: v[n + 3], rx_hwf_drop: v[n + 4] };
+	}
+	return result;
+}
+
+try { print(sprintf('%J\n', collect())); }
+catch (error) { print(sprintf('%J\n', { error: 'Frame Engine sample failed' })); }

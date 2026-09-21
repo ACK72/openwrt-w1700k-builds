@@ -46,6 +46,11 @@ ACK72 keeps rpcd exec process isolation for potentially blocking Wi-Fi reads,
 adds independent CPU sampling and restore-safe monitor startup. The low-rate
 RTT/jitter algorithm and recent reply history remain the ACK72 implementation.
 
+The shared Frame Engine collector, timed drop-counter display and monitor
+integration are new Apache-2.0 changes by openwrt-w1700k-builds contributors
+(2026). They use kernel-maintained GDM interface counters and preserve the
+existing monitor components' Apache-2.0 licensing.
+
 The nft-native mwan3 and luci-app-mwan3 recipes come from dl12345's repositories,
 with commits and archive checksums in configs/extra-packages.json (GPL-2.0).
 They are built from source into the image. The mwan3 route-state refresh fix is

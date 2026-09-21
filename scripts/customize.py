@@ -3,8 +3,10 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from repositories import builder_repository
 
@@ -19,6 +21,54 @@ RUNTIME_COMMANDS = ('sh', 'ls', 'awk', 'chmod', 'mkdir', 'mv', 'rm', 'rmdir',
 
 def rendered(source):
     return source.read_bytes().replace(b'@BUILDER_REPOSITORY@', builder_repository().encode())
+
+
+def apply_patch_series(tree, patches):
+    """Validate overlapping monitor patches in a temporary tree before writing.
+
+    A later patch may change a whole file introduced by an earlier patch, so
+    checking each old patch in reverse against the final tree is insufficient.
+    """
+    if not patches:
+        return
+    paths = set()
+    for patch in patches:
+        for name in re.findall(r'^(?:--- a/|\+\+\+ b/)([^\t\n]+)', patch.read_text(encoding='utf-8'), re.M):
+            path = Path(name)
+            if path.is_absolute() or '..' in path.parts or '.git' in path.parts:
+                raise RuntimeError(f'Unsafe patch path: {name}')
+            paths.add(path)
+    for reverse in (True, False):
+        with tempfile.TemporaryDirectory(prefix='w1700k-monitors-') as directory:
+            staged = Path(directory)
+            for path in paths:
+                if (tree / path).exists():
+                    (staged / path).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(tree / path, staged / path)
+            command = ['git', '-C', str(staged), 'apply', '--whitespace=nowarn']
+            complete = True
+            for patch in (reversed(patches) if reverse else patches):
+                args = [*command, '--reverse', str(patch)] if reverse else [*command, '--check', str(patch)]
+                result = subprocess.run(args, capture_output=True)
+                if result.returncode:
+                    if not reverse and subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode == 0:
+                        continue
+                    complete = False
+                    if not reverse:
+                        raise RuntimeError(f'Monitor patch no longer applies: {patch.name}')
+                    break
+                if not reverse:
+                    subprocess.run([*command, str(patch)], check=True, capture_output=True)
+            if not complete:
+                continue
+            if not reverse:
+                for path in paths:
+                    if (staged / path).is_file():
+                        (tree / path).parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(staged / path, tree / path)
+                    elif (tree / path).is_file():
+                        (tree / path).unlink()
+            return
 
 
 def apply(openwrt):
@@ -41,13 +91,7 @@ def apply(openwrt):
             subprocess.run([*command, str(patch)], check=True)
         elif subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode:
             raise RuntimeError(f'Packages patch no longer applies: {patch.name}')
-    # Keep the upstream dashboard while applying our small presentation fix.
-    for patch in sorted((ROOT / 'patches/flowsense').glob('*.patch')):
-        command = ['git', '-C', str(openwrt), 'apply', '--whitespace=nowarn']
-        if subprocess.run([*command, '--check', str(patch)], capture_output=True).returncode == 0:
-            subprocess.run([*command, str(patch)], check=True)
-        elif subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode:
-            raise RuntimeError(f'FlowSense patch no longer applies: {patch.name}')
+    apply_patch_series(openwrt, sorted((ROOT / 'patches/flowsense').glob('*.patch')))
     # The stock ASU ACL grants upgrade_start to read-only users. Keep firmware
     # installation in the write scope alongside our authenticated helper.
     acl_path = attended / 'root/usr/share/rpcd/acl.d/luci-app-attendedsysupgrade.json'
@@ -108,6 +152,14 @@ def verify(openwrt):
     flowsense = (root / 'www/luci-static/resources/view/airoha_flowsense/status.js').read_text(encoding='utf-8')
     if 'function latencyState(' not in flowsense or 'cs.latency.detail' not in flowsense:
         raise RuntimeError('FlowSense mean RTT display is missing from rootfs')
+    npu_view = (root / 'www/luci-static/resources/view/airoha_npu/status.js').read_text(encoding='utf-8')
+    for monitor in (flowsense, npu_view):
+        if 'tools.w1700k-frame-engine' not in monitor or 'frameEngine.createTracker()' not in monitor:
+            raise RuntimeError('Shared Frame Engine counter display missing from rootfs')
+    for name in ('luci.airoha_npu', 'luci.airoha_flowsense'):
+        rpc = (root / 'usr/libexec/rpcd' / name).read_text(encoding='utf-8')
+        if '/usr/libexec/w1700k-frame-engine' not in rpc or '0x1fb52604' in rpc:
+            raise RuntimeError(f'Driver GDM collector missing from {name}')
     if 'npu-monitor.jitter.enabled' not in (root / 'etc/init.d/npu-jitter').read_text():
         raise RuntimeError('FlowSense sampler opt-out is missing from rootfs')
     backend = (root / 'usr/libexec/rpcd/luci.airoha_flowsense').read_text()

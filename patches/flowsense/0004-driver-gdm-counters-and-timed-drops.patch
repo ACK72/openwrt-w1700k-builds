@@ -1,0 +1,505 @@
+From: ACK72 <ACK72@users.noreply.github.com>
+Subject: [PATCH] monitors: use driver GDM totals and valid timed drop samples
+
+SPDX-License-Identifier: Apache-2.0
+
+--- a/package/luci-app-airoha-flowsense/htdocs/luci-static/resources/view/airoha_flowsense/status.js
++++ b/package/luci-app-airoha-flowsense/htdocs/luci-static/resources/view/airoha_flowsense/status.js
+@@ -1,12 +1,13 @@
+ 'use strict';
+ 'require view';
++'require tools.w1700k-frame-engine as frameEngine';
+ 'require poll';
+ 'require rpc';
+ 'require ui';
+ 
+ /* ── Drop-delta tracking (all counters are cumulative since interface up) ── */
+-var _prevPseDrops    = null;
+-var _prevCdmHwfDrops = null;
++var _frameTracker = frameEngine.createTracker();
++
+ var _prevBridgeDrops = null;
+ var _prevPpeBnd      = null;  // for tachometer heartbeat
+ var _prevBandBnd     = [null, null, null];  // per-WiFi-band BND, drives the HW-accel pulse
+@@ -20,7 +21,8 @@
+ var callNpuStatus        = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getStatus' });
+ var callPpeEntries       = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getPpeEntries' });
+ var callTokenInfo        = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getTokenInfo' });
+-var callFrameEngine      = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getFrameEngine' });
++var fetchFrameEngine = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getFrameEngine' });
++function callFrameEngine() { return fetchFrameEngine().catch(function() { return { error: 'Frame Engine counters unavailable' }; }); }
+ var callTxStats          = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getTxStats' });
+ var callGetVlanOffload   = rpc.declare({ object: 'luci.airoha_flowsense', method: 'getVlanOffload' });
+ var callSetVlanOffload   = rpc.declare({ object: 'luci.airoha_flowsense', method: 'setVlanOffload', params: ['enabled'] });
+@@ -651,49 +653,16 @@
+ 	return E('div', { 'id': 'conflict-alerts', 'class': 'alert-wrap' }, items);
+ }
+ 
+-/* ── HW Buffer Health (replaces SQM — NPU traffic bypasses qdisc entirely) ── */
++/* ── Drop counters (replaces SQM — NPU traffic bypasses qdisc entirely) ── */
+ function hwBufferState(fe, ppe, mode) {
+-	fe = fe || {}; ppe = ppe || {}; mode = mode || 'router';
+-
+-	// PSE port drops: cumulative across all internal ports (0-9).
+-	// These include CDM/PPE internal paths that drop normally — not a reliable
+-	// congestion signal on their own. Track for display only.
+-	var ports = Array.isArray(fe.pse_ports) ? fe.pse_ports : [];
+-	var pseDrops = 0;
+-	ports.forEach(function(p) { pseDrops += (p.drops || 0); });
+-
+-	// CDM HW-forwarding drops — frames the NPU forwarded that CDM couldn't accept.
+-	// More sensitive than GDM TX drops (which only fire at wire-level jam) and
+-	// directly reflects NPU path congestion.
+-	var cdmHwfDrops = ((fe.cdm1||{}).rx_hwf_drop||0) + ((fe.cdm2||{}).rx_hwf_drop||0);
+-
+-	// Delta since last poll — null on first call (baseline only, no alarm)
+-	var pseDelta    = (_prevPseDrops    !== null && pseDrops    >= _prevPseDrops)    ? (pseDrops    - _prevPseDrops)    : 0;
+-	var cdmHwfDelta = (_prevCdmHwfDrops !== null && cdmHwfDrops >= _prevCdmHwfDrops) ? (cdmHwfDrops - _prevCdmHwfDrops) : 0;
+-	_prevPseDrops    = pseDrops;
+-	_prevCdmHwfDrops = cdmHwfDrops;
+-
+-	// DROPPING on CDM HW-forwarding drops or very high PSE bursts (>200/poll).
+-	var activeDrop = cdmHwfDelta > 0 || pseDelta > 200;
+-
+-	// PPE offload efficiency — BND/(BND+UNB). Shown in subtitle for info only.
+-	// LOW OFFLOAD state removed: low BND% when idle is expected, not a problem.
+-	var ppeBound = (ppe.bnd || {}).total || 0;
+-	var ppeUnb   = (ppe.unb || {}).total || 0;
+-	var ppeTotal = ppeBound + ppeUnb;
+-	var ppePct   = ppeTotal > 0 ? Math.round(ppeBound / ppeTotal * 100) : 0;
+-
+-	var color = activeDrop ? '#f5a623' : '#00cc44';
+-	return {
+-		pseDrops: pseDrops, cdmHwfDrops: cdmHwfDrops, pseDelta: pseDelta, cdmHwfDelta: cdmHwfDelta,
+-		activeDrop: activeDrop,
+-		ppeBound: ppeBound, ppeTotal: ppeTotal, ppePct: ppePct,
+-		color: color, pulsing: activeDrop
+-	};
+-}
+-
+-/* ── Compass SVG ── */
+-// Router-to-target RTT, not the latency of all accelerated flows.
++	var state = _frameTracker(fe);
++	state.color = !state.available ? '#888' : state.activeDrop ? '#f5a623' : '#00cc44';
++	state.pulsing = state.activeDrop;
++	state.label = !state.available ? 'N/A' : state.activeDrop ? 'DROPS OBSERVED' : 'NO NEW DROPS';
++	state.detail = frameEngine.summary(state);
++	return state;
++}
++
+ function latencyState(jitter) {
+ 	jitter = jitter || {};
+ 	var average = typeof jitter.avg_ping === 'number' && isFinite(jitter.avg_ping) && jitter.avg_ping >= 0;
+@@ -822,7 +791,7 @@
+ 	'<path id="cp-arc-west" d="'+pWest+'" fill="none" stroke="'+cs.latColor+'" stroke-width="9" stroke-linecap="round" opacity="0.7"/>' +
+ 	// Quadrant labels — curved textPath following each arc
+ 	'<text font-size="9" font-family="monospace" letter-spacing="1.5" opacity="0.75" fill="#00c8ff"><textPath href="#tp-north" startOffset="50%" text-anchor="middle">NPU PATH</textPath></text>' +
+-	'<text font-size="9" font-family="monospace" letter-spacing="1.5" opacity="0.75" id="cp-lbl-south"><textPath href="#tp-south" startOffset="50%" text-anchor="middle">HW BUFFER</textPath></text>' +
++	'<text font-size="9" font-family="monospace" letter-spacing="1.5" opacity="0.75" id="cp-lbl-south"><textPath href="#tp-south" startOffset="50%" text-anchor="middle">DROP COUNTERS</textPath></text>' +
+ 	'<text font-size="9" font-family="monospace" letter-spacing="1.5" opacity="0.75" id="cp-lbl-east"><textPath href="#tp-east"  startOffset="50%" text-anchor="middle">INTEGRITY</textPath></text>' +
+ 	'<text font-size="9" font-family="monospace" letter-spacing="1.5" opacity="0.75" id="cp-lbl-west"><textPath href="#tp-west"  startOffset="50%" text-anchor="middle">LATENCY</textPath></text>' +
+ 	// Latency needle
+@@ -1395,11 +1364,11 @@
+ 	}
+ 	var eastColor = cs.eastColor;
+ 
+-	// South card: HW Buffer Health
++	// South card: Drop counters
+ 	var hb = cs.hwBuf || {};
+-	var southVal   = hb.activeDrop ? 'DROPPING' : 'HEALTHY';
++	var southVal   = hb.label || 'N/A';
+ 	var southColor = hb.color || '#00cc44';
+-	var southSub   = 'PSE Δ: '+hb.pseDelta+' CDM Δ: '+hb.cdmHwfDelta+' | PPE: '+hb.ppePct+'% BND ('+hb.ppeBound+'/'+hb.ppeTotal+')';
++	var southSub   = hb.detail || 'Counters unavailable';
+ 
+ 	// West card: Latency
+ 	var latVal   = cs.latency.label;
+@@ -1418,7 +1387,7 @@
+ 		card('NPU Path',    northVal, northColor, northSub),
+ 		card('Integrity',   eastVal,  eastColor,  eastSub),
+ 		card('Latency',     latVal,   latColor,   latSub),
+-		card('HW Buffer',   southVal, southColor, southSub)
++		card('Drop counters',   southVal, southColor, southSub)
+ 	]);
+ }
+ 
+@@ -1472,9 +1441,9 @@
+ 
+ 	var hb = cs.hwBuf || {};
+ 	setCard(divs[3],
+-		hb.activeDrop?'DROPPING':'HEALTHY',
++		hb.label || 'N/A',
+ 		hb.color||'#00cc44',
+-		'PSE Δ: '+hb.pseDelta+' CDM Δ: '+hb.cdmHwfDelta+' | PPE: '+hb.ppePct+'% BND ('+hb.ppeBound+'/'+hb.ppeTotal+')');
++		hb.detail || 'Counters unavailable');
+ }
+ 
+ /* ── Main View ── */
+--- a/package/luci-app-airoha-flowsense/Makefile
++++ b/package/luci-app-airoha-flowsense/Makefile
+@@ -3,7 +3,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_VERSION:=1.1.9
+-PKG_RELEASE:=8
++PKG_RELEASE:=9
+ PKG_LICENSE:=Apache-2.0
+ 
+ LUCI_TITLE:=LuCI Airoha FlowSense — Offload & PPE Monitor
+--- a/package/luci-app-airoha-flowsense/root/usr/libexec/rpcd/luci.airoha_flowsense
++++ b/package/luci-app-airoha-flowsense/root/usr/libexec/rpcd/luci.airoha_flowsense
+@@ -571,49 +571,12 @@
+ 
+ 	getFrameEngine: {
+ 		call: function() {
+-			const addrs = [];
+-			for (let i = 0; i < 10; i++) push(addrs, 0x1fb50150 + i * 4);   // PSE queue
+-			for (let i = 0; i < 10; i++) push(addrs, 0x1fb50120 + i * 4);   // PSE drops
+-			push(addrs, 0x1fb50104);                                        // shared buffer
+-			for (let base in [ 0x1fb50600, 0x1fb51600, 0x1fb52600 ])        // GDM1/2/4
+-				for (let off in [ 0x04, 0x08, 0x48, 0x4c ])
+-					push(addrs, base + off);
+-			for (let base in [ 0x1fb50580, 0x1fb51580 ])                    // CDM1/2
+-				for (let off in [ 0x00, 0x10, 0x14, 0x20, 0x24 ])
+-					push(addrs, base + off);
+-
+-			const v = devmem_many(addrs);
+-			if (length(v) != length(addrs))
+-				return { error: 'devmem not available' };
+-
+-			const pse_ports = [];
+-			for (let i = 0; i < 10; i++)
+-				push(pse_ports, {
+-					port: i,
+-					iq: (v[i] >> 16) & 0xFFFF,
+-					oq: v[i] & 0xFFFF,
+-					drops: v[10 + i]
+-				});
+-
+-			const psb = v[20];
+-			let n = 21;
+-			const gdm = [];
+-			for (let g = 0; g < 3; g++, n += 4)
+-				push(gdm, { tx: v[n], tx_drop: v[n + 1], rx: v[n + 2], rx_drop: v[n + 3] });
+-			const cdm = [];
+-			for (let c = 0; c < 2; c++, n += 5)
+-				push(cdm, {
+-					tx: v[n], rx_cpu: v[n + 1], rx_hwf: v[n + 2],
+-					rx_cpu_drop: v[n + 3], rx_hwf_drop: v[n + 4]
+-				});
+-
+-			return {
+-				pse_ports,
+-				pse_used: (psb >> 16) & 0xFFFF,
+-				pse_free: psb & 0x7FFF,
+-				gdm1: gdm[0], gdm2: gdm[1], gdm4: gdm[2],
+-				cdm1: cdm[0], cdm2: cdm[1]
+-			};
++			const p = popen('/usr/bin/ucode /usr/libexec/w1700k-frame-engine');
++			if (!p) return { error: 'Frame Engine counters unavailable' };
++			const output = p.read('all'), status = p.close();
++			if (status != 0) return { error: 'Frame Engine counters unavailable' };
++			try { return json(output); }
++			catch (error) { return { error: 'Invalid Frame Engine sample' }; }
+ 		}
+ 	},
+ 
+--- a/package/luci-app-airoha-flowsense/root/usr/share/luci-airoha-flowsense/backend.sh
++++ b/package/luci-app-airoha-flowsense/root/usr/share/luci-airoha-flowsense/backend.sh
+@@ -385,108 +385,8 @@
+ 
+ 
+ get_frame_engine() {
+-	if ! command -v devmem > /dev/null 2>&1; then
+-		echo '{"error":"devmem not available"}'
+-		return
+-	fi
+-
+-	# PSE queue status (IQ=hi16, OQ=lo16) and drop counts for each port
+-	local i reg_q reg_d pse_ports=""
+-	for i in 0 1 2 3 4 5 6 7 8 9; do
+-		reg_q=$(printf "0x%x" $((0x1fb50150 + i * 4)))
+-		reg_d=$(printf "0x%x" $((0x1fb50120 + i * 4)))
+-		local qval=$(($(devmem $reg_q)))
+-		local dval=$(($(devmem $reg_d)))
+-		local iq=$(( (qval >> 16) & 0xFFFF ))
+-		local oq=$(( qval & 0xFFFF ))
+-		[ -n "$pse_ports" ] && pse_ports="${pse_ports},"
+-		pse_ports="${pse_ports}{\"port\":${i},\"iq\":${iq},\"oq\":${oq},\"drops\":${dval}}"
+-	done
+-
+-	# PSE shared buffer
+-	local psb=$(($(devmem 0x1fb50104)))
+-	local pse_used=$(( (psb >> 16) & 0xFFFF ))
+-	local pse_free=$(( psb & 0x7FFF ))
+-
+-	# GDM counters (TX_OK, TX_DROP, RX_OK, RX_FC_DROP, RX_OVER_DROP)
+-	# Read as hex to handle large 32-bit counters
+-	local gdm1_tx=$(($(devmem 0x1fb50604)))
+-	local gdm1_txd=$(($(devmem 0x1fb50608)))
+-	local gdm1_rx=$(($(devmem 0x1fb50648)))
+-	local gdm1_rxd=$(($(devmem 0x1fb5064c)))
+-
+-	local gdm2_tx=$(($(devmem 0x1fb51604)))
+-	local gdm2_txd=$(($(devmem 0x1fb51608)))
+-	local gdm2_rx=$(($(devmem 0x1fb51648)))
+-	local gdm2_rxd=$(($(devmem 0x1fb5164c)))
+-
+-	local gdm4_tx=$(($(devmem 0x1fb52604)))
+-	local gdm4_txd=$(($(devmem 0x1fb52608)))
+-	local gdm4_rx=$(($(devmem 0x1fb52648)))
+-	local gdm4_rxd=$(($(devmem 0x1fb5264c)))
+-
+-	# CDM counters (TX_OK, RXCPU_OK, RXHWF_OK, RXCPU_DROP, RXHWF_DROP)
+-	local cdm1_tx=$(($(devmem 0x1fb50580)))
+-	local cdm1_rxcpu=$(($(devmem 0x1fb50590)))
+-	local cdm1_rxhwf=$(($(devmem 0x1fb50594)))
+-	local cdm1_rxcpud=$(($(devmem 0x1fb505a0)))
+-	local cdm1_rxhwfd=$(($(devmem 0x1fb505a4)))
+-
+-	local cdm2_tx=$(($(devmem 0x1fb51580)))
+-	local cdm2_rxcpu=$(($(devmem 0x1fb51590)))
+-	local cdm2_rxhwf=$(($(devmem 0x1fb51594)))
+-	local cdm2_rxcpud=$(($(devmem 0x1fb515a0)))
+-	local cdm2_rxhwfd=$(($(devmem 0x1fb515a4)))
+-
+-	printf '{"pse_ports":[%s],"pse_used":%d,"pse_free":%d,' "$pse_ports" "$pse_used" "$pse_free"
+-	printf '"gdm1":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm1_tx" "$gdm1_txd" "$gdm1_rx" "$gdm1_rxd"
+-	printf '"gdm2":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm2_tx" "$gdm2_txd" "$gdm2_rx" "$gdm2_rxd"
+-	printf '"gdm4":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm4_tx" "$gdm4_txd" "$gdm4_rx" "$gdm4_rxd"
+-	printf '"cdm1":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d},' "$cdm1_tx" "$cdm1_rxcpu" "$cdm1_rxhwf" "$cdm1_rxcpud" "$cdm1_rxhwfd"
+-	printf '"cdm2":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}}' "$cdm2_tx" "$cdm2_rxcpu" "$cdm2_rxhwf" "$cdm2_rxcpud" "$cdm2_rxhwfd"
+-}
+-
+-get_tx_stats() {
+-	local stats_file="/sys/kernel/debug/ieee80211/phy0/mt76/tx_stats"
+-
+-	if [ ! -f "$stats_file" ]; then
+-		echo '{"bands":[]}'
+-		return
+-	fi
+-
+-	awk '
+-	BEGIN {
+-		band = -1
+-		printf "{\"bands\":["
+-		first = 1
+-	}
+-	/Phy band [0-9]/ {
+-		if (band >= 0) {
+-			if (!first) printf ","
+-			first = 0
+-			drops = attempts - success
+-			if (drops < 0) drops = 0
+-			printf "{\"band\":%d,\"attempts\":%d,\"success\":%d,\"drops\":%d,\"per\":%d,\"ba_miss\":%d}", \
+-				band, attempts, success, drops, per, ba_miss
+-		}
+-		gsub(/.*band /, ""); band = $1 + 0
+-		attempts = 0; success = 0; per = 0; ba_miss = 0
+-	}
+-	/BA miss count:/ { ba_miss = $NF + 0 }
+-	/Tx attempts:/ { attempts = $3 + 0 }
+-	/Tx success:/ { success = $3 + 0 }
+-	/Tx PER:/ { p = $NF; gsub(/%/, "", p); per = p + 0 }
+-	END {
+-		if (band >= 0) {
+-			if (!first) printf ","
+-			drops = attempts - success
+-			if (drops < 0) drops = 0
+-			printf "{\"band\":%d,\"attempts\":%d,\"success\":%d,\"drops\":%d,\"per\":%d,\"ba_miss\":%d}", \
+-				band, attempts, success, drops, per, ba_miss
+-		}
+-		printf "]}"
+-	}
+-	' "$stats_file" 2>/dev/null || echo '{"bands":[]}'
++	/usr/bin/ucode /usr/libexec/w1700k-frame-engine ||
++		printf '%s\n' '{"error":"Frame Engine counters unavailable"}'
+ }
+ 
+ get_vlan_offload() {
+--- a/package/luci-app-airoha-npu/htdocs/luci-static/resources/view/airoha_npu/status.js
++++ b/package/luci-app-airoha-npu/htdocs/luci-static/resources/view/airoha_npu/status.js
+@@ -1,13 +1,16 @@
+ 'use strict';
+ 'require view';
++'require tools.w1700k-frame-engine as frameEngine';
+ 'require poll';
+ 'require rpc';
+ 'require ui';
+ 
++var _frameTracker = frameEngine.createTracker();
+ var callNpuStatus = rpc.declare({ object: 'luci.airoha_npu', method: 'getStatus' });
+ var callPpeEntries = rpc.declare({ object: 'luci.airoha_npu', method: 'getPpeEntries' });
+ var callTokenInfo = rpc.declare({ object: 'luci.airoha_npu', method: 'getTokenInfo' });
+-var callFrameEngine = rpc.declare({ object: 'luci.airoha_npu', method: 'getFrameEngine' });
++var fetchFrameEngine = rpc.declare({ object: 'luci.airoha_npu', method: 'getFrameEngine' });
++function callFrameEngine() { return fetchFrameEngine().catch(function() { return { error: 'Frame Engine counters unavailable' }; }); }
+ var callSetGovernor = rpc.declare({ object: 'luci.airoha_npu', method: 'setGovernor', params: ['governor'] });
+ var callSetMaxFreq = rpc.declare({ object: 'luci.airoha_npu', method: 'setMaxFreq', params: ['freq'] });
+ var callSetOverclock = rpc.declare({ object: 'luci.airoha_npu', method: 'setOverclock', params: ['freq_mhz'] });
+@@ -165,7 +168,8 @@
+ 
+ /* ── Frame Engine Diagram (with WiFi bands, NPU, PPE flows) ── */
+ function renderFeDiagram(fe, ti, st) {
+-	if (!fe || fe.error) return E('div', { 'class': 'soc-muted' }, 'devmem not available on this build');
++	var drops = _frameTracker(fe);
++	if (!fe || fe.error) return E('div', { 'class': 'soc-muted' }, 'Frame Engine counters unavailable');
+ 	ti = ti || {}; st = st || {};
+ 
+ 	var ports = Array.isArray(fe.pse_ports) ? fe.pse_ports : [];
+@@ -173,25 +177,21 @@
+ 	// Helper: GDM card
+ 	function gdmCard(key, name, label, color, pse) {
+ 		var d = fe[key] || {};
+-		var active = d.tx > 0 || d.rx > 0;
+-		return E('div', { 'class': 'soc-card soc-card-accent', 'style': 'border-left-color:'+color + (active?';border-color:'+color:'') }, [
+-			E('div', { 'style': 'display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px' }, [
+-				E('span', { 'style': 'font-weight:bold;color:'+color+';font-size:14px' }, name),
+-				E('span', { 'class': 'soc-label' }, pse)
+-			]),
+-			E('div', { 'class': 'soc-label', 'style': 'margin-bottom:6px' }, label),
+-			E('div', { 'style': 'display:grid;grid-template-columns:auto 1fr;gap:2px 10px;font-size:12px' }, [
+-				E('span', { 'class': 'soc-muted' }, 'TX'), E('span', { 'class': 'soc-text', 'style': 'text-align:right' }, fmtK(d.tx)),
+-				E('span', { 'class': 'soc-muted' }, 'RX'), E('span', { 'class': 'soc-text', 'style': 'text-align:right' }, fmtK(d.rx))
+-			].concat(d.tx_drop > 0 ? [
+-				E('span', { 'style': 'color:#f44336' }, 'TX Drop'), E('span', { 'style': 'color:#f44336;text-align:right' }, fmtK(d.tx_drop))
+-			] : []).concat(d.rx_drop > 0 ? [
+-				E('span', { 'style': 'color:#f44336' }, 'RX Drop'), E('span', { 'style': 'color:#f44336;text-align:right' }, fmtK(d.rx_drop))
+-			] : []))
++		var available = d.available === true;
++		return E('div', { 'class': 'soc-card soc-card-accent', 'style': 'border-left-color:'+color }, [
++			E('div', { 'style': 'display:flex;justify-content:space-between' }, [
++				E('strong', { 'style': 'color:'+color }, name), E('span', { 'class':'soc-label' }, pse)
++			]),
++			E('div', { 'class':'soc-label' }, label),
++			E('div', { 'class':'soc-label' }, available ? 'Cumulative packets · '+d.interfaces.join(', ') : 'Counters unavailable'),
++			E('div', { 'style':'display:grid;grid-template-columns:1fr auto;gap:2px 10px;font-size:12px' },
++				[['TX', 'tx'], ['RX', 'rx'], ['TX drops total', 'tx_drop'], ['RX drops total', 'rx_drop']].reduce(function(cells, item) {
++					cells.push(E('span', { 'class':'soc-muted' }, item[0]), E('span', {}, available ? fmtK(d[item[1]]) : 'N/A'));
++					return cells;
++				}, []))
+ 		]);
+ 	}
+ 
+-	// Helper: CDM offload bar
+ 	function cdmCard(key, name, label, pse) {
+ 		var d = fe[key] || {};
+ 		var total = (d.rx_cpu||0) + (d.rx_hwf||0);
+@@ -225,10 +225,11 @@
+ 			E('span', { 'style': 'font-weight:bold;color:#9c27b0;font-size:14px' }, 'CDM4'),
+ 			E('span', { 'class': 'soc-label' }, 'P7 WiFi DMA')
+ 		]),
+-		E('div', { 'style': 'display:flex;gap:12px;font-size:11px;margin-bottom:8px' }, [
++		E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:6px 12px;font-size:11px;margin-bottom:8px' }, [
+ 			E('span', { 'class': 'soc-muted' }, 'IQ '+p7.iq),
+ 			E('span', { 'class': 'soc-muted' }, 'OQ '+p7.oq),
+-			p7.drops > 0 ? E('span', { 'style': 'color:#f44336' }, 'Drop '+fmtK(p7.drops)) : null
++			E('span', { 'style': 'color:'+(drops.available && drops.ports[7].delta > 0 ? '#f5a623' : 'var(--soc-muted)') }, frameEngine.dropText(drops, 7)),
++			E('span', { 'class':'soc-muted' }, 'Total '+fmtK(p7.drops))
+ 		].filter(Boolean)),
+ 		// WiFi bands inside
+ 		E('div', { 'style': 'display:grid;grid-template-columns:repeat(3,1fr);gap:6px' }, bandChips)
+@@ -274,13 +275,14 @@
+ 	// PSE port cells (skip P7 since it's shown in CDM4/WiFi section)
+ 	var portCells = ports.filter(function(p){ return p.port !== 7; }).map(function(p) {
+ 		var info = psePortMap[p.port] || { name:'P'+p.port, label:'?', color:'#666' };
+-		var drop = p.drops > 0;
++		var drop = drops.available && drops.ports[p.port].delta > 0;
+ 		return E('div', { 'class': 'soc-pse-cell', 'style': drop ? 'border-color:#f44336' : '' }, [
+ 			E('div', { 'style': 'font-weight:600;color:'+info.color+';font-size:11px' }, 'P'+p.port+' '+info.name),
+-			E('div', { 'style': 'display:flex;gap:8px;font-size:11px;margin-top:2px' }, [
++			E('div', { 'style': 'display:flex;flex-wrap:wrap;gap:4px 8px;font-size:11px;margin-top:2px' }, [
+ 				E('span', { 'class': 'soc-muted' }, 'IQ '+p.iq),
+ 				E('span', { 'class': 'soc-muted' }, 'OQ '+p.oq),
+-				drop ? E('span', { 'style': 'color:#f44336' }, fmtK(p.drops)) : null
++				E('span', { 'style': 'color:'+(drop ? '#f5a623' : 'var(--soc-muted)') }, frameEngine.dropText(drops, p.port)),
++				E('span', { 'class':'soc-muted' }, 'Total '+fmtK(p.drops))
+ 			].filter(Boolean))
+ 		]);
+ 	});
+--- a/package/luci-app-airoha-npu/Makefile
++++ b/package/luci-app-airoha-npu/Makefile
+@@ -3,11 +3,11 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_VERSION:=1.0.3
+-PKG_RELEASE:=1
++PKG_RELEASE:=2
+ PKG_LICENSE:=Apache-2.0
+ 
+ LUCI_TITLE:=LuCI Airoha SoC Status (NPU, CPU, Frame Engine)
+-LUCI_DEPENDS:=+luci-base @TARGET_airoha
++LUCI_DEPENDS:=+luci-base +ucode +ucode-mod-fs @TARGET_airoha
+ 
+ include $(TOPDIR)/feeds/luci/luci.mk
+ 
+--- a/package/luci-app-airoha-npu/root/usr/libexec/rpcd/luci.airoha_npu
++++ b/package/luci-app-airoha-npu/root/usr/libexec/rpcd/luci.airoha_npu
+@@ -384,65 +384,8 @@
+ }
+ 
+ get_frame_engine() {
+-	if ! command -v devmem > /dev/null 2>&1; then
+-		echo '{"error":"devmem not available"}'
+-		return
+-	fi
+-
+-	# PSE queue status (IQ=hi16, OQ=lo16) and drop counts for each port
+-	local i reg_q reg_d pse_ports=""
+-	for i in 0 1 2 3 4 5 6 7 8 9; do
+-		reg_q=$(printf "0x%x" $((0x1fb50150 + i * 4)))
+-		reg_d=$(printf "0x%x" $((0x1fb50120 + i * 4)))
+-		local qval=$(($(devmem $reg_q)))
+-		local dval=$(($(devmem $reg_d)))
+-		local iq=$(( (qval >> 16) & 0xFFFF ))
+-		local oq=$(( qval & 0xFFFF ))
+-		[ -n "$pse_ports" ] && pse_ports="${pse_ports},"
+-		pse_ports="${pse_ports}{\"port\":${i},\"iq\":${iq},\"oq\":${oq},\"drops\":${dval}}"
+-	done
+-
+-	# PSE shared buffer
+-	local psb=$(($(devmem 0x1fb50104)))
+-	local pse_used=$(( (psb >> 16) & 0xFFFF ))
+-	local pse_free=$(( psb & 0x7FFF ))
+-
+-	# GDM counters (TX_OK, TX_DROP, RX_OK, RX_FC_DROP, RX_OVER_DROP)
+-	# Read as hex to handle large 32-bit counters
+-	local gdm1_tx=$(($(devmem 0x1fb50604)))
+-	local gdm1_txd=$(($(devmem 0x1fb50608)))
+-	local gdm1_rx=$(($(devmem 0x1fb50648)))
+-	local gdm1_rxd=$(($(devmem 0x1fb5064c)))
+-
+-	local gdm2_tx=$(($(devmem 0x1fb51604)))
+-	local gdm2_txd=$(($(devmem 0x1fb51608)))
+-	local gdm2_rx=$(($(devmem 0x1fb51648)))
+-	local gdm2_rxd=$(($(devmem 0x1fb5164c)))
+-
+-	local gdm4_tx=$(($(devmem 0x1fb52604)))
+-	local gdm4_txd=$(($(devmem 0x1fb52608)))
+-	local gdm4_rx=$(($(devmem 0x1fb52648)))
+-	local gdm4_rxd=$(($(devmem 0x1fb5264c)))
+-
+-	# CDM counters (TX_OK, RXCPU_OK, RXHWF_OK, RXCPU_DROP, RXHWF_DROP)
+-	local cdm1_tx=$(($(devmem 0x1fb50580)))
+-	local cdm1_rxcpu=$(($(devmem 0x1fb50590)))
+-	local cdm1_rxhwf=$(($(devmem 0x1fb50594)))
+-	local cdm1_rxcpud=$(($(devmem 0x1fb505a0)))
+-	local cdm1_rxhwfd=$(($(devmem 0x1fb505a4)))
+-
+-	local cdm2_tx=$(($(devmem 0x1fb51580)))
+-	local cdm2_rxcpu=$(($(devmem 0x1fb51590)))
+-	local cdm2_rxhwf=$(($(devmem 0x1fb51594)))
+-	local cdm2_rxcpud=$(($(devmem 0x1fb515a0)))
+-	local cdm2_rxhwfd=$(($(devmem 0x1fb515a4)))
+-
+-	printf '{"pse_ports":[%s],"pse_used":%d,"pse_free":%d,' "$pse_ports" "$pse_used" "$pse_free"
+-	printf '"gdm1":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm1_tx" "$gdm1_txd" "$gdm1_rx" "$gdm1_rxd"
+-	printf '"gdm2":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm2_tx" "$gdm2_txd" "$gdm2_rx" "$gdm2_rxd"
+-	printf '"gdm4":{"tx":%d,"tx_drop":%d,"rx":%d,"rx_drop":%d},' "$gdm4_tx" "$gdm4_txd" "$gdm4_rx" "$gdm4_rxd"
+-	printf '"cdm1":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d},' "$cdm1_tx" "$cdm1_rxcpu" "$cdm1_rxhwf" "$cdm1_rxcpud" "$cdm1_rxhwfd"
+-	printf '"cdm2":{"tx":%d,"rx_cpu":%d,"rx_hwf":%d,"rx_cpu_drop":%d,"rx_hwf_drop":%d}}' "$cdm2_tx" "$cdm2_rxcpu" "$cdm2_rxhwf" "$cdm2_rxcpud" "$cdm2_rxhwfd"
++	/usr/bin/ucode /usr/libexec/w1700k-frame-engine ||
++		printf '%s\n' '{"error":"Frame Engine counters unavailable"}'
+ }
+ 
+ get_vlan_offload() {
