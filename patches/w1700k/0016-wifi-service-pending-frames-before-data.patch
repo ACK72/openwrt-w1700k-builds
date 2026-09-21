@@ -17,7 +17,7 @@ diff --git a/package/kernel/mt76/patches/9999-z-mt76-pending-before-data.patch b
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-z-mt76-pending-before-data.patch
-@@ -0,0 +1,640 @@
+@@ -0,0 +1,645 @@
 +From: ACK72 <ACK72@users.noreply.github.com>
 +Subject: [PATCH] mt76: service pending frames before shared data queues
 +
@@ -33,9 +33,12 @@ new file mode 100644
 +Separate-hw devices and exported pending-drain callers retain their order.
 +This does not establish the cause of missed beacons or PCIe failures.
 +
++Skip adjacent aliases while initializing shared-ring budgets. Keep
++per-frame kicks and all admission checks unchanged.
++
 +--- a/tx.c
 ++++ b/tx.c
-+@@ -432,458 +432,592 @@
++@@ -432,458 +432,594 @@
 + 		info->flags |= IEEE80211_TX_STATUS_EOSP |
 + 			       IEEE80211_TX_CTL_REQ_TX_STATUS;
 + 
@@ -440,6 +443,7 @@ new file mode 100644
 ++mt76_txq_schedule_shared(struct mt76_dev *dev, struct mt76_phy **phys, int nphy)
 ++{
 ++	struct mt76_tx_pending pending[ARRAY_SIZE(dev->phys) + 1];
+++	struct mt76_queue *last_q = NULL;
 ++	bool reschedule = false;
 ++	int start, i, j;
 ++
@@ -466,8 +470,9 @@ new file mode 100644
 ++			struct mt76_queue *q = phys[i]->q_tx[j];
 ++			int free;
 ++
-++			if (!q)
+++			if (!q || q == last_q)
 ++				continue;
+++			last_q = q;
 ++			free = max_t(int, (int)q->ndesc - MT_TXQ_FREE_THR -
 ++					 READ_ONCE(q->queued), 0);
 ++			q->tx_pending_budget = min_t(int, MT_TXQ_FREE_THR,

@@ -101,6 +101,10 @@
     {
       "file": "0017-wifi-bump-recovery-failure-release.patch",
       "description": "Bump mt76 package release for checked DMA errors and terminal STA disconnect handling."
+    },
+    {
+      "file": "0018-airoha-name-qdma-napi-threads.patch",
+      "description": "Expose real QDMA/ring names for IRQ/NAPI group locality; no RSS or PID-order inference."
     }
   ]
 }

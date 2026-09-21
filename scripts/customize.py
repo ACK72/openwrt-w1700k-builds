@@ -14,7 +14,7 @@ VIEW = 'htdocs/luci-static/resources/view/attendedsysupgrade/overview.js'
 RUNTIME_COMMANDS = ('sh', 'ls', 'awk', 'chmod', 'mkdir', 'mv', 'rm', 'rmdir',
                     'jq', 'curl', 'grep', 'sha256sum', 'wc', 'tr', 'df', 'sleep',
                     'ubus', 'uci', 'sysupgrade', 'devmem', 'cat', 'timeout', 'ping', 'ip', 'head', 'date',
-                    'mktemp', 'logger', 'ucode')
+                    'mktemp', 'logger', 'ucode', 'taskset')
 
 
 def rendered(source):
@@ -34,6 +34,13 @@ def apply(openwrt):
         elif subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode:
             raise RuntimeError(f'LuCI patch no longer applies: {patch.name}')
     view.write_bytes(rendered(PACKAGE / 'overview.js'))
+    # Keep irqbalance from moving IRQs owned by the platform NAPI policy.
+    for patch in sorted((ROOT / 'patches/packages').glob('*.patch')):
+        command = ['git', '-C', str(openwrt / 'feeds/packages'), 'apply', '--whitespace=nowarn']
+        if subprocess.run([*command, '--check', str(patch)], capture_output=True).returncode == 0:
+            subprocess.run([*command, str(patch)], check=True)
+        elif subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode:
+            raise RuntimeError(f'Packages patch no longer applies: {patch.name}')
     # Keep the upstream dashboard while applying our small presentation fix.
     for patch in sorted((ROOT / 'patches/flowsense').glob('*.patch')):
         command = ['git', '-C', str(openwrt), 'apply', '--whitespace=nowarn']
@@ -56,7 +63,7 @@ def apply(openwrt):
     shutil.copytree(PACKAGE / 'root', overlay, dirs_exist_ok=True)
     helper = overlay / 'usr/libexec/w1700k-upgrade'
     helper.write_bytes(rendered(PACKAGE / 'root/usr/libexec/w1700k-upgrade'))
-    for script in [*(overlay / 'usr/libexec').glob('*'),
+    for script in [*(overlay / 'usr/libexec').rglob('*'),
                    *(overlay / 'etc').glob('*.sh'), *(overlay / 'etc/uci-defaults').glob('*'),
                    *(overlay / 'etc/init.d').glob('*'), *(overlay / 'etc/hotplug.d').glob('*/*')]:
         if not script.is_file():
@@ -75,6 +82,8 @@ def verify(openwrt):
     if len(roots) != 1:
         raise RuntimeError('Expected one compiled Airoha root filesystem')
     root = roots[0]
+    if '--policyscript=/usr/libexec/w1700k-irq-policy' not in (root / 'etc/init.d/irqbalance').read_text():
+        raise RuntimeError('irqbalance is missing the platform affinity policy')
     for command in RUNTIME_COMMANDS:
         paths = [root / directory / command for directory in ('bin', 'sbin', 'usr/bin', 'usr/sbin')]
         if not any(path.is_file() or path.is_symlink() for path in paths):
