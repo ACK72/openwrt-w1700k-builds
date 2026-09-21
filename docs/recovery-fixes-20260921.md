@@ -55,7 +55,8 @@ No entire configuration, DTS, prebuilt NPU or regulatory patch set is imported.
 
 The nested patches were replayed on the previously deployed effective source.
 The resulting mt76 files match the implementation tree after LF normalization.
-The existing 30 local tests pass, including new tests executing the actual C
+The current local suite reports 32 tests with 3 environment-dependent skips,
+including tests executing the actual C
 function bodies extracted from the patches with mocked kernel boundaries:
 
 - Full reset success and stop/firmware/NPU/EEPROM/TXBF/radio failures, with NPU
@@ -65,6 +66,10 @@ function bodies extracted from the patches with mocked kernel boundaries:
   scan channel failures, and ROC completion (9 cases).
 - All four station tags, truncated headers/payloads, oversized/zero counts,
   unknown tags and malformed/countdown TLVs (34 cases).
+- Channel worker park ownership and MCU reset races (5 cases).
+- Original versus patched TX worker ordering with a congested shared ring,
+  separate rings, absent radios, primary-radio control traffic, no pending
+  controls and a completely blocked ring (12 cases).
 
 These tests check control flow and ownership, not hardware DMA/AER behavior.
 Full ARM64 compilation and router acceptance are recorded separately when done.
@@ -92,6 +97,41 @@ again. The harness now rejects duplicate parks, and five actual channel-body
 cases cover success, ordinary error, MCU timeout, pre-existing reset and a reset
 racing with successful channel completion. Stop errors now identify SET4,
 GET3 or SET6; the initiating NPU timeout is still under investigation.
+
+### Cross-band STA acceptance and pending-frame scheduling
+
+The 6GHz STA connected to the saved upstream AP and acquired a DHCP lease.
+5GHz channel 44, restricted ACS over 36/40/44/48, and channel 36 each returned
+with the Mac associated. An earlier unrestricted ACS selected channel 173 and
+the Mac did not rejoin within 150 seconds; that does not establish whether
+the client supports that channel. The original configuration is restored
+after every test; no permanent ACS restriction is introduced.
+
+During the subsequent PC-to-Mac 5GHz load, a **real, unrequested** 6GHz STA
+disconnect occurred. At 15:49:17 and 15:49:19, its last-beacon age reached
+790/840ms against the existing 770ms threshold; the software token count was
+974/1003 out of 16384. At 15:49:19 the STA disconnected with locally generated
+reason 4. The AP temporarily rejected reassociation (status 30), and connection
+and DHCP returned at 15:49:26. There was no MCU timeout, AER or full reset.
+Ten-second health polling captured a down sample; event logs establish the
+boundaries more precisely. The two 90-second 5GHz transfers measured 731.8 and
+775.9 Mbit/s; five explicit STA disconnect/reconnect cycles then succeeded.
+
+Patch `0010` addresses a separately demonstrable scheduling defect. The main
+radio's `schedule_all()` runs the shared mac80211 data scheduler before the
+secondary radios' pending lists. On each completion, a busy data TXQ can take
+the newly freed shared-ring entries before a secondary STA's nullfunc probe
+is serviced. The worker now services pending lists on all radios first, while
+preserving data scheduling, ring capacities and completion wakeups. The C
+regression test reproduces starvation in the original worker and delivery in
+the patched worker; data can use every descriptor left over from controls.
+This is not yet evidence that the initial beacon RX gap or the live disconnect
+has been fixed. At 16:05:26, after about thirteen minutes without the test load,
+the same STA disconnected again with only three tokens in flight. It returned
+at 16:05:38 after status-30 rejections and one association timeout. There was
+again no MCU/AER/reset error. Shared-ring saturation therefore cannot explain
+all observed disconnects. Hardware A/B acceptance remains required, and neither
+beacon loss nor mac80211's probe deadlines are relaxed.
 
 ## NPU memory investigation
 

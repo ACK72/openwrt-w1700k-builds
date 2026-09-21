@@ -52,6 +52,10 @@
     {
       "file": "0009-wifi-fix-channel-and-npu-recovery-lifecycle.patch",
       "description": "Complete scan/ROC, propagate channel failures and check NPU stop/restart before resuming recovery. Includes adapted Gilly 047."
+    },
+    {
+      "file": "0010-wifi-service-pending-frames-before-data.patch",
+      "description": "Service secondary-radio control frames before refilling the shared data rings."
     }
   ]
 }
