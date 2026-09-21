@@ -7,19 +7,26 @@ export LC_ALL=C
 TARGET=${1:-1.1.1.1}
 case "$TARGET" in ''|-*|*[!a-zA-Z0-9.:-]*) exit 1;; esac
 RESULT=/tmp/npu-jitter.json
+STATE=/tmp/npu-jitter.window
 INTERVAL=5
 WINDOW=12
 values=
 cpu_prev=
-route_prev=
-trap 'rm -f "$RESULT.tmp"; exit 0' INT TERM
+# Keep a recent window across service reloads. tmpfs naturally expires it on
+# reboot; a changed target, stale timestamp or malformed record starts fresh.
+values=$(awk -v target="$TARGET" -v now="$(date +%s)" -v w="$WINDOW" -v interval="$INTERVAL" '
+    NR==1 { valid=($0==target); next }
+    NR==2 { valid=valid && $0 ~ /^[0-9]+$/ && now >= $0 && now-$0 <= 2*interval; next }
+    NR==3 {
+        if (!valid || NF<1 || NF>w) exit;
+        for(i=1;i<=NF;i++) if($i!="-" && $i!~/^[0-9]+([.][0-9]+)?$/) exit;
+        print;
+    }' "$STATE" 2>/dev/null)
+trap 'rm -f "$RESULT.tmp" "$STATE.tmp"; exit 0' INT TERM
 while :; do
     cpu_now=$(awk '/^cpu / { print $2,$3,$4,$5,$6,$7,$8,$9; exit }' /proc/stat)
-    # Reset the averaging window when the route changes. With mwan3 this is
-    # still a router-originated probe, not a measurement of every WAN/flow.
-    route_now=$(timeout 3 ip route get "$TARGET" 2>/dev/null | head -n 1)
-    [ "$route_now" = "$route_prev" ] || values=
-    route_prev=$route_now
+    # This is the last WINDOW router-to-target attempts, including failover.
+    # A route change or a temporarily absent route must not erase loss/history.
     probe=$(timeout 3 ping -n -c 1 -W 1 "$TARGET" 2>/dev/null)
     rtt=$(printf '%s\n' "$probe" | awk -F'=' '/min.*avg/ { split($2,a,"/"); gsub(/ /,"",a[2]); if (a[2] ~ /^[0-9]+([.][0-9]+)?$/) print a[2] }')
     values="$values ${rtt:--}"
@@ -46,6 +53,7 @@ while :; do
         if($NF=="-")printf "null";else printf "%.3f",$NF;
         printf ",\"jitter\":%.3f,\"samples\":%d,\"attempts\":%d,\"loss_percent\":%.2f,\"interval\":%d,\"updated_at\":%d,\"target\":\"%s\",\"cpu_pct\":%d}\n",jitter,n,NF,100*lost/NF,interval,now,target,cpu;
     }' > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
+    printf '%s\n%s\n%s\n' "$TARGET" "$now" "$values" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
     cpu_prev=$cpu_now
     sleep "$INTERVAL"
 done

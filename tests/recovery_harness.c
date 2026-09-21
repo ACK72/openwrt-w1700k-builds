@@ -2,6 +2,7 @@
  * This verifies sequencing/ownership, not DMA hardware or firmware behaviour.
  */
 typedef unsigned int u32;
+typedef unsigned char u8;
 typedef __SIZE_TYPE__ size_t;
 void *memset(void *p, int v, size_t n) {
     volatile unsigned char *s=p;
@@ -45,6 +46,8 @@ typedef _Bool bool;
 #define MT_RRO_3_0_EMU_CONF 12
 #define MT_RRO_3_0_EMU_CONF_EN_MASK 13
 #define IEEE80211_IFACE_SKIP_SDATA_NOT_IN_DRIVER 0
+#define IEEE80211_IFACE_ITER_RESUME_ALL 1
+#define NL80211_IFTYPE_STATION 2
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define container_of(p,t,m) ((t *)((char *)(p)-(size_t)&((t *)0)->m))
@@ -70,6 +73,7 @@ typedef _Bool bool;
 #define wiphy_name(p) "mock"
 struct work_struct { int unused; };
 struct ieee80211_hw { int wiphy; };
+struct ieee80211_vif { int type; struct { bool assoc; } cfg; };
 struct mt76_queue { int ndesc, kind; };
 struct mt76_phy { unsigned long state; struct work_struct mac_work; };
 struct mt7996_phy { struct mt76_phy *mt76; int omac_mask; };
@@ -98,6 +102,7 @@ static int fault, issues, stopped, wakes, restarted, dma_resets, fw_attempts;
 static int npu_stops, npu_inits, reclaimed, scans, rocs, beacon_grace, scheduled;
 static struct mt7996_dev *active;
 static int wed_mode;
+static int disconnected;
 #define mt7996_for_each_phy(d,p) for ((p)=(d)->phy;(p)<(d)->phy+3;(p)++)
 #define mt76_for_each_q_rx(d,i) for ((i)=0;(i)<5;(i)++)
 static struct ieee80211_hw *mt76_hw(struct mt7996_dev *d) { return d->mt76.hw; }
@@ -134,8 +139,9 @@ static int mt7996_npu_hw_stop(struct mt7996_dev *d) {
     if (!stopped || d->mt76.tx_worker) issues++;
     mutex_unlock(&d->mt76.mutex); return fault==1 ? -110 : 0;
 }
-static void mt7996_dma_reset(struct mt7996_dev *d,bool force) {
+static int mt7996_dma_reset(struct mt7996_dev *d,bool force) {
     dma_resets++; if (!npu_stops || fault==1) issues++;
+    return fault==30 ? -5 : 0;
 }
 static void mt7996_tx_token_put(struct mt7996_dev *d) {
     reclaimed++; if (!npu_stops || fault==1) issues++;
@@ -159,9 +165,16 @@ static void mt7996_init_txpower(struct mt7996_phy *p) { }
 static int mt7996_txbf_init(struct mt7996_dev *d) { return fault==5?-5:0; }
 static int mt7996_run(struct mt7996_phy *p) { return fault==6?-5:0; }
 static void mt7996_mac_reset_sta_iter(void) { }
-static void mt7996_mac_reset_vif_iter(void) { }
+static void mt7996_mac_reset_vif_iter(void *d,u8 *mac,struct ieee80211_vif *v) { }
 static void ieee80211_iterate_stations_atomic(struct ieee80211_hw *h,void (*fn)(void),void *d) { }
-static void ieee80211_iterate_active_interfaces_atomic(struct ieee80211_hw *h,int f,void (*fn)(void),void *d) { }
+static void ieee80211_connection_loss(struct ieee80211_vif *v) { disconnected++; }
+static void ieee80211_iterate_active_interfaces_atomic(struct ieee80211_hw *h,int f,
+        void (*fn)(void *,u8 *,struct ieee80211_vif *),void *d) {
+    struct ieee80211_vif sta={NL80211_IFTYPE_STATION,{true}};
+    struct ieee80211_vif idle={NL80211_IFTYPE_STATION,{false}};
+    struct ieee80211_vif ap={3,{true}};
+    fn(d,NULL,&sta); fn(d,NULL,&idle); fn(d,NULL,&ap);
+}
 static void mt76_reset_device(struct mt76_dev *d) { }
 static int mt76_wcid_alloc(int mask,int n) { return 0; }
 static int mt7996_wait_reset_state(struct mt7996_dev *d,int state) {
@@ -180,7 +193,8 @@ static void ieee80211_queue_delayed_work(struct ieee80211_hw *h,struct work_stru
 int run_case(int code, u32 *out) {
     struct mt7996_dev d={0}; struct mt76_phy other[2]={{0}};
     struct ieee80211_hw hw={0}; int i;
-    fault=code%10; wed_mode=code>=20; active=&d;
+    fault=code>=40 ? 30 : code%10; wed_mode=(code/20)%2; active=&d;
+    disconnected=0;
     issues=stopped=wakes=restarted=dma_resets=fw_attempts=0;
     npu_stops=npu_inits=reclaimed=scans=rocs=beacon_grace=scheduled=0;
     d.mt76.hw=&hw; d.mt76.tx_worker=1; d.mt76.tx_napi=1; d.hif2=1;
@@ -198,5 +212,6 @@ int run_case(int code, u32 *out) {
     out[11]=d.recovery.failed;out[12]=test_bit(MT76_MCU_RESET,&d.mphy.state);
     out[13]=scans;out[14]=rocs;out[15]=beacon_grace;
     out[16]=d.mt76.napi[0]==1 && d.mt76.napi[3]==1 && d.mt76.napi[4]==1 && d.mt76.tx_napi==1;
+    out[17]=disconnected;
     return 0;
 }

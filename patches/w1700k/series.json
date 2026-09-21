@@ -56,6 +56,10 @@
     {
       "file": "0010-wifi-service-pending-frames-before-data.patch",
       "description": "Service secondary-radio control frames before refilling the shared data rings."
+    },
+    {
+      "file": "0011-wifi-bump-recovery-failure-release.patch",
+      "description": "Bump mt76 package release for checked DMA errors and terminal STA disconnect handling."
     }
   ]
 }

@@ -1,0 +1,15 @@
+From: ACK72 <ACK72@users.noreply.github.com>
+Subject: [PATCH] wifi: bump mt76 release for terminal recovery error handling
+
+diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
+--- a/package/kernel/mt76/Makefile
++++ b/package/kernel/mt76/Makefile
+@@ -1,7 +1,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=mt76
+-PKG_RELEASE=7
++PKG_RELEASE=8
+ 
+ PKG_LICENSE:=BSD-3-Clause-Clear
+ PKG_LICENSE_FILES:=

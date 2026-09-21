@@ -1,10 +1,23 @@
 # Gilly follow-up review, 2026-09-21
 
-`origin/main` was fetched again from Gilly1970/Gemtek-W1700K-6.18. Its HEAD
-remains `0aa0666de1366b69d5d73d98c19809affc1f76ed`, the revision used in
-[the earlier selection](gilly-selection.md). There are no new main-branch
-commits since that review. Patch numbers below refer to its `openwrt-patches`.
-This is a recommendation list, not an additional kernel patch import.
+The first review used `0aa0666de1366b69d5d73d98c19809affc1f76ed`. A later
+fetch on September 21 found HEAD `f72939518d0bd3f02c26f42a4d08c4452cb48a9f`.
+The additional commits replace the FlowSense RPC backend with ucode, add fan
+control changes, and activate PCIe IRQ-affinity/packet-steering changes.
+Patch numbers below refer to `openwrt-patches`.
+
+ACK72 main through `a245e96` already includes 026/044/949/957/980 in patch
+0008 and adapted 047 in 0009. Do not mistake the live rollback image
+(`3299068`) for the current source baseline. The remaining full-reset and
+idle-STA failures are recorded in [the recovery report](recovery-fixes-20260921.md).
+
+The netdev-add steering hook is now included: it reruns the existing enabled
+packet-steering service once after a burst of device creation. It does not
+change CPU policy or disable offload. The new 985 parent-IRQ conversion and
+the entire replacement steering policy remain deferred pending dedicated
+interrupt/teardown validation. They are not established fixes for PCIe
+Completion Timeout. The large FlowSense backend and fan-control rewrites
+are also not mixed into the wireless recovery change.
 
 ## Highest-value next changes
 

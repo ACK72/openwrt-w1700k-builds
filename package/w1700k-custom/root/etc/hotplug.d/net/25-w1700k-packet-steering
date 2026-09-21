@@ -1,0 +1,17 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Adapted from Gilly1970/Gemtek-W1700K-6.18 netifd-hotplug-20-packet-steering,
+# revision f72939518d0bd3f02c26f42a4d08c4452cb48a9f.
+# Recreated Wi-Fi netdevs otherwise retain default RPS until a later reload.
+[ "$ACTION" = add ] || exit 0
+device=${DEVICENAME:-$INTERFACE}
+[ -n "$device" ] && [ -e "/sys/class/net/$device/device" ] || exit 0
+[ -x /etc/init.d/packet_steering ] || exit 0
+/etc/init.d/packet_steering enabled || exit 0
+mkdir /var/run/w1700k-steering.pending 2>/dev/null || exit 0
+(
+    trap 'rmdir /var/run/w1700k-steering.pending 2>/dev/null' EXIT
+    sleep 3
+    /etc/init.d/packet_steering reload
+) >/dev/null 2>&1 &
+exit 0

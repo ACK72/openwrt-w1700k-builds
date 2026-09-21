@@ -17,7 +17,7 @@ diff --git a/package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch b/
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch
-@@ -0,0 +1,3986 @@
+@@ -0,0 +1,4448 @@
 +From: ACK72 <ACK72@users.noreply.github.com>
 +Subject: [PATCH] mt76: complete channel operations and fail closed on recovery errors
 +
@@ -1223,7 +1223,24 @@ new file mode 100644
 + }
 +--- a/mt7996/dma.c
 ++++ b/mt7996/dma.c
-+@@ -877,181 +877,183 @@
++@@ -860,198 +860,211 @@
++ 
++ 	if (mt7996_has_hwrro(dev)) {
++ 		/* rx rro data queue for band0 */
++ 		dev->mt76.q_rx[MT_RXQ_RRO_BAND0].flags =
++ 			MT_WED_RRO_Q_DATA(0) | MT_QFLAG_WED_RRO_EN;
++ 		if (mtk_wed_device_active(wed) && mtk_wed_get_rx_capa(wed))
++ 			dev->mt76.q_rx[MT_RXQ_RRO_BAND0].wed = wed;
++ 		ret = mt76_queue_alloc(dev, &dev->mt76.q_rx[MT_RXQ_RRO_BAND0],
++ 				       MT_RXQ_ID(MT_RXQ_RRO_BAND0),
++ 				       MT7996_RX_RING_SIZE,
++ 				       MT7996_RX_BUF_SIZE,
++ 				       MT_RXQ_RING_BASE(MT_RXQ_RRO_BAND0));
++ 		if (ret)
++ 			return ret;
++ 
++ 		if (is_mt7992(&dev->mt76)) {
++ 			dev->mt76.q_rx[MT_RXQ_RRO_BAND1].flags =
 + 				MT_WED_RRO_Q_DATA(1) | MT_QFLAG_WED_RRO_EN;
 + 			if (mtk_wed_device_active(wed) &&
 + 			    mtk_wed_get_rx_capa(wed))
@@ -1307,13 +1324,20 @@ new file mode 100644
 + 	return 0;
 + }
 + 
-+ void mt7996_dma_reset(struct mt7996_dev *dev, bool force)
++-void mt7996_dma_reset(struct mt7996_dev *dev, bool force)
+++int mt7996_dma_reset(struct mt7996_dev *dev, bool force)
 + {
 + 	struct mt76_phy *phy2 = dev->mt76.phys[MT_BAND1];
 + 	struct mt76_phy *phy3 = dev->mt76.phys[MT_BAND2];
 + 	u32 hif1_ofs = MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0);
 + 	int i;
 + 
+++	/* Do not reclaim rings through an already inaccessible PCIe device. */
+++	if (mt76_rr(dev, MT_HW_REV) == ~0U) {
+++		dev_err(dev->mt76.dev, "PCIe registers inaccessible before DMA reset\n");
+++		return -EIO;
+++	}
+++
 + 	mt76_clear(dev, MT_WFDMA0_GLO_CFG,
 + 		   MT_WFDMA0_GLO_CFG_TX_DMA_EN |
 + 		   MT_WFDMA0_GLO_CFG_RX_DMA_EN);
@@ -1350,6 +1374,10 @@ new file mode 100644
 + 	/* reset wfsys */
 + 	if (force)
 + 		mt7996_wfsys_reset(dev);
+++	if (mt76_rr(dev, MT_HW_REV) == ~0U) {
+++		dev_err(dev->mt76.dev, "PCIe registers inaccessible after WFSYS reset\n");
+++		return -EIO;
+++	}
 + 
 + 	if (dev->hif2 && mtk_wed_device_active(&dev->mt76.mmio.wed_hif2))
 + 		mtk_wed_device_dma_reset(&dev->mt76.mmio.wed_hif2);
@@ -1399,6 +1427,7 @@ new file mode 100644
 + 	}
 + 
 + 	mt7996_dma_enable(dev, !force);
+++	return 0;
 + }
 + 
 + void mt7996_dma_cleanup(struct mt7996_dev *dev)
@@ -1409,7 +1438,7 @@ new file mode 100644
 + }
 +--- a/mt7996/mac.c
 ++++ b/mt7996/mac.c
-+@@ -2050,674 +2050,755 @@
++@@ -2050,674 +2050,774 @@
 + 	nf = mt7996_phy_get_nf(phy, mphy->band_idx);
 + 	if (!phy->noise)
 + 		phy->noise = nf << 4;
@@ -1522,11 +1551,18 @@ new file mode 100644
 ++	return true;
 ++}
 ++
+++static void
+++mt7996_reset_disconnect(void *data, u8 *mac, struct ieee80211_vif *vif)
+++{
+++	/* Queue mac80211 teardown; it must not run under the mt76 mutex. */
+++	if (vif->type == NL80211_IFTYPE_STATION && vif->cfg.assoc)
+++		ieee80211_connection_loss(vif);
+++}
+++
 ++static void mt7996_reset_failed(struct mt7996_dev *dev, int err)
 ++{
 ++	struct mt7996_phy *phy;
 ++
-++	WRITE_ONCE(dev->recovery.failed, true);
 ++	set_bit(MT76_MCU_RESET, &dev->mphy.state);
 ++	mt7996_for_each_phy(dev, phy)
 ++		set_bit(MT76_RESET, &phy->mt76->state);
@@ -1539,7 +1575,11 @@ new file mode 100644
 ++	mt76_npu_disable_irqs(&dev->mt76);
 ++	/* Fail subsequent MCU requests immediately. Retain DMA-owned buffers. */
 ++	atomic_set(&dev->mt76.bus_hung, 1);
+++	/* Mask hardware first; failed also guards all subsequent register IO. */
+++	WRITE_ONCE(dev->recovery.failed, true);
 ++	wake_up(&dev->mt76.mcu.wait);
+++	ieee80211_iterate_active_interfaces_atomic(mt76_hw(dev),
+++		IEEE80211_IFACE_ITER_RESUME_ALL, mt7996_reset_disconnect, dev);
 ++	dev_err(dev->mt76.dev,
 ++		"recovery failed (%d); queues stopped, device restart required\n", err);
 ++}
@@ -1586,12 +1626,16 @@ new file mode 100644
 + 	napi_disable(&dev->mt76.tx_napi);
 + 
 +-	/* token reinit */
-++	mt7996_dma_reset(dev, true);
-+ 	mt7996_tx_token_put(dev);
-+ 	idr_init(&dev->mt76.token);
-+ 
-+-	mt7996_dma_reset(dev, true);
++-	mt7996_tx_token_put(dev);
++-	idr_init(&dev->mt76.token);
 +-
++-	mt7996_dma_reset(dev, true);
+++	ret = mt7996_dma_reset(dev, true);
+++	if (!ret) {
+++		mt7996_tx_token_put(dev);
+++		idr_init(&dev->mt76.token);
+++	}
++ 
 + 	mt76_for_each_q_rx(mdev, i) {
 +-		if (mtk_wed_device_active(&dev->mt76.mmio.wed) &&
 +-		    mt76_queue_is_wed_rro(&mdev->q_rx[i]))
@@ -1600,11 +1644,18 @@ new file mode 100644
 +-		if (mdev->q_rx[i].ndesc) {
 ++		if (mt7996_reset_rx_owned(dev, i)) {
 + 			napi_enable(&dev->mt76.napi[i]);
-+ 			local_bh_disable();
-+ 			napi_schedule(&dev->mt76.napi[i]);
-+ 			local_bh_enable();
++-			local_bh_disable();
++-			napi_schedule(&dev->mt76.napi[i]);
++-			local_bh_enable();
+++			if (!ret) {
+++				local_bh_disable();
+++				napi_schedule(&dev->mt76.napi[i]);
+++				local_bh_enable();
+++			}
 + 		}
 + 	}
+++	if (ret)
+++		goto out;
 + 	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
 + 	clear_bit(MT76_STATE_MCU_RUNNING, &dev->mphy.state);
 + 
@@ -1937,7 +1988,9 @@ new file mode 100644
 ++	ret = -ETIMEDOUT;
 ++	if (!mt7996_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE))
 ++		goto failed;
-++	mt7996_dma_reset(dev, false);
+++	ret = mt7996_dma_reset(dev, false);
+++	if (ret)
+++		goto failed;
 ++
 ++	mt7996_tx_token_put(dev);
 ++	idr_init(&dev->mt76.token);
@@ -2209,7 +2262,7 @@ new file mode 100644
 + 	cnt = mt76_rr(dev, MT_MIB_BSCR1(band_idx));
 + 	mib->tx_bf_ibf_ppdu_cnt += cnt;
 + 
-+@@ -2749,200 +2830,204 @@
++@@ -2749,200 +2849,204 @@
 + 	mib->tx_bf_rx_fb_eht_cnt += cnt;
 + 	mib->tx_bf_rx_fb_all_cnt += cnt;
 + 
@@ -2893,7 +2946,270 @@ new file mode 100644
 + 	for (band = 0; band < __MT_MAX_BAND; band++) {
 +--- a/mt7996/mmio.c
 ++++ b/mt7996/mmio.c
-+@@ -627,284 +627,292 @@
++@@ -296,248 +296,262 @@
++ 		val = FIELD_PREP(MT_HIF_REMAP_L1_MASK, base);
++ 	}
++ 
++ 	dev->bus_ops->rmw(&dev->mt76, MT_HIF_REMAP_L1, l1_mask, val);
++ 	/* use read to push write */
++ 	dev->bus_ops->rr(&dev->mt76, MT_HIF_REMAP_L1);
++ 
++ 	return MT_HIF_REMAP_BASE_L1 + offset;
++ }
++ 
++ static u32 mt7996_reg_map_l2(struct mt7996_dev *dev, u32 addr)
++ {
++ 	u32 offset, base, l2_mask, val;
++ 
++ 	if (is_mt7990(&dev->mt76)) {
++ 		offset = FIELD_GET(MT_HIF_REMAP_L2_OFFSET_7990, addr);
++ 		base = FIELD_GET(MT_HIF_REMAP_L2_BASE_7990, addr);
++ 		l2_mask = MT_HIF_REMAP_L2_MASK_7990;
++ 		val = FIELD_PREP(MT_HIF_REMAP_L2_MASK_7990, base);
++ 	} else {
++ 		offset = FIELD_GET(MT_HIF_REMAP_L2_OFFSET, addr);
++ 		base = FIELD_GET(MT_HIF_REMAP_L2_BASE, addr);
++ 		l2_mask = MT_HIF_REMAP_L2_MASK;
++ 		val = FIELD_PREP(MT_HIF_REMAP_L2_MASK, base);
++ 	}
++ 
++ 	dev->bus_ops->rmw(&dev->mt76, MT_HIF_REMAP_L2, l2_mask, val);
++ 	/* use read to push write */
++ 	dev->bus_ops->rr(&dev->mt76, MT_HIF_REMAP_L2);
++ 
++ 	return MT_HIF_REMAP_BASE_L2 + offset;
++ }
++ 
++ static u32 mt7996_reg_map_cbtop(struct mt7996_dev *dev, u32 addr)
++ {
++ 	u32 offset = FIELD_GET(MT_HIF_REMAP_CBTOP_OFFSET, addr);
++ 	u32 base = FIELD_GET(MT_HIF_REMAP_CBTOP_BASE, addr);
++ 
++ 	dev->bus_ops->rmw(&dev->mt76, MT_HIF_REMAP_CBTOP,
++ 			  MT_HIF_REMAP_CBTOP_MASK,
++ 			  FIELD_PREP(MT_HIF_REMAP_CBTOP_MASK, base));
++ 	/* use read to push write */
++ 	dev->bus_ops->rr(&dev->mt76, MT_HIF_REMAP_CBTOP);
++ 
++ 	return MT_HIF_REMAP_BASE_CBTOP + offset;
++ }
++ 
++ static u32 __mt7996_reg_addr(struct mt7996_dev *dev, u32 addr)
++ {
++ 	int i;
++ 
++ 	if (addr < 0x100000)
++ 		return addr;
++ 
++ 	for (i = 0; i < dev->reg.map_size; i++) {
++ 		u32 ofs;
++ 
++ 		if (addr < dev->reg.map[i].phys)
++ 			continue;
++ 
++ 		ofs = addr - dev->reg.map[i].phys;
++ 		if (ofs >= dev->reg.map[i].size)
++ 			continue;
++ 
++ 		return dev->reg.map[i].mapped + ofs;
++ 	}
++ 
++ 	return INVALID_REG_ADDR;
++ }
++ 
++ static u32 __mt7996_reg_remap_addr(struct mt7996_dev *dev, u32 addr)
++ {
++ 	if ((addr >= MT_INFRA_BASE && addr < MT_WFSYS0_PHY_START) ||
++ 	    (addr >= MT_WFSYS0_PHY_START && addr < MT_WFSYS1_PHY_START) ||
++ 	    (addr >= MT_WFSYS1_PHY_START && addr <= MT_WFSYS1_PHY_END))
++ 		return mt7996_reg_map_l1(dev, addr);
++ 
++ 	/* CONN_INFRA: covert to phyiscal addr and use layer 1 remap */
++ 	if (addr >= MT_INFRA_MCU_START && addr <= MT_INFRA_MCU_END) {
++ 		addr = addr - MT_INFRA_MCU_START + MT_INFRA_BASE;
++ 		return mt7996_reg_map_l1(dev, addr);
++ 	}
++ 
++ 	if (dev_is_pci(dev->mt76.dev) &&
++ 	    ((addr >= MT_CBTOP1_PHY_START && addr <= MT_CBTOP1_PHY_END) ||
++ 	    addr >= MT_CBTOP2_PHY_START)) {
++ 		if (is_mt7990(&dev->mt76))
++ 			return mt7996_reg_map_cbtop(dev, addr);
++ 		return mt7996_reg_map_l1(dev, addr);
++ 	}
++ 
++ 	return mt7996_reg_map_l2(dev, addr);
++ }
++ 
++ void mt7996_memcpy_fromio(struct mt7996_dev *dev, void *buf, u32 offset,
++ 			  size_t len)
++ {
++ 	u32 addr = __mt7996_reg_addr(dev, offset);
++ 	unsigned long flags;
++ 
+++	if (unlikely(READ_ONCE(dev->recovery.failed))) {
+++		memset(buf, 0xff, len);
+++		return;
+++	}
+++
++ 	if (addr != INVALID_REG_ADDR) {
++ 		memcpy_fromio(buf, dev->mt76.mmio.regs + addr, len);
++ 		return;
++ 	}
++ 
++ 	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	memcpy_fromio(buf, dev->mt76.mmio.regs +
++ 			   __mt7996_reg_remap_addr(dev, offset), len);
++ 	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ }
++ 
++ static u32 mt7996_rr(struct mt76_dev *mdev, u32 offset)
++ {
++ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++ 	u32 addr = __mt7996_reg_addr(dev, offset), val;
++ 	unsigned long flags;
++ 
+++	if (unlikely(READ_ONCE(dev->recovery.failed)))
+++		return ~0U;
+++
++ 	if (addr != INVALID_REG_ADDR)
++ 		return dev->bus_ops->rr(mdev, addr);
++ 
++ 	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	val = dev->bus_ops->rr(mdev, __mt7996_reg_remap_addr(dev, offset));
++ 	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ 
++ 	return val;
++ }
++ 
++ static void mt7996_wr(struct mt76_dev *mdev, u32 offset, u32 val)
++ {
++ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++ 	u32 addr = __mt7996_reg_addr(dev, offset);
++ 	unsigned long flags;
++ 
+++	if (unlikely(READ_ONCE(dev->recovery.failed)))
+++		return;
+++
++ 	if (addr != INVALID_REG_ADDR) {
++ 		dev->bus_ops->wr(mdev, addr, val);
++ 		return;
++ 	}
++ 
++ 	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	dev->bus_ops->wr(mdev, __mt7996_reg_remap_addr(dev, offset), val);
++ 	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ }
++ 
++ static u32 mt7996_rmw(struct mt76_dev *mdev, u32 offset, u32 mask, u32 val)
++ {
++ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++ 	u32 addr = __mt7996_reg_addr(dev, offset);
++ 	unsigned long flags;
+++
+++	if (unlikely(READ_ONCE(dev->recovery.failed)))
+++		return ~0U;
++ 
++ 	if (addr != INVALID_REG_ADDR)
++ 		return dev->bus_ops->rmw(mdev, addr, mask, val);
++ 
++ 	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	val = dev->bus_ops->rmw(mdev, __mt7996_reg_remap_addr(dev, offset), mask, val);
++ 	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ 
++ 	return val;
++ }
++ 
++ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
++ static int mt7996_mmio_wed_reset(struct mtk_wed_device *wed)
++ {
++ 	struct mt76_dev *mdev = container_of(wed, struct mt76_dev, mmio.wed);
++ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++ 	struct mt76_phy *mphy = &dev->mphy;
++ 	int ret;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (test_and_set_bit(MT76_STATE_WED_RESET, &mphy->state))
++ 		return -EBUSY;
++ 
++ 	ret = mt7996_mcu_set_ser(dev, UNI_CMD_SER_TRIGGER, UNI_CMD_SER_SET_RECOVER_FROM_ETH,
++ 				 mphy->band_idx);
++ 	if (ret)
++ 		goto out;
++ 
++ 	rtnl_unlock();
++ 	if (!wait_for_completion_timeout(&mdev->mmio.wed_reset, 20 * HZ)) {
++ 		dev_err(mdev->dev, "wed reset timeout\n");
++ 		ret = -ETIMEDOUT;
++ 	}
++ 	rtnl_lock();
++ out:
++ 	clear_bit(MT76_STATE_WED_RESET, &mphy->state);
++ 
++ 	return ret;
++ }
++ #endif
++ 
++ int mt7996_mmio_wed_init(struct mt7996_dev *dev, void *pdev_ptr,
++ 			 bool hif2, int *irq)
++ {
++ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
++ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
++ 	struct pci_dev *pci_dev = pdev_ptr;
++ 	u32 hif1_ofs;
++ 
++ 	if (!wed_enable)
++ 		return 0;
++ 
++ 	hif1_ofs = dev->hif2 ? MT_WFDMA0_PCIE1(0) - MT_WFDMA0(0) : 0;
++ 
++ 	if (hif2)
++ 		wed = &dev->mt76.mmio.wed_hif2;
++ 
++ 	wed->wlan.pci_dev = pci_dev;
++ 	wed->wlan.bus_type = MTK_WED_BUS_PCIE;
++ 
++ 	wed->wlan.base = devm_ioremap(dev->mt76.dev,
++ 				      pci_resource_start(pci_dev, 0),
++ 				      pci_resource_len(pci_dev, 0));
++ 	if (!wed->wlan.base)
++ 		return -ENOMEM;
++ 
++ 	wed->wlan.phy_base = pci_resource_start(pci_dev, 0);
++ 
++ 	if (hif2) {
++ 		wed->wlan.wpdma_int = wed->wlan.phy_base +
++ 				      MT_INT_PCIE1_SOURCE_CSR_EXT;
++ 		wed->wlan.wpdma_mask = wed->wlan.phy_base +
++ 				       MT_INT_PCIE1_MASK_CSR;
++ 		wed->wlan.wpdma_tx = wed->wlan.phy_base + hif1_ofs +
++ 					     MT_TXQ_RING_BASE(0) +
++ 					     MT7996_TXQ_BAND2 * MT_RING_SIZE;
++ 		if (is_mt7996(&dev->mt76)) {
++ 			wed->wlan.txfree_tbit = ffs(MT_INT_RX_TXFREE_EXT) - 1;
++ 			wed->wlan.wpdma_txfree = wed->wlan.phy_base + hif1_ofs +
++ 						 MT_RXQ_RING_BASE(0) +
++ 						 MT7996_RXQ_TXFREE2 * MT_RING_SIZE;
++ 		} else {
++ 			wed->wlan.txfree_tbit = ffs(MT_INT_RX_TXFREE_BAND1_EXT) - 1;
++ 			wed->wlan.wpdma_txfree = wed->wlan.phy_base + hif1_ofs +
++ 						 MT_RXQ_RING_BASE(0) +
++ 						 MT7996_RXQ_MCU_WA_EXT * MT_RING_SIZE;
++ 		}
++ 
++ 		wed->wlan.wpdma_rx_glo = wed->wlan.phy_base + hif1_ofs + MT_WFDMA0_GLO_CFG;
++ 		wed->wlan.wpdma_rx[0] = wed->wlan.phy_base + hif1_ofs +
++ 					MT_RXQ_RING_BASE(MT7996_RXQ_BAND2) +
++ 					MT7996_RXQ_BAND2 * MT_RING_SIZE;
++ 
++ 		wed->wlan.id = MT7996_DEVICE_ID_2;
++ 		wed->wlan.tx_tbit[0] = ffs(MT_INT_TX_DONE_BAND2) - 1;
++ 	} else {
++ 		wed->wlan.hw_rro = true;
++ 		wed->wlan.wpdma_int = wed->wlan.phy_base + MT_INT_SOURCE_CSR;
++ 		wed->wlan.wpdma_mask = wed->wlan.phy_base + MT_INT_MASK_CSR;
++@@ -627,284 +641,292 @@
 + 
 + 	if (!hif2) {
 + 		dev->mt76.hwrro_mode = is_mt7996(&dev->mt76) ? MT76_HWRRO_V3
@@ -3390,7 +3706,153 @@ new file mode 100644
 + 	RDD_START_TXQ = 20,
 + 	RDD_CAC_START = 50,
 + 	RDD_CAC_END,
-+@@ -789,200 +790,202 @@
++@@ -644,345 +645,347 @@
++ static inline struct mt7996_phy *
++ mt7996_phy3(struct mt7996_dev *dev)
++ {
++ 	return __mt7996_phy(dev, MT_BAND2);
++ }
++ 
++ static inline bool
++ mt7996_band_valid(struct mt7996_dev *dev, u8 band)
++ {
++ 	if (!is_mt7996(&dev->mt76))
++ 		return band <= MT_BAND1;
++ 
++ 	return band <= MT_BAND2;
++ }
++ 
++ static inline struct mt7996_phy *
++ mt7996_band_phy(struct mt7996_dev *dev, enum nl80211_band band)
++ {
++ 	struct mt76_phy *mphy;
++ 
++ 	mphy = dev->mt76.band_phys[band];
++ 	if (!mphy)
++ 		return NULL;
++ 
++ 	return mphy->priv;
++ }
++ 
++ static inline struct mt7996_vif_link *
++ mt7996_vif_link(struct mt7996_dev *dev, struct ieee80211_vif *vif, int link_id)
++ {
++ 	return (struct mt7996_vif_link *)mt76_vif_link(&dev->mt76, vif, link_id);
++ }
++ 
++ static inline struct mt7996_phy *
++ mt7996_vif_link_phy(struct mt7996_vif_link *link)
++ {
++ 	struct mt76_phy *mphy = mt76_vif_link_phy(&link->mt76);
++ 
++ 	if (!mphy)
++ 		return NULL;
++ 
++ 	return mphy->priv;
++ }
++ 
++ static inline struct mt7996_vif_link *
++ mt7996_vif_conf_link(struct mt7996_dev *dev, struct ieee80211_vif *vif,
++ 		     struct ieee80211_bss_conf *link_conf)
++ {
++ 	return (struct mt7996_vif_link *)mt76_vif_conf_link(&dev->mt76, vif,
++ 							    link_conf);
++ }
++ 
++ static inline struct mt7996_sta_link *
++ mt7996_sta_link(struct mt7996_sta *msta, u8 link_id)
++ {
++ 	if (link_id >= IEEE80211_MLD_MAX_NUM_LINKS)
++ 		return NULL;
++ 
++ 	return rcu_dereference(msta->link[link_id]);
++ }
++ 
++ static inline struct mt7996_sta_link *
++ mt7996_sta_link_protected(struct mt7996_dev *dev, struct mt7996_sta *msta,
++ 			  u8 link_id)
++ {
++ 	if (link_id >= IEEE80211_MLD_MAX_NUM_LINKS)
++ 		return NULL;
++ 
++ 	return mt76_dereference(msta->link[link_id], &dev->mt76);
++ }
++ 
++ #define mt7996_for_each_phy(dev, phy)					\
++ 	for (int __i = 0; __i < ARRAY_SIZE((dev)->radio_phy); __i++)	\
++ 		if (((phy) = (dev)->radio_phy[__i]) != NULL)
++ 
++ extern const struct ieee80211_ops mt7996_ops;
++ extern struct pci_driver mt7996_pci_driver;
++ extern struct pci_driver mt7996_hif_driver;
++ 
++ struct mt7996_dev *mt7996_mmio_probe(struct device *pdev,
++ 				     void __iomem *mem_base, u32 device_id);
++ void mt7996_rro_hw_init(struct mt7996_dev *dev);
++ void mt7996_wfsys_reset(struct mt7996_dev *dev);
++ irqreturn_t mt7996_irq_handler(int irq, void *dev_instance);
++ u64 __mt7996_get_tsf(struct ieee80211_hw *hw, struct mt7996_vif_link *link);
++ int mt7996_register_device(struct mt7996_dev *dev);
++ void mt7996_unregister_device(struct mt7996_dev *dev);
++ int mt7996_vif_link_add(struct mt76_phy *mphy, struct ieee80211_vif *vif,
++ 			struct ieee80211_bss_conf *link_conf,
++ 			struct mt76_vif_link *mlink);
++ void mt7996_vif_link_remove(struct mt76_phy *mphy, struct ieee80211_vif *vif,
++ 			    struct ieee80211_bss_conf *link_conf,
++ 			    struct mt76_vif_link *mlink);
++ int mt7996_eeprom_init(struct mt7996_dev *dev);
++ int mt7996_eeprom_parse_hw_cap(struct mt7996_dev *dev, struct mt7996_phy *phy);
++ int mt7996_eeprom_get_target_power(struct mt7996_dev *dev,
++ 				   struct ieee80211_channel *chan);
++ s8 mt7996_eeprom_get_power_delta(struct mt7996_dev *dev, int band);
++ bool mt7996_eeprom_has_background_radar(struct mt7996_dev *dev);
++ int mt7996_dma_init(struct mt7996_dev *dev);
++-void mt7996_dma_reset(struct mt7996_dev *dev, bool force);
+++int mt7996_dma_reset(struct mt7996_dev *dev, bool force);
++ void mt7996_dma_prefetch(struct mt7996_dev *dev);
++ void mt7996_dma_cleanup(struct mt7996_dev *dev);
++ void mt7996_dma_start(struct mt7996_dev *dev, bool reset, bool wed_reset);
++ int mt7996_init_tx_queues(struct mt7996_phy *phy, int idx,
++ 			  int n_desc, int ring_base, struct mtk_wed_device *wed);
++ void mt7996_init_txpower(struct mt7996_phy *phy);
++ int mt7996_txbf_init(struct mt7996_dev *dev);
++ void mt7996_reset(struct mt7996_dev *dev);
++ int mt7996_run(struct mt7996_phy *phy);
++ int mt7996_mcu_init(struct mt7996_dev *dev);
++ int mt7996_mcu_init_firmware(struct mt7996_dev *dev);
++ int mt7996_mcu_twt_agrt_update(struct mt7996_dev *dev,
++ 			       struct mt7996_vif_link *link,
++ 			       struct mt7996_twt_flow *flow,
++ 			       int cmd);
++ int mt7996_mcu_add_dev_info(struct mt7996_phy *phy, struct ieee80211_vif *vif,
++ 			    struct ieee80211_bss_conf *link_conf,
++ 			    struct mt76_vif_link *mlink, bool enable);
++ int mt7996_mcu_add_bss_info(struct mt7996_phy *phy, struct ieee80211_vif *vif,
++ 			    struct ieee80211_bss_conf *link_conf,
++ 			    struct mt76_vif_link *mlink,
++ 			    struct mt7996_sta_link *msta_link, int enable);
++ int mt7996_mcu_update_bss_rfch(struct mt7996_phy *phy,
++ 			       struct mt7996_vif_link *link);
++ int mt7996_mcu_add_sta(struct mt7996_dev *dev,
++ 		       struct ieee80211_bss_conf *link_conf,
++ 		       struct ieee80211_link_sta *link_sta,
++ 		       struct mt7996_vif_link *link,
++ 		       struct mt7996_sta_link *msta_link,
++ 		       int conn_state, bool newly);
++ int mt7996_mcu_teardown_mld_sta(struct mt7996_dev *dev,
++ 				struct mt7996_vif_link *link,
++ 				struct mt7996_sta_link *msta_link);
++ void mt7996_mcu_update_sta_rec_bw(void *data, struct ieee80211_sta *sta);
++ int mt7996_mcu_add_tx_ba(struct mt7996_dev *dev,
++ 			 struct ieee80211_ampdu_params *params,
++ 			 struct ieee80211_vif *vif, bool enable);
++ int mt7996_mcu_add_rx_ba(struct mt7996_dev *dev,
++ 			 struct ieee80211_ampdu_params *params,
++ 			 struct ieee80211_vif *vif, bool enable);
++ int mt7996_mcu_update_bss_color(struct mt7996_dev *dev,
++ 				struct mt76_vif_link *mlink,
++ 				struct cfg80211_he_bss_color *he_bss_color);
++ int mt7996_mcu_add_beacon(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 + 			  struct ieee80211_bss_conf *link_conf, bool enabled);
 + int mt7996_mcu_beacon_inband_discov(struct mt7996_dev *dev,
 + 				    struct ieee80211_bss_conf *link_conf,

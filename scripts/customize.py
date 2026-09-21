@@ -13,7 +13,8 @@ PACKAGE = ROOT / 'package/w1700k-custom'
 VIEW = 'htdocs/luci-static/resources/view/attendedsysupgrade/overview.js'
 RUNTIME_COMMANDS = ('sh', 'ls', 'awk', 'chmod', 'mkdir', 'mv', 'rm', 'rmdir',
                     'jq', 'curl', 'grep', 'sha256sum', 'wc', 'tr', 'df', 'sleep',
-                    'ubus', 'uci', 'sysupgrade', 'devmem', 'cat', 'timeout', 'ping', 'ip', 'head', 'date')
+                    'ubus', 'uci', 'sysupgrade', 'devmem', 'cat', 'timeout', 'ping', 'ip', 'head', 'date',
+                    'mktemp', 'logger', 'ucode')
 
 
 def rendered(source):
@@ -55,8 +56,11 @@ def apply(openwrt):
     shutil.copytree(PACKAGE / 'root', overlay, dirs_exist_ok=True)
     helper = overlay / 'usr/libexec/w1700k-upgrade'
     helper.write_bytes(rendered(PACKAGE / 'root/usr/libexec/w1700k-upgrade'))
-    for script in [overlay / 'usr/libexec/w1700k-upgrade', overlay / 'usr/libexec/npu-jitter-daemon',
-                   *(overlay / 'etc').glob('*.sh'), *(overlay / 'etc/uci-defaults').glob('*')]:
+    for script in [*(overlay / 'usr/libexec').glob('*'),
+                   *(overlay / 'etc').glob('*.sh'), *(overlay / 'etc/uci-defaults').glob('*'),
+                   *(overlay / 'etc/init.d').glob('*'), *(overlay / 'etc/hotplug.d').glob('*/*')]:
+        if not script.is_file():
+            continue
         script.chmod(0o755)
     licenses = overlay / 'usr/share/licenses/w1700k-custom'
     licenses.mkdir(parents=True, exist_ok=True)
@@ -83,7 +87,7 @@ def verify(openwrt):
         if not target.is_file() or rendered(source) != target.read_bytes():
             raise RuntimeError(f'Customization missing or changed in rootfs: {relative}')
         # Windows fixtures have no POSIX executable bits; release builds run on Linux.
-        if os.name != 'nt' and (relative.suffix == '.sh' or relative.name in ('w1700k-upgrade', 'npu-jitter-daemon') or 'uci-defaults' in relative.parts) and not target.stat().st_mode & 0o111:
+        if os.name != 'nt' and (relative.suffix == '.sh' or 'libexec' in relative.parts or 'init.d' in relative.parts or 'hotplug.d' in relative.parts or 'uci-defaults' in relative.parts) and not target.stat().st_mode & 0o111:
             raise RuntimeError(f'Customization is not executable: {relative}')
     view = (root / 'www/luci-static/resources/view/attendedsysupgrade/overview.js').read_text(encoding='utf-8')
     channel = (root / 'www/luci-static/resources/view/status/channel_analysis.js').read_text(encoding='utf-8')

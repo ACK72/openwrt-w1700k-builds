@@ -7,6 +7,12 @@ PCIe endpoint or to identify the first cause of command 0x34 timing out.
 
 ## Changes
 
+**Hardware acceptance is failing.** A clean boot of builder `52358c6` passed
+the cooperative NPU stop path but its idle software full-reset test produced
+PCIe completion timeouts and firmware initialization failure. Builder `a245e96`
+adds TX scheduling changes but does not fix that reset failure and has not
+passed hardware recovery acceptance. Neither is a validated recovery release.
+
 - Complete accepted scan and ROC requests exactly once even during MCU reset.
   Suppress RF restoration during reset, not the mac80211 software completion.
   Stop scanning after a channel error, without sending probes or scheduling
@@ -97,6 +103,32 @@ again. The harness now rejects duplicate parks, and five actual channel-body
 cases cover success, ordinary error, MCU timeout, pre-existing reset and a reset
 racing with successful channel completion. Stop errors now identify SET4,
 GET3 or SET6; the initiating NPU timeout is still under investigation.
+
+### Follow-up idle reset failure and impact
+
+Builder `52358c6` / run `35569427927` was installed and verified on a new boot.
+A single idle software full-reset request at uptime 102.230 seconds was followed
+by PCIe AER completion timeouts at about 103 seconds, firmware initialization
+timeouts at 105/107 seconds, and the terminal error `recovery failed (-5)` at
+107.085 seconds. No SET4/GET3/SET6 failure or duplicate worker-park warning was
+logged. The stop succeeded far enough to enter DMA/WFSYS reset and firmware
+initialization; it is not evidence that every PCIe DMA transaction was drained.
+The first failing MMIO access is not established by the available trace.
+
+The user reported Wi-Fi loss and loss of Internet access from a wired PC,
+while wired local management/SSH remained accessible. The post-failure SSH log
+collection also succeeded. This does not establish an Ethernet LAN hardware
+failure. A stale preferred WWAN route is a leading hypothesis: the terminal
+failure code stops radio queues without notifying the STA connection loss.
+The incident capture lacks contemporaneous route/rule/nft state, so the precise
+forwarding failure remains unproven.
+
+The external mwan3 nft package had not been reinstalled after the upgrades.
+Preserved configuration is insufficient to preserve its executable or failover
+service. These tests therefore did not validate the user's complete multi-WAN
+environment. Device testing was stopped, and the user requested restoration of
+the previously exercised baseline using a clean installation, mwan3 nft install,
+and restoration of the designated configuration archive.
 
 ### Cross-band STA acceptance and pending-frame scheduling
 

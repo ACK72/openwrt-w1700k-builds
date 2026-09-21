@@ -1,0 +1,28 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+# Apply only to the reviewed mwan3 3.6.12 rtmon; leave unknown versions alone.
+set -eu
+file=/usr/sbin/mwan3rtmon
+[ -f "$file" ] || exit 0
+sha=$(sha256sum "$file")
+sha=${sha%% *}
+case "$sha" in
+    912a1bffabd35969492dd51b4c749776c9898efd2a659d7d5a3a69c8967da965) ;;
+    eaefbeb32f859b6af3919448a8762c3e52ccd865927c12aa533fd6c2730d834e) exit 0 ;;
+    *) logger -t w1700k-mwan3 'Unknown mwan3rtmon version; route-state fix not applied'; exit 1 ;;
+esac
+tmp=$(mktemp "${file}.XXXXXX")
+trap 'rm -f "$tmp"' EXIT INT TERM
+# Route notifications from per-interface tables must refresh ROUTE_STATUS too.
+# Keep the upstream debounce timer and all route mirroring logic unchanged.
+awk '
+    /^\tarm_route_state_refresh\(\);$/ { next }
+    { print }
+    /^\tlet route = event.msg;$/ { print "\tarm_route_state_refresh();" }
+' "$file" > "$tmp"
+sha=$(sha256sum "$tmp")
+[ "${sha%% *}" = 'eaefbeb32f859b6af3919448a8762c3e52ccd865927c12aa533fd6c2730d834e' ] || exit 1
+ucode -c -o /dev/null "$tmp"
+chmod 755 "$tmp"
+mv "$tmp" "$file"
+logger -t w1700k-mwan3 'Applied per-interface route-state notification fix'

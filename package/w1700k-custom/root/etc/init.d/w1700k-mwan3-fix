@@ -1,0 +1,6 @@
+#!/bin/sh /etc/rc.common
+# Apply before mwan3 starts, including after a clean installation + backup restore.
+START=18
+boot() {
+    /usr/libexec/w1700k-mwan3-fix
+}

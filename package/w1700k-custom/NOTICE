@@ -28,6 +28,14 @@ The low-rate npu-jitter-daemon replacement, first-boot enable script, and
 FlowSense mean-RTT presentation patch are new Apache-2.0 changes by ACK72
 (2026). FlowSense's existing Apache-2.0 notices remain unchanged.
 
+The version-guarded mwan3 route-state installer is an Apache-2.0 change by
+ACK72 (2026). It moves an existing call in the user's separately installed
+mwan3 3.6.12 source; the upstream mwan3 license is not changed.
+
+The netdev-add packet-steering hook follows the narrowly scoped suggestion in
+Gilly1970/Gemtek-W1700K-6.18 at f72939518d0bd3f02c26f42a4d08c4452cb48a9f.
+It does not import that tree's PCIe IRQ-affinity or packet-steering policy.
+
 Corresponding customization source, patches and build scripts:
 Project source and releases: see the firmware's configured release repository.
 The exact builder commit, source and feed revisions are retained with each

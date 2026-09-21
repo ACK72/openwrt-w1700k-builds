@@ -1,0 +1,3 @@
+#!/bin/sh
+/etc/init.d/w1700k-mwan3-fix enable
+/usr/libexec/w1700k-mwan3-fix

@@ -53,9 +53,9 @@ class RecoveryLifecycle(unittest.TestCase):
         cls.folder=Path(cls.temp.name)
         inner=inner_patch('0009-wifi-fix-channel-and-npu-recovery-lifecycle.patch','package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch')
         source=patch_side(inner,'mt7996/mac.c')
-        names=['mt7996_reset_rx_owned','mt7996_reset_failed','mt7996_mac_restart','mt7996_mac_full_reset','mt7996_mac_reset_work']
+        names=['mt7996_reset_rx_owned','mt7996_reset_disconnect','mt7996_reset_failed','mt7996_mac_restart','mt7996_mac_full_reset','mt7996_mac_reset_work']
         # Return types on a preceding line are explicitly retained here.
-        types=['','', 'static int\n','static int\n','']
+        types=['','static void\n','', 'static int\n','static int\n','']
         (cls.folder/'recovery_functions.h').write_text(''.join(t+function(source,n) for n,t in zip(names,types)))
         shutil.copyfile(ROOT/'tests/recovery_harness.c',cls.folder/'test.c')
         try: cls.lib=compile_harness(cls.folder,'recovery')
@@ -69,11 +69,21 @@ class RecoveryLifecycle(unittest.TestCase):
         cls.lib=None; cls.temp.cleanup()
 
     def run_fault(self,code):
-        out=(ctypes.c_uint32*17)(); self.lib.run_case(code,out)
+        out=(ctypes.c_uint32*18)(); self.lib.run_case(code,out)
         self.assertEqual(out[0],0,'unbalanced NAPI, recursive mutex or unsafe DMA reclamation')
         self.assertEqual(out[9],0,'device mutex leaked')
         self.assertEqual(out[16],1,'NAPI enable/disable not balanced')
+        self.assertEqual(out[17],out[11], 'only an associated STA is notified on terminal failure')
         return list(out)
+
+    def test_inaccessible_dma_device_aborts_without_token_release(self):
+        for code in (40,50,60,70):
+            with self.subTest(code=code):
+                r=self.run_fault(code)
+                self.assertEqual(r[4],1)
+                self.assertEqual(r[5],0)
+                self.assertEqual(r[8],0)
+                self.assertEqual(r[1:4],[1,0,0])
 
     def test_full_reset_success_and_each_failure(self):
         for base in (0,20):
