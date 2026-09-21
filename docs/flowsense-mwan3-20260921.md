@@ -78,12 +78,17 @@ Mac-to-PC unlimited reported 2813 TCP retransmissions. No 5 GHz disconnect,
 new kernel warning, PCIe completion timeout or reboot was detected in this
 short test. It does not establish long-duration or 10 Gbps stability.
 
-The concurrent 6 GHz STA had beacon loss at 18:51:37 and reconnected at 18:51:48.
-Another beacon-loss reconnect occurred before this controlled test, at 18:40.
-Therefore the shared-radio/6 GHz issue remains unresolved; these observations
-do not prove that 5 GHz load alone causes it. This change does not alter the
+The 6 GHz STA had beacon loss at 18:51:37 and reconnected at 18:51:48.
+The iperf JSON timestamps place the first test start at 18:51:54, followed by
+18:52:10, 18:52:25 and 18:52:58. Thus that reconnect was **before** the test,
+not during it. No 6 GHz reconnect was recorded during these four stages.
+Another beacon-loss reconnect occurred at 18:40 before testing as well.
+The 6 GHz issue remains unresolved, but this run does not reproduce it under
+5 GHz load. This change does not alter the
 wireless scheduler or claim to solve that remaining driver/firmware problem.
 
 Raw logs, device configuration and packet-flow details remain outside the public
 repository under the local Tests directory. Local suite: 50 tests, 47 passed,
 3 skipped for unavailable jq; patch replay and JavaScript syntax were checked.
+Six additional deterministic CPU-counter cases passed in the device's actual
+ucode interpreter (initial, 50% busy, 0% idle, same-second, reset and stale).

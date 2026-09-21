@@ -9,6 +9,8 @@ sha=${sha%% *}
 case "$sha" in
     912a1bffabd35969492dd51b4c749776c9898efd2a659d7d5a3a69c8967da965) ;;
     eaefbeb32f859b6af3919448a8762c3e52ccd865927c12aa533fd6c2730d834e) exit 0 ;;
+    # Source-built variant has the same fix plus explanatory comments.
+    a7a1605accfa8bb8c93222c28ef54c6879ddb0ead5425a6ca4d5b8a3f5a890e4) exit 0 ;;
     *) logger -t w1700k-mwan3 'Unknown mwan3rtmon version; route-state fix not applied'; exit 1 ;;
 esac
 tmp=$(mktemp "${file}.XXXXXX")
