@@ -92,3 +92,12 @@ repository under the local Tests directory. Local suite: 50 tests, 47 passed,
 3 skipped for unavailable jq; patch replay and JavaScript syntax were checked.
 Six additional deterministic CPU-counter cases passed in the device's actual
 ucode interpreter (initial, 50% busy, 0% idle, same-second, reset and stale).
+
+After the display/backend update, another four-stage run repeated the 100 Mbps
+checks and extended each unlimited direction to 90 seconds. PC-to-Mac averaged
+983.01 Mbps; Mac-to-PC averaged 745.26 Mbps with 2634 TCP retransmissions. The
+FlowSense page polled during this run and showed changing CPU load (11% at one
+snapshot), latency and 12/12 replies. No 5 GHz or 6 GHz disconnect, new kernel
+warning, PCIe error or reboot appeared during this additional test. Traffic,
+radio conditions and polling differed from the first run, so these figures are
+not a controlled before/after throughput comparison.
