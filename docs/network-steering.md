@@ -27,6 +27,8 @@ mt7996's NAPI infrastructure and cannot each receive an independent IRQ CPU.
 The kernel patch names Ethernet threads `napi/qdma0-r0` through
 `napi/qdma1-r31`, and `napi/qdma0-t0` through `napi/qdma1-t1`. It changes
 identification only; ring routing and packet scheduling are unchanged.
+Names are assigned when each thread is created and retained for recreation,
+so the identity read through `/proc` matches the hardware group.
 The platform policy discovers IRQ numbers by driver names. irqbalance's
 policy script excludes these IRQs from its independent balancing.
 

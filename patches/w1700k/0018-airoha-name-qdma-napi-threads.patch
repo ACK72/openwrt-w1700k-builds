@@ -1,28 +1,63 @@
 From: ACK72 <ACK72@users.noreply.github.com>
 Subject: [PATCH] airoha: expose QDMA identity for locality-aware steering
 
-Name existing threaded NAPI contexts without changing ring routing,
-interrupt ownership or the packet datapath. This does not add RSS.
+Assign QDMA/ring names when NAPI threads are created. Linux 6.18 keeps
+__set_task_comm internal and procfs prefers the original kthread full
+name, so changing task comm after creation cannot provide this identity.
 
-Route naming through a GPL-exported NAPI helper in the network core.
-__set_task_comm is internal in Linux 6.18 and cannot be called by
-airoha-eth.ko. Serialize thread access with the netdev lock.
+Add a GPL-exported named registration variant, preserve default NAPI
+registration, and keep names in control-path storage for recreation.
+Retain RX/TX poll callbacks, weight and TX busy-poll exclusion. Ring
+routing, IRQ ownership and packet scheduling are unchanged.
 
 diff --git a/target/linux/airoha/patches-6.18/9999-airoha-name-qdma-napi-threads.patch b/target/linux/airoha/patches-6.18/9999-airoha-name-qdma-napi-threads.patch
 new file mode 100644
 --- /dev/null
 +++ b/target/linux/airoha/patches-6.18/9999-airoha-name-qdma-napi-threads.patch
-@@ -0,0 +1,93 @@
-+Subject: [PATCH] net: airoha: name NAPI threads through the network core
+@@ -0,0 +1,291 @@
++Subject: [PATCH] net: airoha: assign NAPI thread names at creation
 +
 +diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
 +--- a/include/linux/netdevice.h
 ++++ b/include/linux/netdevice.h
-+@@ -2795,6 +2795,8 @@
++@@ -417,6 +417,8 @@
++ 	int			napi_rmap_idx;
++ 	int			index;
++ 	struct napi_config	*config;
+++	/* Optional name copied at registration and reused on thread recreation. */
+++	char			thread_name[IFNAMSIZ];
++ };
++ 
++ enum {
++@@ -2795,6 +2797,32 @@
 +  */
 + #define NAPI_POLL_WEIGHT 64
 + 
-++void netif_napi_set_thread_name(struct napi_struct *napi, const char *name);
+++void netif_napi_add_weight_named_locked(struct net_device *dev,
+++				       struct napi_struct *napi,
+++				       int (*poll)(struct napi_struct *, int),
+++				       int weight, const char *name);
+++
+++/**
+++ * netif_napi_add_weight_named - register NAPI with a persistent thread name
+++ * @dev: network device
+++ * @napi: NAPI context
+++ * @poll: polling function
+++ * @weight: polling weight
+++ * @name: optional thread name, copied and truncated to IFNAMSIZ - 1
+++ *
+++ * Call in process context without the netdev lock held. NULL or an empty
+++ * name retains the normal napi/<device>-<id> naming behavior.
+++ */
+++static inline void
+++netif_napi_add_weight_named(struct net_device *dev, struct napi_struct *napi,
+++			    int (*poll)(struct napi_struct *, int), int weight,
+++			    const char *name)
+++{
+++	netdev_lock(dev);
+++	netif_napi_add_weight_named_locked(dev, napi, poll, weight, name);
+++	netdev_unlock(dev);
+++}
 ++
 + void netif_napi_add_weight_locked(struct net_device *dev,
 + 				  struct napi_struct *napi,
@@ -30,79 +65,244 @@ new file mode 100644
 +diff --git a/net/core/dev.c b/net/core/dev.c
 +--- a/net/core/dev.c
 ++++ b/net/core/dev.c
-+@@ -7519,6 +7519,27 @@
++@@ -1617,66 +1617,69 @@
++ 	call_netdevice_notifiers(NETDEV_RESEND_IGMP, dev);
++ }
++ EXPORT_SYMBOL(__netdev_notify_peers);
++ 
++ /**
++  * netdev_notify_peers - notify network peers about existence of @dev
++  * @dev: network device
++  *
++  * Generate traffic such that interested network peers are aware of
++  * @dev, such as by generating a gratuitous ARP. This may be used when
++  * a device wants to inform the rest of the network about some sort of
++  * reconfiguration such as a failover event or virtual machine
++  * migration.
++  */
++ void netdev_notify_peers(struct net_device *dev)
++ {
++ 	rtnl_lock();
++ 	__netdev_notify_peers(dev);
++ 	rtnl_unlock();
++ }
++ EXPORT_SYMBOL(netdev_notify_peers);
++ 
++ static int napi_threaded_poll(void *data);
++ 
++ static int napi_kthread_create(struct napi_struct *n)
++ {
++ 	int err = 0;
++ 
++ 	/* Create and wake up the kthread once to put it in
++ 	 * TASK_INTERRUPTIBLE mode to avoid the blocked task
++ 	 * warning and work with loadavg.
++ 	 */
++-	n->thread = kthread_run(napi_threaded_poll, n, "napi/%s-%d",
++-				n->dev->name, n->napi_id);
+++	if (n->thread_name[0])
+++		n->thread = kthread_run(napi_threaded_poll, n, "%s", n->thread_name);
+++	else
+++		n->thread = kthread_run(napi_threaded_poll, n, "napi/%s-%d",
+++					n->dev->name, n->napi_id);
++ 	if (IS_ERR(n->thread)) {
++ 		err = PTR_ERR(n->thread);
++ 		pr_err("kthread_run failed with err %d\n", err);
++ 		n->thread = NULL;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ static int __dev_open(struct net_device *dev, struct netlink_ext_ack *extack)
++ {
++ 	const struct net_device_ops *ops = dev->netdev_ops;
++ 	int ret;
++ 
++ 	ASSERT_RTNL();
++ 	dev_addr_check(dev);
++ 
++ 	if (!netif_device_present(dev)) {
++ 		/* may be detached because parent is runtime-suspended */
++ 		if (dev->dev.parent)
++ 			pm_runtime_resume(dev->dev.parent);
++ 		if (!netif_device_present(dev))
++ 			return -ENODEV;
++ 	}
++ 
++ 	/* Block netpoll from trying to do any rx path servicing.
++ 	 * If we don't do this there is a chance ndo_poll_controller
++ 	 * or ndo_poll may be running while we open the device
++ 	 */
++ 	netpoll_poll_disable(dev);
++ 
++ 	ret = call_netdevice_notifiers_extack(NETDEV_PRE_UP, dev, extack);
++@@ -7444,107 +7447,117 @@
++ 	list_for_each_entry(pos, &dev->napi_list, dev_list) {
++ 		if (napi_id_valid(pos->napi_id))
++ 			pos_id = pos->napi_id;
++ 		else if (pos->config)
++ 			pos_id = pos->config->napi_id;
++ 		else
++ 			pos_id = UINT_MAX;
++ 
++ 		if (pos_id <= new_id)
++ 			break;
++ 		higher = &pos->dev_list;
++ 	}
++ 	list_add_rcu(&napi->dev_list, higher); /* adds after higher */
++ }
++ 
++ /* Double check that napi_get_frags() allocates skbs with
++  * skb->head being backed by slab, not a page fragment.
++  * This is to make sure bug fixed in 3226b158e67c
++  * ("net: avoid 32 x truesize under-estimation for tiny skbs")
++  * does not accidentally come back.
++  */
++ static void napi_get_frags_check(struct napi_struct *napi)
++ {
++ 	struct sk_buff *skb;
++ 
++ 	local_bh_disable();
++ 	skb = napi_get_frags(napi);
++ 	WARN_ON_ONCE(skb && skb->head_frag);
++ 	napi_free_frags(napi);
++ 	local_bh_enable();
++ }
++ 
++-void netif_napi_add_weight_locked(struct net_device *dev,
++-				  struct napi_struct *napi,
++-				  int (*poll)(struct napi_struct *, int),
++-				  int weight)
+++void netif_napi_add_weight_named_locked(struct net_device *dev,
+++				       struct napi_struct *napi,
+++				       int (*poll)(struct napi_struct *, int),
+++				       int weight, const char *name)
++ {
++ 	netdev_assert_locked(dev);
++ 	if (WARN_ON(test_and_set_bit(NAPI_STATE_LISTED, &napi->state)))
++ 		return;
++ 
+++	strscpy(napi->thread_name, name ?: "", sizeof(napi->thread_name));
++ 	INIT_LIST_HEAD(&napi->poll_list);
++ 	INIT_HLIST_NODE(&napi->napi_hash_node);
++ 	hrtimer_setup(&napi->timer, napi_watchdog, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
++ 	gro_init(&napi->gro);
++ 	napi->skb = NULL;
++ 	napi->poll = poll;
++ 	if (weight > NAPI_POLL_WEIGHT)
++ 		netdev_err_once(dev, "%s() called with weight %d\n", __func__,
++ 				weight);
++ 	napi->weight = weight;
++ 	napi->dev = dev;
++ #ifdef CONFIG_NETPOLL
++ 	napi->poll_owner = -1;
++ #endif
++ 	napi->list_owner = -1;
++ 	set_bit(NAPI_STATE_SCHED, &napi->state);
++ 	set_bit(NAPI_STATE_NPSVC, &napi->state);
++ 	netif_napi_dev_list_add(dev, napi);
++ 
++ 	/* default settings from sysfs are applied to all NAPIs. any per-NAPI
++ 	 * configuration will be loaded in napi_enable
++ 	 */
++ 	napi_set_defer_hard_irqs(napi, READ_ONCE(dev->napi_defer_hard_irqs));
++ 	napi_set_gro_flush_timeout(napi, READ_ONCE(dev->gro_flush_timeout));
++ 
++ 	napi_get_frags_check(napi);
++ 	/* Create kthread for this napi if dev->threaded is set.
++ 	 * Clear dev->threaded if kthread creation failed so that
++ 	 * threaded mode will not be enabled in napi_enable().
++ 	 */
++ 	if (napi_get_threaded_config(dev, napi))
++ 		if (napi_kthread_create(napi))
++ 			dev->threaded = NETDEV_NAPI_THREADED_DISABLED;
++ 	netif_napi_set_irq_locked(napi, -1);
+++}
+++EXPORT_SYMBOL_GPL(netif_napi_add_weight_named_locked);
+++
+++void netif_napi_add_weight_locked(struct net_device *dev,
+++				  struct napi_struct *napi,
+++				  int (*poll)(struct napi_struct *, int),
+++				  int weight)
+++{
+++	netif_napi_add_weight_named_locked(dev, napi, poll, weight, NULL);
 + }
 + EXPORT_SYMBOL(netif_napi_add_weight_locked);
 + 
-++/**
-++ * netif_napi_set_thread_name - name an existing NAPI kernel thread
-++ * @napi: initialized NAPI context
-++ * @name: thread name, truncated to TASK_COMM_LEN - 1 characters
-++ *
-++ * Call in process context without the netdev lock held. The caller must
-++ * keep the NAPI context alive. The device lock protects the thread against
-++ * concurrent NAPI thread removal. Non-threaded NAPI is left unchanged.
-++ */
-++void netif_napi_set_thread_name(struct napi_struct *napi, const char *name)
-++{
-++	char comm[TASK_COMM_LEN];
-++
-++	strscpy(comm, name, sizeof(comm));
-++	netdev_lock(napi->dev);
-++	if (napi->thread)
-++		set_task_comm(napi->thread, comm);
-++	netdev_unlock(napi->dev);
-++}
-++EXPORT_SYMBOL_GPL(netif_napi_set_thread_name);
-++
 + void napi_disable_locked(struct napi_struct *n)
 + {
 + 	unsigned long val, new;
++ 
++ 	might_sleep();
++ 	netdev_assert_locked(n->dev);
++ 
++ 	set_bit(NAPI_STATE_DISABLE, &n->state);
++ 
++ 	val = READ_ONCE(n->state);
++ 	do {
++ 		while (val & (NAPIF_STATE_SCHED | NAPIF_STATE_NPSVC)) {
++ 			usleep_range(20, 200);
++ 			val = READ_ONCE(n->state);
++ 		}
++ 
++ 		new = val | NAPIF_STATE_SCHED | NAPIF_STATE_NPSVC;
++ 		new &= ~(NAPIF_STATE_THREADED | NAPIF_STATE_PREFER_BUSY_POLL);
++ 	} while (!try_cmpxchg(&n->state, &val, new));
++ 
++ 	hrtimer_cancel(&n->timer);
++ 
++ 	if (n->config)
++ 		napi_save_config(n);
++ 	else
++ 		napi_hash_del(n);
++ 
++ 	clear_bit(NAPI_STATE_DISABLE, &n->state);
++ }
 +diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
 +--- a/drivers/net/ethernet/airoha/airoha_eth.c
 ++++ b/drivers/net/ethernet/airoha/airoha_eth.c
-+@@ -7,6 +7,7 @@
-+ #include <linux/of_net.h>
-+ #include <linux/of_reserved_mem.h>
-+ #include <linux/platform_device.h>
-++#include <linux/sched.h>
-+ #include <linux/tcp.h>
-+ #include <linux/if_vlan.h>
-+ #include <linux/pcs/pcs.h>
-+@@ -1034,6 +1035,20 @@
++@@ -1034,6 +1034,23 @@
 + 	return done;
 + }
 + 
-++/* The shared dummy netdev gives every NAPI thread the same default name.
-++ * Expose the hardware QDMA/ring identity for userspace affinity policy.
-++ * QDMA0 serves LAN devices and QDMA1 serves WAN devices.
-++ */
-++static void airoha_qdma_name_napi(struct airoha_qdma *qdma,
-++				  struct napi_struct *napi, char type, int id)
+++/* Use real hardware identities instead of the shared dummy netdev name. */
+++static void airoha_qdma_add_napi(struct airoha_qdma *qdma,
+++				 struct napi_struct *napi,
+++				 int (*poll)(struct napi_struct *, int),
+++				 char type, int id)
 ++{
-++	char name[TASK_COMM_LEN];
+++	char name[IFNAMSIZ];
 ++	int qdma_id = qdma - qdma->eth->qdma;
 ++
 ++	snprintf(name, sizeof(name), "napi/qdma%d-%c%d", qdma_id, type, id);
-++	netif_napi_set_thread_name(napi, name);
+++	/* Preserve netif_napi_add_tx()'s busy-poll exclusion. */
+++	if (type == 't')
+++		set_bit(NAPI_STATE_NO_BUSY_POLL, &napi->state);
+++	netif_napi_add_weight_named(qdma->eth->napi_dev, napi, poll,
+++				    NAPI_POLL_WEIGHT, name);
 ++}
 ++
 + static int airoha_qdma_init_rx_queue(struct airoha_queue *q,
 + 				     struct airoha_qdma *qdma, int ndesc)
 + {
-+@@ -1077,6 +1092,7 @@
++@@ -1076,7 +1093,7 @@
++ 
 + 	q->buf_size = lro_q ? pp_params.max_len : pp_params.max_len / 2;
 + 	q->ndesc = ndesc;
-+ 	netif_napi_add(eth->napi_dev, &q->napi, airoha_qdma_rx_napi_poll);
-++	airoha_qdma_name_napi(qdma, &q->napi, 'r', qid);
++-	netif_napi_add(eth->napi_dev, &q->napi, airoha_qdma_rx_napi_poll);
+++	airoha_qdma_add_napi(qdma, &q->napi, airoha_qdma_rx_napi_poll, 'r', qid);
 + 
 + 	airoha_qdma_wr(qdma, REG_RX_RING_BASE(qid), dma_addr);
 + 	airoha_qdma_rmw(qdma, REG_RX_RING_SIZE(qid),
-+@@ -1368,6 +1384,7 @@
++@@ -1366,8 +1383,8 @@
++ 	irq_q->size = size;
++ 	irq_q->qdma = qdma;
 + 
-+ 	netif_napi_add_tx(eth->napi_dev, &irq_q->napi,
-+ 			  airoha_qdma_tx_napi_poll);
-++	airoha_qdma_name_napi(qdma, &irq_q->napi, 't', id);
++-	netif_napi_add_tx(eth->napi_dev, &irq_q->napi,
++-			  airoha_qdma_tx_napi_poll);
+++	airoha_qdma_add_napi(qdma, &irq_q->napi, airoha_qdma_tx_napi_poll,
+++			     't', id);
 + 
 + 	airoha_qdma_wr(qdma, REG_TX_IRQ_BASE(id), dma_addr);
 + 	airoha_qdma_rmw(qdma, REG_TX_IRQ_CFG(id), TX_IRQ_DEPTH_MASK,
