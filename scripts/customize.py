@@ -17,6 +17,10 @@ RUNTIME_COMMANDS = ('sh', 'ls', 'awk', 'chmod', 'mkdir', 'mv', 'rm', 'rmdir',
                     'jq', 'curl', 'grep', 'sha256sum', 'wc', 'tr', 'df', 'sleep',
                     'ubus', 'uci', 'sysupgrade', 'devmem', 'cat', 'timeout', 'ping', 'ip', 'head', 'date',
                     'mktemp', 'logger', 'ucode', 'taskset')
+RETIRED_FRAME_ENGINE_FILES = (
+    'usr/libexec/w1700k-frame-engine',
+    'www/luci-static/resources/tools/w1700k-frame-engine.js',
+)
 
 
 def rendered(source):
@@ -105,6 +109,9 @@ def apply(openwrt):
     acl_path.write_text(json.dumps(acl, indent=2) + '\n', encoding='utf-8')
     overlay = openwrt / 'files'
     shutil.copytree(PACKAGE / 'root', overlay, dirs_exist_ok=True)
+    # Drop assets left by earlier builds when reusing the managed workspace.
+    for name in RETIRED_FRAME_ENGINE_FILES:
+        (overlay / name).unlink(missing_ok=True)
     helper = overlay / 'usr/libexec/w1700k-upgrade'
     helper.write_bytes(rendered(PACKAGE / 'root/usr/libexec/w1700k-upgrade'))
     for script in [*(overlay / 'usr/libexec').rglob('*'),
@@ -152,14 +159,13 @@ def verify(openwrt):
     flowsense = (root / 'www/luci-static/resources/view/airoha_flowsense/status.js').read_text(encoding='utf-8')
     if 'function latencyState(' not in flowsense or 'cs.latency.detail' not in flowsense:
         raise RuntimeError('FlowSense mean RTT display is missing from rootfs')
-    npu_view = (root / 'www/luci-static/resources/view/airoha_npu/status.js').read_text(encoding='utf-8')
-    for monitor in (flowsense, npu_view):
-        if 'tools.w1700k-frame-engine' not in monitor or 'frameEngine.createTracker()' not in monitor:
-            raise RuntimeError('Shared Frame Engine counter display missing from rootfs')
-    for name in ('luci.airoha_npu', 'luci.airoha_flowsense'):
-        rpc = (root / 'usr/libexec/rpcd' / name).read_text(encoding='utf-8')
-        if '/usr/libexec/w1700k-frame-engine' not in rpc or '0x1fb52604' in rpc:
-            raise RuntimeError(f'Driver GDM collector missing from {name}')
+    for name in RETIRED_FRAME_ENGINE_FILES:
+        if (root / name).exists():
+            raise RuntimeError(f'Retired Frame Engine asset remains in rootfs: {name}')
+    for app in ('airoha_npu', 'airoha_flowsense'):
+        for name in (f'www/luci-static/resources/view/{app}/status.js', f'usr/libexec/rpcd/luci.{app}'):
+            if 'w1700k-frame-engine' in (root / name).read_text(encoding='utf-8'):
+                raise RuntimeError(f'Retired Frame Engine integration remains in {name}')
     if 'npu-monitor.jitter.enabled' not in (root / 'etc/init.d/npu-jitter').read_text():
         raise RuntimeError('FlowSense sampler opt-out is missing from rootfs')
     backend = (root / 'usr/libexec/rpcd/luci.airoha_flowsense').read_text()
