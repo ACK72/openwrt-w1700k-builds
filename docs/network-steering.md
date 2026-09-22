@@ -6,19 +6,22 @@ existence does not establish RSS support. The current Airoha/mt7996 driver
 stack does not expose a general RX hash indirection table. This firmware
 does not enable RSS or invent a queue-to-CPU mapping from NAPI PID order.
 
-The default policy keeps each hardware group's IRQs and threaded NAPI on
-the same core:
+The default policy places Ethernet IRQs/NAPI and Wi-Fi NPU host RX IRQs/NAPI
+on CPUs 1, 2 and 3. CPU0 retains normal OS/kernel scheduling:
 
 | Hardware group | CPU | Placement |
 |---|---|---|
-| mt7996 Wi-Fi and mt76 NPU host RX | 0 | Wi-Fi NAPI and both NPU RX IRQs; PCIe IRQs already arrive here |
 | QDMA0, driver LAN role | 1 | All four IRQ banks, RX NAPI and TX-completion NAPI |
 | QDMA1, driver WAN role | 2 | All four IRQ banks, RX NAPI and TX-completion NAPI |
-| Other work | Unrestricted | CPU3 remains available; ordinary processes are not isolated |
+| mt7996 Wi-Fi and mt76 NPU host RX | 3 | Wi-Fi NAPI and both `mt76-npu.0` / `mt76-npu.1` RX IRQs |
+| mt7996 PCIe MSI | 0 (existing path) | Chained IRQ delivery is unchanged; see the exception below |
+| OS/kernel and other work | Default scheduler | CPU0 is not assigned a managed QDMA/NPU/NAPI group; ordinary tasks are not pinned or isolated |
 
 All four cores share L2, but each has private L1 caches. Keeping a group's
 IRQ and NAPI together avoids unnecessarily moving its receive work between
-L1 caches. It does not eliminate all shared data or cache misses.
+L1 caches. The PCIe IRQ exception below still crosses cores, and normal OS
+tasks may also run on CPUs 1-3. This policy does not eliminate all shared data
+or cache misses and does not reserve CPU0 exclusively for OS work.
 
 These are hardware groups, not UCI interface names. A Wi-Fi STA used as WAN
 still uses the Wi-Fi group. Multiple bands, SSIDs and AP/STA interfaces share
@@ -36,8 +39,10 @@ The mt7996 PCIe MSI children inherit a chained parent IRQ. This policy does
 not try to write their unsupported affinity controls or change the PCIe
 interrupt lifecycle. It checks that the observed PCIe interrupt counts are
 confined to CPU0. This check is an observation, not an independent mechanism
-for pinning that parent. A future PCIe affinity implementation needs a
-separate review before choosing another Wi-Fi CPU.
+for pinning that parent. Wi-Fi NAPI and the steerable NPU RX IRQs run on CPU3,
+so PCIe work that schedules Wi-Fi NAPI can require a cross-core wakeup. This
+does not move every Wi-Fi interrupt to CPU3. Moving the PCIe parent itself
+would require a separate driver change and validation.
 
 ## Configuration
 
@@ -48,6 +53,12 @@ The `network` globals option `packet_steering` selects:
 | Unset or `1` | Group placement above; disable RPS and per-queue RFS on Airoha/mt7996 netdevs |
 | `2` | Same IRQ/NAPI placement; explicitly enable RPS to CPUs 0–3 and both RFS tables |
 | `0` | Release managed task/steerable IRQ affinity to CPUs 0–3; disable RPS and per-queue RFS |
+
+In LuCI, select **Packet Steering: Enabled** (`1`) and **Steering flows (RPS):
+Standard: none** (empty or `0`) for the default placement with RPS/RFS off.
+Mode `1` also clears previously enabled RPS masks and per-queue RFS tables;
+only an explicit mode `2` enables software steering. An allocated global RFS
+table alone does not enable RFS when the managed per-queue tables are zero.
 
 irqbalance continues to exclude managed IRQs in mode `0`. Other devices and
 the firewall's hardware offload settings are left under their existing
@@ -95,7 +106,8 @@ Source-level checks and simulated ucode tests cover group identification,
 RFS prerequisites, repeated reloads and rollback. They do not establish a
 throughput gain or connection stability on a newly built image. Compare
 download/upload throughput, loaded RTT p95/p99, CPU/softirq load, drops,
-retransmissions and 6 GHz reconnects after building and installing it.
+retransmissions and 6 GHz reconnects after building and installing it. Include
+CPU3 saturation and CPU0-to-CPU3 PCIe/NAPI wakeups in that comparison.
 Changing steering during traffic can move active work between CPUs.
 
 The separate mt76 pending-frame optimization preserves per-frame DMA kicks,

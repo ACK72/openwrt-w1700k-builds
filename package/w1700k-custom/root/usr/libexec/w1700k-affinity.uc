@@ -70,7 +70,7 @@ function build_plan(mode, flows) {
 		} else {
 			m = match(name, /^napi\/(phy\d+)-\d+$/);
 			if (m && wifi_phys[m[1]]) {
-				cpu = 0; // Same CPU as the chained mt7996 PCIe interrupt.
+				cpu = 3; // Same CPU as the steerable mt76 NPU host RX IRQs.
 				wifi_seen[m[1]] = true;
 			}
 		}
@@ -104,12 +104,12 @@ function build_plan(mode, flows) {
 			m = match(line, /^\s*(\d+):.*\smt76-npu\.[01]$/);
 			if (m) {
 				id = m[1];
-				cpu = 0;
+				cpu = 3;
 			} else {
 				m = match(line, /^\s*(\d+):\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+).*\smt7996e(-hif)?$/);
 				if (m) {
 					// These MSI children cannot be steered by smp_affinity.
-					// Reject unexpected delivery instead of claiming IRQ locality.
+					// Keep their CPU0 path; Wi-Fi NAPI and NPU RX use CPU3.
 					if (+m[3] || +m[4] || +m[5])
 						die('mt7996 PCIe IRQ delivery is not confined to CPU0');
 					wifi_irq++;
@@ -215,7 +215,7 @@ try {
 	}
 	let plan = build_plan(mode, flows);
 	if (dry)
-		print(sprintf('%J\n', { mode, policy: 'wifi=0 lan=1 wan=2', changes: plan }));
+		print(sprintf('%J\n', { mode, policy: 'wifi=3 lan=1 wan=2', changes: plan }));
 	else
 		apply_plan(plan);
 } catch (err) {
