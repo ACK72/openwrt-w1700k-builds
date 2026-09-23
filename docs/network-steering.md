@@ -32,8 +32,8 @@ The kernel patch names Ethernet threads `napi/qdma0-r0` through
 identification only; ring routing and packet scheduling are unchanged.
 Names are assigned when each thread is created and retained for recreation,
 so the identity read through `/proc` matches the hardware group.
-The platform policy discovers IRQ numbers by driver names. irqbalance's
-policy script excludes these IRQs from its independent balancing.
+The platform policy discovers IRQ numbers by driver names. The firmware
+does not include irqbalance or its LuCI app.
 
 The mt7996 PCIe MSI children inherit a chained parent IRQ. This policy does
 not try to write their unsupported affinity controls or change the PCIe
@@ -60,10 +60,9 @@ Mode `1` also clears previously enabled RPS masks and per-queue RFS tables;
 only an explicit mode `2` enables software steering. An allocated global RFS
 table alone does not enable RFS when the managed per-queue tables are zero.
 
-irqbalance continues to exclude managed IRQs in mode `0`. Other devices and
-the firewall's hardware offload settings are left under their existing
-configuration. No changes to NPU firmware, DMA ownership or queue sizes are
-part of this policy.
+Other devices and the firewall's hardware offload settings are left under
+their existing configuration. No changes to NPU firmware, DMA ownership or
+queue sizes are part of this policy.
 
 In mode `2`, `steering_flows` sets entries per RX queue (default 256, range
 16–4096, rounded up to a power of two). The global RFS socket table is at
@@ -94,11 +93,10 @@ The generic `/usr/libexec/network/packet-steering.uc` is not the W1700K policy;
 do not invoke it directly to manage this board's affinity.
 
 The policy requires all four CPUs online, all 68 named QDMA contexts and all
-eight Ethernet IRQ banks. It rejects anonymous NAPI from older kernels and
-an irqbalance process started without the matching policy. Unknown or
-incomplete topology aborts before writes. Failed writes/readback trigger
-best-effort restoration; a rollback failure is reported. Repeated reloads
-avoid rewriting unchanged settings and resetting flow tables.
+eight Ethernet IRQ banks. It rejects anonymous NAPI from older kernels.
+Unknown or incomplete topology aborts before writes. Failed writes/readback
+trigger best-effort restoration; a rollback failure is reported. Repeated
+reloads avoid rewriting unchanged settings and resetting flow tables.
 
 ## Validation limits
 

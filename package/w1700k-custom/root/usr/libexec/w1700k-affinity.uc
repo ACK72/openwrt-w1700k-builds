@@ -52,12 +52,6 @@ function build_plan(mode, flows) {
 		if (!m)
 			continue; // Processes can exit during enumeration.
 		let name = trim(m[1]), cpu = null;
-		if (name == 'irqbalance') {
-			let cmd = readfile(replace(path, /status$/, 'cmdline')) ?? '';
-			if (index(cmd, '--policyscript=/usr/libexec/w1700k-irq-policy') < 0)
-				die('irqbalance is running without the W1700K IRQ policy; restart irqbalance');
-			continue;
-		}
 		if (match(name, /^napi\/qdma_eth-/))
 			die('Anonymous QDMA NAPI: the QDMA identity kernel patch is required');
 		m = match(name, /^napi\/qdma([01])-([rt])(\d+)$/);

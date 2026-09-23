@@ -17,9 +17,10 @@ RUNTIME_COMMANDS = ('sh', 'ls', 'awk', 'chmod', 'mkdir', 'mv', 'rm', 'rmdir',
                     'jq', 'curl', 'grep', 'sha256sum', 'wc', 'tr', 'df', 'sleep',
                     'ubus', 'uci', 'sysupgrade', 'devmem', 'cat', 'timeout', 'ping', 'ip', 'head', 'date',
                     'mktemp', 'logger', 'ucode', 'taskset')
-RETIRED_FRAME_ENGINE_FILES = (
+RETIRED_CUSTOMIZATION_FILES = (
     'usr/libexec/w1700k-frame-engine',
     'www/luci-static/resources/tools/w1700k-frame-engine.js',
+    'usr/libexec/w1700k-irq-policy',
 )
 
 
@@ -88,13 +89,6 @@ def apply(openwrt):
         elif subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode:
             raise RuntimeError(f'LuCI patch no longer applies: {patch.name}')
     view.write_bytes(rendered(PACKAGE / 'overview.js'))
-    # Keep irqbalance from moving IRQs owned by the platform NAPI policy.
-    for patch in sorted((ROOT / 'patches/packages').glob('*.patch')):
-        command = ['git', '-C', str(openwrt / 'feeds/packages'), 'apply', '--whitespace=nowarn']
-        if subprocess.run([*command, '--check', str(patch)], capture_output=True).returncode == 0:
-            subprocess.run([*command, str(patch)], check=True)
-        elif subprocess.run([*command, '--reverse', '--check', str(patch)], capture_output=True).returncode:
-            raise RuntimeError(f'Packages patch no longer applies: {patch.name}')
     apply_patch_series(openwrt, sorted((ROOT / 'patches/flowsense').glob('*.patch')))
     # The stock ASU ACL grants upgrade_start to read-only users. Keep firmware
     # installation in the write scope alongside our authenticated helper.
@@ -110,7 +104,7 @@ def apply(openwrt):
     overlay = openwrt / 'files'
     shutil.copytree(PACKAGE / 'root', overlay, dirs_exist_ok=True)
     # Drop assets left by earlier builds when reusing the managed workspace.
-    for name in RETIRED_FRAME_ENGINE_FILES:
+    for name in RETIRED_CUSTOMIZATION_FILES:
         (overlay / name).unlink(missing_ok=True)
     helper = overlay / 'usr/libexec/w1700k-upgrade'
     helper.write_bytes(rendered(PACKAGE / 'root/usr/libexec/w1700k-upgrade'))
@@ -133,8 +127,6 @@ def verify(openwrt):
     if len(roots) != 1:
         raise RuntimeError('Expected one compiled Airoha root filesystem')
     root = roots[0]
-    if '--policyscript=/usr/libexec/w1700k-irq-policy' not in (root / 'etc/init.d/irqbalance').read_text():
-        raise RuntimeError('irqbalance is missing the platform affinity policy')
     for command in RUNTIME_COMMANDS:
         paths = [root / directory / command for directory in ('bin', 'sbin', 'usr/bin', 'usr/sbin')]
         if not any(path.is_file() or path.is_symlink() for path in paths):
@@ -159,9 +151,9 @@ def verify(openwrt):
     flowsense = (root / 'www/luci-static/resources/view/airoha_flowsense/status.js').read_text(encoding='utf-8')
     if 'function latencyState(' not in flowsense or 'cs.latency.detail' not in flowsense:
         raise RuntimeError('FlowSense mean RTT display is missing from rootfs')
-    for name in RETIRED_FRAME_ENGINE_FILES:
+    for name in RETIRED_CUSTOMIZATION_FILES:
         if (root / name).exists():
-            raise RuntimeError(f'Retired Frame Engine asset remains in rootfs: {name}')
+            raise RuntimeError(f'Retired customization remains in rootfs: {name}')
     for app in ('airoha_npu', 'airoha_flowsense'):
         for name in (f'www/luci-static/resources/view/{app}/status.js', f'usr/libexec/rpcd/luci.{app}'):
             if 'w1700k-frame-engine' in (root / name).read_text(encoding='utf-8'):

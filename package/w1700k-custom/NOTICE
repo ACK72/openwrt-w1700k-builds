@@ -36,9 +36,8 @@ The netdev-add packet-steering hook follows the narrowly scoped suggestion in
 Gilly1970/Gemtek-W1700K-6.18 at f72939518d0bd3f02c26f42a4d08c4452cb48a9f.
 It does not import that tree's PCIe IRQ-affinity or packet-steering policy.
 
-The W1700K QDMA NAPI identity patch, platform affinity policy and irqbalance
-integration are new GPL-2.0-only changes by openwrt-w1700k-builds contributors
-(2026). The irqbalance recipe adaptation retains its GPL-2.0-or-later license.
+The W1700K QDMA NAPI identity patch and platform affinity policy are new
+GPL-2.0-only changes by openwrt-w1700k-builds contributors (2026).
 
 FlowSense ucode parsing is adapted from Gilly1970/Gemtek-W1700K-6.18
 commit 4a1e35762e382dfaf2306da9b079c548e2f3d632 (Apache-2.0).

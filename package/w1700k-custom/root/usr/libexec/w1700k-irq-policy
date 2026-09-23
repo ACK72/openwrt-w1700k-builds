@@ -1,9 +1,0 @@
-#!/bin/sh
-# SPDX-License-Identifier: GPL-2.0-only
-# irqbalance arguments: sysfs device path, IRQ number. Never persist IRQ IDs.
-case "$2" in ''|*[!0-9]*) exit 1;; esac
-awk -v irq="$2:" '
-    $1 == irq && $NF ~ /^(airoha_eth\.[0-7]|mt76-npu\.[01]|mt7996e(-hif)?)$/ {
-        print "ban=true"
-    }
-' /proc/interrupts
