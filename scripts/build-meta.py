@@ -190,10 +190,24 @@ def check_installed(openwrt):
     manifests = list((openwrt / "bin/targets/airoha/an7581").glob("*.manifest"))
     if not requested or len(manifests) != 1:
         raise RuntimeError("Missing or ambiguous image package inventory")
-    installed = {line.split(" - ", 1)[0] for line in manifests[0].read_text().splitlines() if " - " in line}
-    missing = requested - installed
+    installed = dict(line.split(" - ", 1) for line in manifests[0].read_text().splitlines() if " - " in line)
+    missing = []
+    mismatched = []
+    for dependency in sorted(requested):
+        # OpenWrt's APK install list also pins base-files, libc and kernel.
+        # Match the package name, but retain the exact-version requirement.
+        match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9+_.-]*)(?:=([^\s=<>]+))?", dependency)
+        if not match:
+            raise RuntimeError(f"Unsupported image package requirement: {dependency}")
+        name, version = match.groups()
+        if name not in installed:
+            missing.append(dependency)
+        elif version is not None and installed[name] != version:
+            mismatched.append(f"{dependency} (installed {installed[name]})")
     if missing:
         raise RuntimeError("Packages missing from image rootfs: " + ", ".join(sorted(missing)))
+    if mismatched:
+        raise RuntimeError("Package versions differ in image rootfs: " + ", ".join(mismatched))
     print(f"Verified {len(requested)} requested packages in the image rootfs ({len(installed)} installed)")
 
 
