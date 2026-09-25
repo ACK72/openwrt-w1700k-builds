@@ -105,6 +105,14 @@
     {
       "file": "0018-airoha-name-qdma-napi-threads.patch",
       "description": "Expose real QDMA/ring names for IRQ/NAPI group locality; no RSS or PID-order inference."
+    },
+    {
+      "file": "0019-wifi-add-opt-in-sta-control-diagnostics.patch",
+      "description": "Add disabled-by-default bounded diagnostics for MCU, beacon, work and RX scheduling latency."
+    },
+    {
+      "file": "0020-wifi-coalesce-device-wide-sta-polling.patch",
+      "description": "Keep per-PHY counters while polling global STA statistics once per device interval."
     }
   ]
 }

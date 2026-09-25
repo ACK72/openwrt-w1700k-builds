@@ -1,0 +1,203 @@
+From: ACK72 <ACK72@users.noreply.github.com>
+Subject: [PATCH] wifi: coalesce device-wide STA queries across PHYs
+
+diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
+--- a/package/kernel/mt76/Makefile
++++ b/package/kernel/mt76/Makefile
+@@ -1,7 +1,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=mt76
+-PKG_RELEASE=11
++PKG_RELEASE=12
+ 
+ PKG_LICENSE:=BSD-3-Clause-Clear
+ PKG_LICENSE_FILES:=
+diff --git a/package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch b/package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch
+new file mode 100644
+--- /dev/null
++++ b/package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch
+@@ -0,0 +1,183 @@
++From: ACK72 <ACK72@users.noreply.github.com>
++Subject: [PATCH] mt7996: coalesce device-wide STA queries across PHYs
++
++--- a/mt7996/mac.c
+++++ b/mt7996/mac.c
++@@ -2912,104 +2912,139 @@
++ 		msta_link = list_first_entry(&list, struct mt7996_sta_link,
++ 					     rc_list);
++ 		list_del_init(&msta_link->rc_list);
++ 
++ 		changed = msta_link->changed;
++ 		msta_link->changed = 0;
++ 		mvif = msta_link->sta->vif;
++ 		vif = container_of((void *)mvif, struct ieee80211_vif,
++ 				   drv_priv);
++ 
++ 		spin_unlock_bh(&dev->mt76.sta_poll_lock);
++ 
++ 		if (changed & (IEEE80211_RC_SUPP_RATES_CHANGED |
++ 			       IEEE80211_RC_NSS_CHANGED |
++ 			       IEEE80211_RC_BW_CHANGED))
++ 			mt7996_mcu_add_rate_ctrl(dev, msta_link->sta, vif,
++ 						 msta_link->wcid.link_id,
++ 						 true);
++ 
++ 		if (changed & IEEE80211_RC_SMPS_CHANGED)
++ 			mt7996_mcu_set_fixed_field(dev, msta_link->sta, NULL,
++ 						   msta_link->wcid.link_id,
++ 						   RATE_PARAM_MMPS_UPDATE);
++ 
++ 		spin_lock_bh(&dev->mt76.sta_poll_lock);
++ 	}
++ 
++ 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
++ 
++ 	mutex_unlock(&dev->mt76.mutex);
++ }
++ 
+++static void mt7996_mac_sta_poll(struct mt7996_phy *phy)
+++{
+++	struct mt7996_dev *dev = phy->dev;
+++	u64 start;
+++	int ret, first_error = 0;
+++
+++	lockdep_assert_held(&dev->mt76.mutex);
+++	if (dev->sta_poll_valid && time_before(jiffies, dev->sta_poll_next))
+++		return;
+++
+++	start = mt76_sta_diag_clock(&dev->mt76);
+++	ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_RATE);
+++	if (ret)
+++		first_error = ret;
+++	ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_AIR_TIME);
+++	if (ret && !first_error)
+++		first_error = ret;
+++	ret = mt7996_mcu_get_per_sta_info(phy, UNI_PER_STA_RSSI);
+++	if (ret && !first_error)
+++		first_error = ret;
+++	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
+++		ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_ADM_STAT);
+++		if (ret && !first_error)
+++			first_error = ret;
+++		ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_MSDU_COUNT);
+++		if (ret && !first_error)
+++			first_error = ret;
+++	}
+++
+++	/*
+++	 * Any active PHY may poll. Errors also back off to avoid retry bursts.
+++	 * Start the interval after completion, including a slow MCU response.
+++	 */
+++	dev->sta_poll_next = jiffies + 5 * MT7996_WATCHDOG_TIME;
+++	dev->sta_poll_valid = true;
+++	if (start)
+++		mt76_sta_diag_event(&dev->mt76, MT76_DIAG_STA_POLL,
+++			phy->mt76->band_idx, start,
+++			mt76_sta_diag_us(start, ktime_get_ns()), 0, 0, first_error);
+++}
+++
++ void mt7996_mac_work(struct work_struct *work)
++ {
++ 	struct mt7996_phy *phy;
++ 	struct mt76_phy *mphy;
++ 	u64 diag_start, diag_locked;
++ 
++ 	mphy = (struct mt76_phy *)container_of(work, struct mt76_phy,
++ 					       mac_work.work);
++ 	phy = mphy->priv;
++ 	diag_start = mt76_sta_diag_clock(mphy->dev);
++ 	if (diag_start)
++ 		mt76_sta_diag_event(mphy->dev, MT76_DIAG_WORK_BEGIN,
++ 				    mphy->band_idx, diag_start, 0, 0, 0, 0);
++ 
++ 	mutex_lock(&mphy->dev->mutex);
++ 	diag_locked = diag_start ? ktime_get_ns() : 0;
++ 
++ 	if (test_bit(MT76_MCU_RESET, &mphy->dev->phy.state)) {
++ 		mutex_unlock(&mphy->dev->mutex);
++ 		if (diag_start)
++ 			mt76_sta_diag_event(mphy->dev, MT76_DIAG_WORK_END,
++ 				mphy->band_idx, diag_start,
++ 				mt76_sta_diag_us(diag_start, diag_locked),
++ 				mt76_sta_diag_us(diag_locked, ktime_get_ns()),
++ 				0, -ECANCELED);
++ 		return;
++ 	}
++ 	mt76_update_survey(mphy);
++ 	if (++mphy->mac_work_count == 5) {
++ 		mphy->mac_work_count = 0;
++ 
++ 		mt7996_mac_update_stats(phy);
++ 
++-		mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_RATE);
++-		mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_AIR_TIME);
++-		mt7996_mcu_get_per_sta_info(phy, UNI_PER_STA_RSSI);
++-		if (mtk_wed_device_active(&phy->dev->mt76.mmio.wed)) {
++-			mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_ADM_STAT);
++-			mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_MSDU_COUNT);
++-		}
+++		mt7996_mac_sta_poll(phy);
++ 	}
++ 
++ 	mutex_unlock(&mphy->dev->mutex);
++ 
++ 	if (diag_start)
++ 		mt76_sta_diag_event(mphy->dev, MT76_DIAG_WORK_END,
++ 			mphy->band_idx, diag_start,
++ 			mt76_sta_diag_us(diag_start, diag_locked),
++ 			mt76_sta_diag_us(diag_locked, ktime_get_ns()), 0, 0);
++ 	mt76_beacon_mon_check(mphy);
++ 	mt76_tx_status_check(mphy->dev, false);
++ 
++ 	ieee80211_queue_delayed_work(mphy->hw, &mphy->mac_work,
++ 				     MT7996_WATCHDOG_TIME);
++ }
++ 
++ static void mt7996_dfs_stop_radar_detector(struct mt7996_phy *phy)
++ {
++ 	struct mt7996_dev *dev = phy->dev;
++ 	int rdd_idx = mt7996_get_rdd_idx(phy, false);
++ 
++ 	if (rdd_idx < 0)
++ 		return;
++ 
++ 	mt7996_mcu_rdd_cmd(dev, RDD_STOP, rdd_idx, 0);
++ }
++ 
++ static int mt7996_dfs_start_rdd(struct mt7996_dev *dev, int rdd_idx)
++ {
++ 	int region;
++ 
++ 	switch (dev->mt76.region) {
++--- a/mt7996/mt7996.h
+++++ b/mt7996/mt7996.h
++@@ -471,24 +471,28 @@
++ 	u64 mld_remap_idx_mask;
++ 
++ 	const struct mt76_bus_ops *bus_ops;
++ 	struct mt7996_phy phy;
++ 
++ 	/* monitor rx chain configured channel */
++ 	struct cfg80211_chan_def rdd2_chandef;
++ 	struct mt7996_phy *rdd2_phy;
++ 
++ 	u16 chainmask;
++ 	u8 chainshift[__MT_MAX_BAND];
++ 	u32 hif_idx;
+++
+++	/* Device-wide STA queries, serialized by mt76.mutex. */
+++	unsigned long sta_poll_next;
+++	bool sta_poll_valid;
++ 
++ 	struct work_struct init_work;
++ 	struct work_struct rc_work;
++ 	struct work_struct dump_work;
++ 	struct work_struct reset_work;
++ 	wait_queue_head_t reset_wait;
++ 	struct {
++ 		u32 state;
++ 		u32 wa_reset_count;
++ 		u32 wm_reset_count;
++ 		bool hw_full_reset:1;
++ 		bool hw_init_done:1;
