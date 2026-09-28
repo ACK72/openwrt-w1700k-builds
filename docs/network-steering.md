@@ -6,32 +6,37 @@ existence does not establish RSS support. The current Airoha/mt7996 driver
 stack does not expose a general RX hash indirection table. This firmware
 does not enable RSS or invent a queue-to-CPU mapping from NAPI PID order.
 
-The default policy places Ethernet IRQs/NAPI and Wi-Fi NPU host RX IRQs/NAPI
-on CPUs 1, 2 and 3. CPU0 retains normal OS/kernel scheduling:
+The default policy follows each queue's interrupt delivery. Ethernet groups
+use CPUs 1 and 2; threaded Wi-Fi NAPI is split by its actual RX queue role:
 
 | Hardware group | CPU | Placement |
 |---|---|---|
 | QDMA0, driver LAN role | 1 | All four IRQ banks, RX NAPI and TX-completion NAPI |
 | QDMA1, driver WAN role | 2 | All four IRQ banks, RX NAPI and TX-completion NAPI |
-| mt7996 Wi-Fi and mt76 NPU host RX | 3 | Wi-Fi NAPI and both `mt76-npu.0` / `mt76-npu.1` RX IRQs |
+| mt76 NPU host RX | 3 | `npu0` / `npu1` NAPI and both `mt76-npu.0` / `mt76-npu.1` RX IRQs |
+| mt7996 PCIe RX, MCU and completion queues | 0 | Named PCIe queue NAPI contexts, matching observed PCIe IRQ delivery |
 | mt7996 PCIe MSI | 0 (existing path) | Chained IRQ delivery is unchanged; see the exception below |
-| OS/kernel and other work | Default scheduler | CPU0 is not assigned a managed QDMA/NPU/NAPI group; ordinary tasks are not pinned or isolated |
+| OS/kernel and other work | Default scheduler | Ordinary tasks are not pinned or isolated |
 
 All four cores share L2, but each has private L1 caches. Keeping a group's
 IRQ and NAPI together avoids unnecessarily moving its receive work between
-L1 caches. The PCIe IRQ exception below still crosses cores, and normal OS
-tasks may also run on CPUs 1-3. This policy does not eliminate all shared data
+L1 caches. Normal OS tasks may also run on CPUs 1-3. This policy does not eliminate all shared data
 or cache misses and does not reserve CPU0 exclusively for OS work.
 
-These are hardware groups, not UCI interface names. A Wi-Fi STA used as WAN
-still uses the Wi-Fi group. Multiple bands, SSIDs and AP/STA interfaces share
-mt7996's NAPI infrastructure and cannot each receive an independent IRQ CPU.
+These are hardware queues, not UCI interface names. A Wi-Fi STA used as WAN
+still uses the same Wi-Fi queue roles. Multiple bands, SSIDs and AP/STA
+interfaces share mt7996's NAPI infrastructure; this is not per-interface steering.
 
 The kernel patch names Ethernet threads `napi/qdma0-r0` through
 `napi/qdma1-r31`, and `napi/qdma0-t0` through `napi/qdma1-t1`. It changes
 identification only; ring routing and packet scheduling are unchanged.
 Names are assigned when each thread is created and retained for recreation,
 so the identity read through `/proc` matches the hardware group.
+Patch `0021` uses the same registration API for Wi-Fi, giving each RX NAPI a
+name such as `napi/phy0-wm` or `napi/phy0-npu1`. The suffix is selected from
+`enum mt76_rxq_id` at registration, not from PID, NAPI ID or creation order.
+Names are copied by the kernel and survive NAPI thread recreation. The shared
+wiphy is discovered independently of whether an AP or STA netdev is up.
 The platform policy discovers IRQ numbers by driver names. The firmware
 does not include irqbalance or its LuCI app.
 
@@ -39,10 +44,40 @@ The mt7996 PCIe MSI children inherit a chained parent IRQ. This policy does
 not try to write their unsupported affinity controls or change the PCIe
 interrupt lifecycle. It checks that the observed PCIe interrupt counts are
 confined to CPU0. This check is an observation, not an independent mechanism
-for pinning that parent. Wi-Fi NAPI and the steerable NPU RX IRQs run on CPU3,
-so PCIe work that schedules Wi-Fi NAPI can require a cross-core wakeup. This
-does not move every Wi-Fi interrupt to CPU3. Moving the PCIe parent itself
+for pinning that parent. PCIe queue threads are placed on CPU0, while the
+steerable NPU RX IRQs and their two host RX threads run on CPU3. Moving the PCIe parent itself
 would require a separate driver change and validation.
+
+## Threaded Wi-Fi NAPI roles
+
+The policy requires `napi_threaded=1` and the following 16 named contexts for
+the W1700K MT7996 + official NPU topology. A context's existence does not mean
+it processes packets on the CPU: several RRO/page rings are owned by the NPU.
+
+| Queue IDs | Name suffixes | Role | CPU |
+|---|---|---|---|
+| 1, 2 | `wm`, `wa` | WM / WA MCU event RX | 0 |
+| 0, 6 | `rx0`, `rx2` | Ordinary band 0 / 2 RX | 0 |
+| 5, 7 | `wa0`, `wa2` | Per-band WA / TX-free paths | 0 |
+| 14, 16 | `tf0`, `tf2` | TX-free completion rings | 0 |
+| 8, 10 | `rro0`, `rro2` | Hardware reorder data rings | 0 |
+| 11, 12, 13 | `pg0`, `pg1`, `pg2` | MSDU page rings | 0 |
+| 17 | `ind` | Reorder indication ring | 0 |
+| 19, 20 | `npu0`, `npu1` | NPU-to-host RX rings | 3 |
+
+This classifies transport queues, not 802.11 frame types. Beacon, management
+or EAPOL processing must not be assumed to occur exclusively on the WM queue;
+NPU host RX can deliver frames requiring host processing too. The separate
+TX cleanup NAPI uses the non-threaded TX dummy netdev and is not turned into
+a new threaded context by this change. Poll callbacks, weights, IRQ masks,
+DMA ownership and offload paths are preserved.
+
+The old kernel's repeated `napi/phy0-0` names cannot identify these roles.
+Install the matching kernel/mt76 changes together with this policy. Unknown,
+duplicate or missing roles, missing NPU IRQs, or non-threaded Wi-Fi abort the
+plan before writes. A different queue topology requires a reviewed policy
+update. Long wiphy names that cannot fit a complete role name fall back to
+the kernel's generic name and are not accepted by this policy.
 
 ## Configuration
 
@@ -105,7 +140,8 @@ RFS prerequisites, repeated reloads and rollback. They do not establish a
 throughput gain or connection stability on a newly built image. Compare
 download/upload throughput, loaded RTT p95/p99, CPU/softirq load, drops,
 retransmissions and 6 GHz reconnects after building and installing it. Include
-CPU3 saturation and CPU0-to-CPU3 PCIe/NAPI wakeups in that comparison.
+CPU0/CPU3 saturation and cross-core wakeups in that comparison. CPU0 now
+also runs the PCIe queue threads, so compare its scheduler load explicitly.
 Changing steering during traffic can move active work between CPUs.
 
 The separate mt76 pending-frame optimization preserves per-frame DMA kicks,

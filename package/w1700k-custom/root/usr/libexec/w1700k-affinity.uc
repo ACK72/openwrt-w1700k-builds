@@ -25,6 +25,15 @@ function plan_file(plan, path, value, effective) {
 		push(plan, { path, value, old, effective });
 }
 
+// MT7996 + official NPU topology on this board. Names come from RX queue
+// registration, including the idle firmware-owned RRO/page contexts.
+// PCIe IRQs deliver on CPU0; only NPU host RX IRQs deliver on CPU3.
+const wifi_roles = {
+	rx0: 0, wm: 0, wa: 0, wa0: 0, rx2: 0, wa2: 0,
+	rro0: 0, rro2: 0, pg0: 0, pg1: 0, pg2: 0,
+	tf0: 0, tf2: 0, ind: 0, npu0: 3, npu1: 3,
+};
+
 function build_plan(mode, flows) {
 	if (required('/tmp/sysinfo/board_name') != 'gemtek,w1700k-ubi')
 		die('This policy requires Gemtek W1700K');
@@ -32,13 +41,27 @@ function build_plan(mode, flows) {
 		die('The locality policy requires CPUs 0-3 online');
 
 	let plan = [], tasks = [], rings = {}, wifi_phys = {}, wifi_seen = {}, queues = [];
+	// Discover the shared wiphy even when no AP/STA netdev is currently up.
+	for (let path in glob('/sys/class/ieee80211/*')) {
+		if (split(realpath(`${path}/device/driver`) ?? '', '/')[-1] != 'mt7996e')
+			continue;
+		let phy = split(path, '/')[-1];
+		if (!match(phy, /^phy\d+$/))
+			die(`Unsupported Wi-Fi wiphy name: ${phy}`);
+		wifi_phys[phy] = true;
+		if (required(`/sys/kernel/debug/ieee80211/${phy}/mt76/napi_threaded`) != '1')
+			die(`Threaded NAPI must be enabled for ${phy}`);
+	}
+	if (length(keys(wifi_phys)) > 1)
+		die('Expected one shared MT7996 wiphy');
 	for (let path in glob('/sys/class/net/*')) {
 		let driver = split(realpath(`${path}/device/driver`) ?? '', '/')[-1];
 		if (driver != 'airoha_eth' && driver != 'mt7996e')
 			continue;
 		if (driver == 'mt7996e') {
 			let phy = required(`${path}/phy80211/index`);
-			wifi_phys[`phy${phy}`] = true;
+			if (!wifi_phys[`phy${phy}`])
+				die('Wi-Fi netdev has no verified shared wiphy');
 		}
 		for (let queue in glob(`${path}/queues/rx-*/rps_cpus`))
 			push(queues, queue);
@@ -63,9 +86,15 @@ function build_plan(mode, flows) {
 			cpu = +m[1] + 1; // QDMA0/LAN -> CPU1, QDMA1/WAN -> CPU2.
 		} else {
 			m = match(name, /^napi\/(phy\d+)-\d+$/);
+			if (m && wifi_phys[m[1]])
+				die('Anonymous Wi-Fi NAPI: the RX queue role kernel patch is required');
+			m = match(name, /^napi\/(phy\d+)-(.+)$/);
 			if (m && wifi_phys[m[1]]) {
-				cpu = 3; // Same CPU as the steerable mt76 NPU host RX IRQs.
-				wifi_seen[m[1]] = true;
+				let role = m[2];
+				if (wifi_roles[role] == null || wifi_seen[name])
+					die(`Unexpected Wi-Fi queue identity: ${name}`);
+				wifi_seen[name] = true;
+				cpu = wifi_roles[role];
 			}
 		}
 		if (cpu == null)
@@ -81,10 +110,11 @@ function build_plan(mode, flows) {
 	if (length(keys(rings)) != 68)
 		die('Expected 32 RX and 2 TX completion NAPI contexts on each QDMA');
 	for (let phy in keys(wifi_phys))
-		if (!wifi_seen[phy])
-			die(`Missing NAPI threads for ${phy}`);
+		for (let role in keys(wifi_roles))
+			if (!wifi_seen[`napi/${phy}-${role}`])
+				die(`Missing Wi-Fi NAPI queue ${phy}-${role}`);
 
-	let banks = {}, wifi_irq = 0;
+	let banks = {}, wifi_irq = 0, npu_irqs = {};
 	for (let line in split(required('/proc/interrupts'), '\n')) {
 		let m = match(line, /^\s*(\d+):.*\sairoha_eth\.([0-7])$/);
 		let cpu, id;
@@ -95,15 +125,18 @@ function build_plan(mode, flows) {
 			banks[m[2]] = true;
 			cpu = +m[2] < 4 ? 1 : 2;
 		} else {
-			m = match(line, /^\s*(\d+):.*\smt76-npu\.[01]$/);
+			m = match(line, /^\s*(\d+):.*\smt76-npu\.([01])$/);
 			if (m) {
+				if (npu_irqs[m[2]])
+					die('Duplicate NPU host RX IRQ');
+				npu_irqs[m[2]] = true;
 				id = m[1];
 				cpu = 3;
 			} else {
 				m = match(line, /^\s*(\d+):\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+).*\smt7996e(-hif)?$/);
 				if (m) {
 					// These MSI children cannot be steered by smp_affinity.
-					// Keep their CPU0 path; Wi-Fi NAPI and NPU RX use CPU3.
+					// PCIe queue threads use CPU0; NPU host RX uses CPU3.
 					if (+m[3] || +m[4] || +m[5])
 						die('mt7996 PCIe IRQ delivery is not confined to CPU0');
 					wifi_irq++;
@@ -118,6 +151,8 @@ function build_plan(mode, flows) {
 		die('Expected all eight QDMA IRQ banks');
 	if (length(keys(wifi_phys)) && wifi_irq != 2)
 		die('Expected both mt7996 PCIe IRQs');
+	if (length(keys(wifi_phys)) && length(keys(npu_irqs)) != 2)
+		die('Expected both NPU host RX IRQs');
 	for (let task in tasks)
 		push(plan, task);
 
@@ -209,7 +244,7 @@ try {
 	}
 	let plan = build_plan(mode, flows);
 	if (dry)
-		print(sprintf('%J\n', { mode, policy: 'wifi=3 lan=1 wan=2', changes: plan }));
+		print(sprintf('%J\n', { mode, policy: 'wifi-pcie=0 wifi-npu=3 lan=1 wan=2', changes: plan }));
 	else
 		apply_plan(plan);
 } catch (err) {

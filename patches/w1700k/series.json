@@ -113,6 +113,10 @@
     {
       "file": "0020-wifi-coalesce-device-wide-sta-polling.patch",
       "description": "Keep per-PHY counters while polling global STA statistics once per device interval."
+    },
+    {
+      "file": "0021-wifi-name-napi-by-rx-queue-role.patch",
+      "description": "Persist actual mt76 RX queue roles in threaded NAPI names for IRQ-local placement. Requires named-NAPI kernel API from 0018."
     }
   ]
 }

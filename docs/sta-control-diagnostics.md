@@ -6,8 +6,8 @@ The firmware includes two separate mt76 changes:
 - `0020`: device-wide STA statistics polling shared by the active PHYs. Per-radio
   survey and MAC counters retain their existing work cycle.
 
-The mt76 package release is 12. These changes do not move authentication or
-reconnection into the NPU. The diagnostic patch retains beacon thresholds,
+These changes were introduced in mt76 package release 12. They do not move
+authentication or reconnection into the NPU. The diagnostic patch retains beacon thresholds,
 watchdog ordering, RX budgets, DMA ownership and recovery behavior.
 
 ## Enable and read
@@ -18,7 +18,7 @@ kernel ftrace support is not required.
 
 ```sh
 diag=/sys/kernel/debug/ieee80211/phy0/mt76
-printf '1\n' > "$diag/sta_control_diag_enable"
+echo 1 > "$diag/sta_control_diag_enable"
 cat "$diag/sta_control_diag"
 ```
 
@@ -26,7 +26,7 @@ Record snapshots during a short reproduction window. To stop recording and
 retain the final snapshot:
 
 ```sh
-printf '0\n' > "$diag/sta_control_diag_enable"
+echo 0 > "$diag/sta_control_diag_enable"
 cat "$diag/sta_control_diag"
 ```
 
