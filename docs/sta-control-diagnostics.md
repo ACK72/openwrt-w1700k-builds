@@ -10,6 +10,11 @@ These changes were introduced in mt76 package release 12. They do not move
 authentication or reconnection into the NPU. The diagnostic patch retains beacon thresholds,
 watchdog ordering, RX budgets, DMA ownership and recovery behavior.
 
+Patch `0022` (mt76 release 14) corrects NAPI admission timing. Earlier builds
+recorded scheduling attempts even when NAPI rejected them, which could leave
+a stale timestamp and overstate a later wait. Treat earlier wait maxima as
+provisional; they do not by themselves prove CPU contention or a stalled queue.
+
 ## Enable and read
 
 The files are under the shared radio's mt76 debugfs directory. Verify the PHY
@@ -52,9 +57,13 @@ overwritten count. Each queue row contains:
 `queue polls budget_hits wait_max_us run_max_us`
 
 `budget_hits` counts polls that consumed their budget; it is not a drop counter.
-Wait time starts at the instrumented NAPI scheduling request, or at the previous
-budget-exhausted poll. It excludes time before the IRQ/tasklet reaches that
-request. A poll without a recorded scheduling timestamp contributes no wait
+With `0022`, wait time starts after an instrumented scheduling request acquires
+NAPI ownership, before dispatch to the poller, or at the previous budget-exhausted
+poll. Rejected attempts do not start or change a timestamp. A fresh accepted
+request replaces any timestamp left by a cancelled instance. This order also
+prevents a threaded poll on another CPU from starting before its timestamp.
+It excludes time before the IRQ/tasklet reaches the request. An internal repoll
+without an instrumented admission or a budget timestamp contributes no wait
 sample; a zero wait maximum does not prove zero scheduling latency. Pauses for
 recovery can also contribute to a wait and must be correlated with reset logs.
 Run time measures the poll body before completion/IRQ re-enable, including any

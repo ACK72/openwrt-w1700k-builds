@@ -117,6 +117,10 @@
     {
       "file": "0021-wifi-name-napi-by-rx-queue-role.patch",
       "description": "Persist actual mt76 RX queue roles in threaded NAPI names for IRQ-local placement. Requires named-NAPI kernel API from 0018."
+    },
+    {
+      "file": "0022-wifi-fix-napi-admission-latency-sampling.patch",
+      "description": "Timestamp accepted NAPI admission before dispatch, excluding rejected requests and stale pre-disable timestamps."
     }
   ]
 }
