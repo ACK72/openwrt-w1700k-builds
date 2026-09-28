@@ -121,6 +121,31 @@
     {
       "file": "0022-wifi-fix-napi-admission-latency-sampling.patch",
       "description": "Timestamp accepted NAPI admission before dispatch, excluding rejected requests and stale pre-disable timestamps."
+    },
+    {
+      "file": "0023-wifi-integrate-npu-station-counters.patch",
+      "selected": [
+        "039 (adapted)",
+        "046 (packet reporting; adapted)"
+      ],
+      "source": "Gilly1970/Gemtek-W1700K-6.18@4b8fb8c3a2619dd239fb44fd511ee2848a07e768",
+      "author": "ACK72 <acikom72@gmail.com>"
+    },
+    {
+      "file": "0024-airoha-isolate-ipv6-source-mac-slots.patch",
+      "selected": [
+        "972/973 (immutable-slot redesign)"
+      ],
+      "source": "Gilly1970/Gemtek-W1700K-6.18@4b8fb8c3a2619dd239fb44fd511ee2848a07e768",
+      "author": "ACK72 <acikom72@gmail.com>"
+    },
+    {
+      "file": "0025-airoha-harden-shared-qdma-gro-lifecycle.patch",
+      "selected": [
+        "975/977 (shared-QDMA adaptation)"
+      ],
+      "source": "Gilly1970/Gemtek-W1700K-6.18@4b8fb8c3a2619dd239fb44fd511ee2848a07e768",
+      "author": "ACK72 <acikom72@gmail.com>"
     }
   ]
 }

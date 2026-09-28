@@ -1,0 +1,283 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Mon, 28 Sep 2026 18:50:30 +0900
+Subject: [PATCH] airoha: keep IPv6 flow source MAC slots immutable
+
+Redesign the source-MAC allocation from Gilly 972/973 as one change.
+Allocate IPv6 GDM egress MACs from slots 5..14, never the mutable GDM
+base slots or KEEP slot 15. Serialize both words and check write ACKs.
+Share exact MAC matches but never recycle programmed slots until full
+hardware initialization. Thus flow-delete failures and in-flight packets
+cannot observe a reassigned MAC. Exhaustion or write failure declines
+offload. Failed writes quarantine their slot. No MAC addresses are logged.
+
+This deliberately bounds hardware offload to ten distinct GDM IPv6 egress
+MACs per hardware lifetime; subsequent MACs use software forwarding.
+L2 KEEP, Wi-Fi egress and inline IPv4 MAC handling retain their behavior.
+
+Adapted-from: Gilly1970 <gilroyscott@hotmail.com>, patches 972 and 973
+Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
+
+diff --git a/target/linux/airoha/patches-6.18/9999-z-airoha-ipv6-source-mac-slots.patch b/target/linux/airoha/patches-6.18/9999-z-airoha-ipv6-source-mac-slots.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/airoha/patches-6.18/9999-z-airoha-ipv6-source-mac-slots.patch
+@@ -0,0 +1,259 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Mon, 28 Sep 2026 18:50:30 +0900
++Subject: [PATCH] airoha: isolate IPv6 flow source MACs in immutable UPDMEM slots
++
++Redesign the source-MAC allocation from Gilly 972/973 as one change.
++Allocate IPv6 GDM egress MACs from slots 5..14, never the mutable GDM
++base slots or KEEP slot 15. Serialize both words and check write ACKs.
++Share exact MAC matches but never recycle programmed slots until full
++hardware initialization. Thus flow-delete failures and in-flight packets
++cannot observe a reassigned MAC. Exhaustion or write failure declines
++offload. Failed writes quarantine their slot. No MAC addresses are logged.
++
++This deliberately bounds hardware offload to ten distinct GDM IPv6 egress
++MACs per hardware lifetime; subsequent MACs use software forwarding.
++L2 KEEP, Wi-Fi egress and inline IPv4 MAC handling retain their behavior.
++
++Adapted-from: Gilly1970 <gilroyscott@hotmail.com>, patches 972 and 973
++Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
++
++--- a/drivers/net/ethernet/airoha/airoha_eth.h
+++++ b/drivers/net/ethernet/airoha/airoha_eth.h
++@@ -634,24 +634,32 @@
++ 	struct airoha_npu __rcu *npu;
++ 
++ 	struct airoha_ppe *ppe;
++ 	struct rhashtable flow_table;
++ 
++ 	struct reset_control_bulk_data rsts[AIROHA_MAX_NUM_RSTS];
++ 	struct reset_control_bulk_data *xsi_rsts;
++ 
++ 	struct net_device *napi_dev;
++ 
++ 	struct airoha_qdma qdma[AIROHA_MAX_NUM_QDMA];
++ 	struct airoha_gdm_port *ports[AIROHA_MAX_NUM_GDM_PORTS];
+++
+++	/* Slots 0..4 belong to GDM; 15 means keep the original source MAC.
+++	 * Dynamic slots are immutable until the next full hardware init.
+++	 */
+++	spinlock_t updmem_lock;
+++	u16 updmem_used;
+++	u16 updmem_valid;
+++	u8 updmem_mac[16][ETH_ALEN];
++ };
++ 
++ u32 airoha_rr(void __iomem *base, u32 offset);
++ void airoha_wr(void __iomem *base, u32 offset, u32 val);
++ u32 airoha_rmw(void __iomem *base, u32 offset, u32 mask, u32 val);
++ 
++ #define airoha_fe_rr(eth, offset)				\
++ 	airoha_rr((eth)->fe_regs, (offset))
++ #define airoha_fe_wr(eth, offset, val)				\
++ 	airoha_wr((eth)->fe_regs, (offset), (val))
++ #define airoha_fe_rmw(eth, offset, mask, val)			\
++ 	airoha_rmw((eth)->fe_regs, (offset), (mask), (val))
++--- a/drivers/net/ethernet/airoha/airoha_ppe.c
+++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
++@@ -334,24 +334,65 @@
++ #else
++ 	return -ENODEV;
++ #endif
++ }
++ 
++ static void airoha_ppe_foe_set_bridge_addrs(struct airoha_foe_bridge *br,
++ 					    struct ethhdr *eh)
++ {
++ 	br->dest_mac_hi = get_unaligned_be32(eh->h_dest);
++ 	br->dest_mac_lo = get_unaligned_be16(eh->h_dest + 4);
++ 	br->src_mac_hi = get_unaligned_be16(eh->h_source);
++ 	br->src_mac_lo = get_unaligned_be32(eh->h_source + 2);
+++}
+++
+++/* Keep GDM slots reserved even when their ports are not registered.
+++ * Do not recycle a slot on flow deletion: a successful SRAM invalidation
+++ * does not establish that every in-flight packet has consumed its SMAC.
+++ */
+++#define AIROHA_UPDMEM_FIRST 5
+++#define AIROHA_UPDMEM_KEEP 15
+++
+++static int airoha_ppe_write_upd_mem(struct airoha_eth *eth, u8 slot,
+++				     const u8 *addr);
+++
+++static int airoha_ppe_get_smac_id(struct airoha_eth *eth, const u8 *addr)
+++{
+++	int slot, free = -1, ret;
+++
+++	spin_lock_bh(&eth->updmem_lock);
+++	for (slot = AIROHA_UPDMEM_FIRST; slot < AIROHA_UPDMEM_KEEP; slot++) {
+++		if ((eth->updmem_valid & BIT(slot)) &&
+++		    ether_addr_equal(eth->updmem_mac[slot], addr)) {
+++			ret = slot;
+++			goto unlock;
+++		}
+++		if (!(eth->updmem_used & BIT(slot)) && free < 0)
+++			free = slot;
+++	}
+++	ret = -ENOSPC;
+++	if (free < 0)
+++		goto unlock;
+++
+++	/* Quarantine partial writes too: never match or reassign that slot. */
+++	eth->updmem_used |= BIT(free);
+++	ret = airoha_ppe_write_upd_mem(eth, free, addr);
+++	if (ret)
+++		goto unlock;
+++	ether_addr_copy(eth->updmem_mac[free], addr);
+++	eth->updmem_valid |= BIT(free);
+++	ret = free;
+++unlock:
+++	spin_unlock_bh(&eth->updmem_lock);
+++	return ret;
++ }
++ 
++ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
++ 					struct airoha_foe_entry *hwe,
++ 					struct net_device *netdev, int type,
++ 					struct airoha_flow_data *data,
++ 					int l4proto, u8 dsfield)
++ {
++ 	u32 qdata = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f), ports_pad, val;
++ 	int wlan_etype = -EINVAL, dsa_port = airoha_get_dsa_port(&netdev);
++ 	struct airoha_foe_mac_info_common *l2;
++ 	u8 smac_id = 0xf;
++@@ -414,24 +455,35 @@
++ 			       FIELD_PREP(AIROHA_FOE_IB2_DSCP, dsfield) |
++ 			       AIROHA_FOE_IB2_PSE_QOS;
++ 			/* For downlink traffic consume SRAM memory for hw
++ 			 * forwarding descriptors queue.
++ 			 */
++ 			if (airoha_is_lan_gdm_dev(dev))
++ 				val |= AIROHA_FOE_IB2_FAST_PATH;
++ 			if (dsa_port >= 0)
++ 				val |= FIELD_PREP(AIROHA_FOE_IB2_NBQ,
++ 						  dsa_port);
++ 
++ 			smac_id = port->id;
+++			if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
+++				int sid;
+++
+++				/* Even the base MAC uses an immutable flow slot so
+++				 * ndo_set_mac_address cannot rewrite a live flow.
+++				 */
+++				sid = airoha_ppe_get_smac_id(eth, data->eth.h_source);
+++				if (sid < 0)
+++					return sid;
+++				smac_id = sid;
+++			}
++ 		}
++ 	}
++ 
++ 	if (is_multicast_ether_addr(data->eth.h_dest))
++ 		val |= AIROHA_FOE_IB2_MULTICAST;
++ 
++ 	ports_pad = 0xa5a5a500 | (l4proto & 0xff);
++ 	if (type == PPE_PKT_TYPE_IPV4_ROUTE)
++ 		hwe->ipv4.orig_tuple.ports = ports_pad;
++ 	if (type == PPE_PKT_TYPE_IPV6_ROUTE_3T)
++ 		hwe->ipv6.ports = ports_pad;
++ 
++@@ -1595,42 +1647,63 @@
++ 	if (hash > ppe_hash_mask)
++ 		return;
++ 
++ 	now = (u16)jiffies;
++ 	diff = now - ppe->foe_check_time[hash];
++ 	if (diff < HZ / 10)
++ 		return;
++ 
++ 	ppe->foe_check_time[hash] = now;
++ 	airoha_ppe_foe_insert_entry(ppe, skb, hash, rx_wlan);
++ }
++ 
++-void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr)
++-{
++-	struct airoha_gdm_port *port = dev->port;
++-	struct airoha_eth *eth = dev->eth;
+++static int airoha_ppe_write_upd_mem(struct airoha_eth *eth, u8 slot,
+++				     const u8 *addr)
+++{
++ 	u32 val;
++-
+++	int err;
+++
+++	lockdep_assert_held(&eth->updmem_lock);
++ 	val = (addr[2] << 24) | (addr[3] << 16) | (addr[4] << 8) | addr[5];
++ 	airoha_fe_wr(eth, REG_UPDMEM_DATA(0), val);
++ 	airoha_fe_wr(eth, REG_UPDMEM_CTRL(0),
++-		     FIELD_PREP(PPE_UPDMEM_ADDR_MASK, port->id) |
+++		     FIELD_PREP(PPE_UPDMEM_ADDR_MASK, slot) |
++ 		     PPE_UPDMEM_WR_MASK | PPE_UPDMEM_REQ_MASK);
+++	err = read_poll_timeout_atomic(airoha_fe_rr, val,
+++				       val & PPE_UPDMEM_ACK_MASK,
+++				       10, 100, false, eth, REG_UPDMEM_CTRL(0));
+++	if (err)
+++		return err;
++ 
++ 	val = (addr[0] << 8) | addr[1];
++ 	airoha_fe_wr(eth, REG_UPDMEM_DATA(0), val);
++ 	airoha_fe_wr(eth, REG_UPDMEM_CTRL(0),
++-		     FIELD_PREP(PPE_UPDMEM_ADDR_MASK, port->id) |
+++		     FIELD_PREP(PPE_UPDMEM_ADDR_MASK, slot) |
++ 		     FIELD_PREP(PPE_UPDMEM_OFFSET_MASK, 1) |
++ 		     PPE_UPDMEM_WR_MASK | PPE_UPDMEM_REQ_MASK);
+++	return read_poll_timeout_atomic(airoha_fe_rr, val,
+++					val & PPE_UPDMEM_ACK_MASK,
+++					10, 100, false, eth, REG_UPDMEM_CTRL(0));
+++}
+++
+++void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr)
+++{
+++	struct airoha_eth *eth = dev->eth;
+++	int err;
+++
+++	spin_lock_bh(&eth->updmem_lock);
+++	err = airoha_ppe_write_upd_mem(eth, dev->port->id, addr);
+++	spin_unlock_bh(&eth->updmem_lock);
+++	if (err)
+++		dev_warn_ratelimited(eth->dev, "UPDMEM base MAC write timed out\n");
++ }
++ 
++ struct airoha_ppe_dev *airoha_ppe_get_dev(struct device *dev)
++ {
++ 	struct platform_device *pdev;
++ 	struct device_node *np;
++ 	struct airoha_eth *eth;
++ 
++ 	np = of_parse_phandle(dev->of_node, "airoha,eth", 0);
++ 	if (!np)
++ 		return ERR_PTR(-ENODEV);
++ 
++@@ -1719,24 +1792,29 @@
++ 	}
++ 
++ 	ppe->foe_check_time = devm_kzalloc(eth->dev,
++ 					   ppe_num_entries * sizeof(*ppe->foe_check_time),
++ 					   GFP_KERNEL);
++ 	if (!ppe->foe_check_time)
++ 		return -ENOMEM;
++ 
++ 	err = airoha_ppe_flush_sram_entries(ppe);
++ 	if (err)
++ 		return err;
++ 
+++	/* Hardware was reset and its flow SRAM was successfully flushed. */
+++	spin_lock_init(&eth->updmem_lock);
+++	eth->updmem_used = 0;
+++	eth->updmem_valid = 0;
+++
++ 	err = rhashtable_init(&eth->flow_table, &airoha_flow_table_params);
++ 	if (err)
++ 		return err;
++ 
++ 	err = rhashtable_init(&ppe->l2_flows, &airoha_l2_flow_table_params);
++ 	if (err)
++ 		goto error_flow_table_destroy;
++ 
++ 	err = airoha_ppe_debugfs_init(ppe);
++ 	if (err)
++ 		goto error_l2_flow_table_destroy;
++ 

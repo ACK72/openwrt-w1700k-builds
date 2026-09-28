@@ -1,0 +1,187 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Mon, 28 Sep 2026 18:50:30 +0900
+Subject: [PATCH] airoha: harden GRO boundaries and shared QDMA lifecycle
+
+Select the missing checks from Gilly 975/977 without importing their
+single-netdev ownership model over ACK shared-QDMA feature synchronization.
+Reject zero aggregate counts and empty TCP payloads before allocating an
+SKB. Disable the shared GRO engine only at last QDMA close. Keep peer
+feature synchronization while deferring hardware writes if all peers are
+down. Already-present GRO flags, high RX queues, aggregate upper bound
+and nonzero timestamp guard are preserved.
+
+Adapted-from: Gilly1970 <gilroyscott@hotmail.com> (975) and
+ Lorenzo Bianconi <lorenzo@kernel.org> (977)
+Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
+
+diff --git a/target/linux/airoha/patches-6.18/9999-zz-airoha-shared-qdma-gro.patch b/target/linux/airoha/patches-6.18/9999-zz-airoha-shared-qdma-gro.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/airoha/patches-6.18/9999-zz-airoha-shared-qdma-gro.patch
+@@ -0,0 +1,166 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Mon, 28 Sep 2026 18:50:30 +0900
++Subject: [PATCH] airoha: validate GRO aggregates and honor shared QDMA lifetime
++
++Select the missing checks from Gilly 975/977 without importing their
++single-netdev ownership model over ACK shared-QDMA feature synchronization.
++Reject zero aggregate counts and empty TCP payloads before allocating an
++SKB. Disable the shared GRO engine only at last QDMA close. Keep peer
++feature synchronization while deferring hardware writes if all peers are
++down. Already-present GRO flags, high RX queues, aggregate upper bound
++and nonzero timestamp guard are preserved.
++
++Adapted-from: Gilly1970 <gilroyscott@hotmail.com> (975) and
++ Lorenzo Bianconi <lorenzo@kernel.org> (977)
++Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
++
++--- a/drivers/net/ethernet/airoha/airoha_eth.c
+++++ b/drivers/net/ethernet/airoha/airoha_eth.c
++@@ -739,25 +739,25 @@
++ 	u32 desc_ctrl = le32_to_cpu(READ_ONCE(desc->ctrl));
++ 	u32 msg1 = le32_to_cpu(READ_ONCE(desc->msg1));
++ 	u32 msg2 = le32_to_cpu(READ_ONCE(desc->msg2));
++ 	u32 msg3 = le32_to_cpu(READ_ONCE(desc->msg3));
++ 	struct skb_shared_info *shinfo;
++ 	u16 tcp_win, l2_len;
++ 	struct sk_buff *skb;
++ 	struct tcphdr *th;
++ 	struct page *page;
++ 	bool ipv4, ipv6;
++ 
++ 	agg_count = FIELD_GET(QDMA_ETH_RXMSG_AGG_COUNT_MASK, msg2);
++-	if (agg_count > AIROHA_RXQ_LRO_MAX_AGG_COUNT)
+++	if (!agg_count || agg_count > AIROHA_RXQ_LRO_MAX_AGG_COUNT)
++ 		return NULL;
++ 
++ 	ipv4 = FIELD_GET(QDMA_ETH_RXMSG_IP4_MASK, msg1);
++ 	ipv6 = FIELD_GET(QDMA_ETH_RXMSG_IP6_MASK, msg1);
++ 	if (!ipv4 && !ipv6)
++ 		return NULL;
++ 
++ 	l2_len = FIELD_GET(QDMA_ETH_RXMSG_L2_LEN_MASK, msg2);
++ 	len = FIELD_GET(QDMA_DESC_LEN_MASK, desc_ctrl);
++ 
++ 	if (ipv4) {
++ 		struct iphdr *iph;
++@@ -792,25 +792,25 @@
++ 
++ 		ip6h->payload_len = cpu_to_be16(len - th_off);
++ 	}
++ 
++ 	if (len < th_off + sizeof(*th))
++ 		return NULL;
++ 
++ 	th = (struct tcphdr *)(e->buf + th_off);
++ 	if (th->doff < 5)
++ 		return NULL;
++ 
++ 	data_off = th_off + (th->doff << 2);
++-	if (len < data_off)
+++	if (len <= data_off)
++ 		return NULL;
++ 
++ 	tcp_win = FIELD_GET(QDMA_ETH_RXMSG_TCP_WIN_MASK, msg3);
++ 	tcp_ack_seq = le32_to_cpu(READ_ONCE(desc->data));
++ 	th->ack_seq = cpu_to_be32(tcp_ack_seq);
++ 	th->window = cpu_to_be16(tcp_win);
++ 
++ 	/* Check tcp timestamp option */
++ 	if (th->doff == (sizeof(*th) + TCPOLEN_TSTAMP_ALIGNED) / 4) {
++ 		u32 topt = get_unaligned_be32(th + 1);
++ 
++ 		if (topt == ((TCPOPT_NOP << 24) | (TCPOPT_NOP << 16) |
++@@ -2132,24 +2132,25 @@
++ 			GLOBAL_CFG_TX_DMA_EN_MASK |
++ 			GLOBAL_CFG_RX_DMA_EN_MASK);
++ 	qdma->users++;
++ }
++ 
++ static void airoha_qdma_stop(struct airoha_qdma *qdma)
++ {
++ 	u32 status;
++ 
++ 	if (--qdma->users)
++ 		return;
++ 
+++	airoha_fe_lro_disable(qdma->eth, qdma - &qdma->eth->qdma[0]);
++ 	airoha_qdma_clear(qdma, REG_QDMA_GLOBAL_CFG,
++ 			  GLOBAL_CFG_TX_DMA_EN_MASK |
++ 			  GLOBAL_CFG_RX_DMA_EN_MASK);
++ 
++ 	if (read_poll_timeout(airoha_qdma_rr, status,
++ 			      !(status & (GLOBAL_CFG_TX_DMA_BUSY_MASK |
++ 					  GLOBAL_CFG_RX_DMA_BUSY_MASK)),
++ 			      USEC_PER_MSEC, 50 * USEC_PER_MSEC, true,
++ 			      qdma, REG_QDMA_GLOBAL_CFG))
++ 		dev_warn(qdma->eth->dev, "QDMA DMA engine busy timeout\n");
++ 
++ 	for (int i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
++@@ -2171,27 +2172,26 @@
++ 			      FIELD_PREP(WAN_MTU0_MASK, netdev->mtu + VLAN_ETH_HLEN));
++ }
++ 
++ static int airoha_dev_open(struct net_device *netdev)
++ {
++ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++ 	struct airoha_gdm_port *port = dev->port;
++ 	struct airoha_eth *eth = dev->eth;
++ 	struct airoha_qdma *qdma;
++ 	u32 pse_port = FE_PSE_PORT_PPE1;
++ 	int err, qdma_id;
++ 
++-	/* HW LRO is configured on the QDMA and it is shared between
++-	 * all the devices using it. Refuse to open a second device on
++-	 * the same QDMA if LRO is enabled on any device sharing it.
+++	/* HW GRO is shared; feature changes are synchronized across all
+++	 * netdevs on this QDMA and the engine stops after its last user.
++ 	 */
++ 	qdma = airoha_qdma_deref(dev);
++ 	qdma_id = qdma - &eth->qdma[0];
++ 
++ 	err = phylink_of_phy_connect(dev->phylink, netdev->dev.of_node, 0);
++ 	if (err) {
++ 		netdev_err(netdev, "could not attach PHY: %d\n", err);
++ 		return err;
++ 	}
++ 
++ 	phylink_start(dev->phylink);
++ 
++@@ -2573,28 +2573,33 @@
++ 
++ static int airoha_dev_set_features(struct net_device *netdev,
++ 				   netdev_features_t features)
++ {
++ 	netdev_features_t diff = netdev->features ^ features;
++ 	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++ 	struct airoha_qdma *qdma = airoha_qdma_deref(dev);
++ 	int qdma_id = qdma - &dev->eth->qdma[0];
++ 
++ 	if (!(diff & NETIF_F_GRO_HW) || qdma->syncing_gro_features)
++ 		return 0;
++ 
++-	if (features & NETIF_F_GRO_HW)
++-		airoha_dev_lro_enable(dev);
++-	else
++-		airoha_fe_lro_disable(dev->eth, qdma_id);
+++	/* A down netdev may share QDMA with a running peer. Keep hardware
+++	 * and peer feature state coherent; defer MMIO only if all are down.
+++	 */
+++	if (qdma->users) {
+++		if (features & NETIF_F_GRO_HW)
+++			airoha_dev_lro_enable(dev);
+++		else
+++			airoha_fe_lro_disable(dev->eth, qdma_id);
+++	}
++ 
++ 	/* LRO is a QDMA-wide resource, so expose one coherent feature state
++ 	 * on every netdev using this QDMA.
++ 	 */
++ 	airoha_sync_qdma_gro_features(dev, features);
++ 
++ 	return 0;
++ }
++ 
++ static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
++ 				   struct net_device *netdev)
++ {

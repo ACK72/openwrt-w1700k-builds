@@ -1,0 +1,113 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Mon, 28 Sep 2026 18:50:30 +0900
+Subject: [PATCH] wifi: integrate NPU station counters without source switching
+
+Adapt the NPU polling/reporting ideas in Gilly 039 and 046 to the ACK
+device-wide poll introduced by 0020. Keep its deadline, error backoff,
+AIR_TIME and RSSI requests. Preserve WED reporting. Report NPU MSDUs
+without switching to software on zero; retain software bytes and MLO
+statistics until their firmware/aggregation contracts are established.
+
+Adapted-from: Gilly <gilroyscott1970@gmail.com>, patches 039 and 046
+Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
+
+diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
+--- a/package/kernel/mt76/Makefile
++++ b/package/kernel/mt76/Makefile
+@@ -1,7 +1,7 @@
+ include $(TOPDIR)/rules.mk
+ 
+ PKG_NAME:=mt76
+-PKG_RELEASE=14
++PKG_RELEASE=15
+ 
+ PKG_LICENSE:=BSD-3-Clause-Clear
+ PKG_LICENSE_FILES:=
+diff --git a/package/kernel/mt76/patches/9999-zzzzzz-mt7996-npu-stats.patch b/package/kernel/mt76/patches/9999-zzzzzz-mt7996-npu-stats.patch
+new file mode 100644
+--- /dev/null
++++ b/package/kernel/mt76/patches/9999-zzzzzz-mt7996-npu-stats.patch
+@@ -0,0 +1,83 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Mon, 28 Sep 2026 18:50:30 +0900
++Subject: [PATCH] mt7996: integrate NPU counters with device-wide polling
++
++Adapt the NPU polling/reporting ideas in Gilly 039 and 046 to the ACK
++device-wide poll introduced by 0020. Keep its deadline, error backoff,
++AIR_TIME and RSSI requests. Preserve WED reporting. Report NPU MSDUs
++without switching to software on zero; retain software bytes and MLO
++statistics until their firmware/aggregation contracts are established.
++
++Adapted-from: Gilly <gilroyscott1970@gmail.com>, patches 039 and 046
++Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
++
++--- a/mt7996/mac.c
+++++ b/mt7996/mac.c
++@@ -2952,25 +2952,26 @@
++ 		return;
++ 
++ 	start = mt76_sta_diag_clock(&dev->mt76);
++ 	ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_RATE);
++ 	if (ret)
++ 		first_error = ret;
++ 	ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_AIR_TIME);
++ 	if (ret && !first_error)
++ 		first_error = ret;
++ 	ret = mt7996_mcu_get_per_sta_info(phy, UNI_PER_STA_RSSI);
++ 	if (ret && !first_error)
++ 		first_error = ret;
++-	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
+++	if (mtk_wed_device_active(&dev->mt76.mmio.wed) ||
+++	    mt76_npu_device_active(&dev->mt76)) {
++ 		ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_ADM_STAT);
++ 		if (ret && !first_error)
++ 			first_error = ret;
++ 		ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_MSDU_COUNT);
++ 		if (ret && !first_error)
++ 			first_error = ret;
++ 	}
++ 
++ 	/*
++ 	 * Any active PHY may poll. Errors also back off to avoid retry bursts.
++ 	 * Start the interval after completion, including a slow MCU response.
++ 	 */
++--- a/mt7996/main.c
+++++ b/mt7996/main.c
++@@ -2000,24 +2000,37 @@
++ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
++ 		sinfo->tx_bytes = msta_link->wcid.stats.tx_bytes;
++ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BYTES64);
++ 
++ 		sinfo->rx_bytes = msta_link->wcid.stats.rx_bytes;
++ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BYTES64);
++ 
++ 		sinfo->tx_packets = msta_link->wcid.stats.tx_packets;
++ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_PACKETS);
++ 
++ 		sinfo->rx_packets = msta_link->wcid.stats.rx_packets;
++ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_PACKETS);
+++	} else if (mt76_npu_device_active(&dev->mt76) && !sta->mlo) {
+++		/* MSDU reports are accumulated by the existing ALL_STA handler.
+++		 * Keep one counter source even before the first report or after
+++		 * an idle/failed poll. A zero-based software fallback would make
+++		 * totals jump backwards when the first firmware report arrives.
+++		 * ADM_STAT bytes are not populated on all NPU bands; leave byte
+++		 * accounting to mac80211 for the entire association. MLO needs
+++		 * link/removed-link aggregation before using per-WCID counters.
+++		 */
+++		sinfo->tx_packets = READ_ONCE(msta_link->wcid.stats.tx_packets);
+++		sinfo->rx_packets = READ_ONCE(msta_link->wcid.stats.rx_packets);
+++		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
+++				 BIT_ULL(NL80211_STA_INFO_RX_PACKETS);
++ 	}
++ }
++ 
++ static void mt7996_link_rate_ctrl_update(void *data,
++ 					 struct mt7996_sta_link *msta_link)
++ {
++ 	struct mt7996_sta *msta = msta_link->sta;
++ 	struct mt7996_phy *phy = mt7996_vif_link_phy(&msta->vif->deflink);
++ 	struct mt7996_dev *dev;
++ 	u32 *changed = data;
++ 
++ 	if (!phy)
