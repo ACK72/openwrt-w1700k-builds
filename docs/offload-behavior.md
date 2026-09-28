@@ -48,3 +48,36 @@ TCP payloads are rejected before an aggregate SKB is allocated.
 These adaptations derive from Gilly's 039/046, 972/973 and selected 975/977
 ideas, with source links and contributor attribution in their build patches.
 See the [pinned source patch collection](https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches).
+
+## Guarded forwarding and control paths
+
+Single-descriptor NPU RX packets use a separate path with the same completion,
+buffer and length checks as fragmented packets. Multi-descriptor packets still
+wait for the whole chain before any page ownership changes. Receive delivery
+and station power-save processing retain their per-packet ordering.
+
+Ordinary queued pending TX payloads publish up to four descriptors per kick.
+Control, status-requested, port-control, offchannel and power-save/DTIM traffic
+is published immediately. Ring changes, enqueue errors, queue stops, exhausted
+budgets and function exit flush pending publication. PHY and ring admission
+budgets and WCID FIFO order are unchanged. Fewer kicks do not imply the same
+percentage improvement in throughput; device latency and RF tests are needed.
+
+Cross-ingress L2 collisions still use the existing software fallback window.
+Ingress metadata is resolved only when an L2 fallback entry is found. These
+changes do not make an ambiguous hardware flow key safe to share.
+
+WLAN SET mailbox commands omit unused reply payload copies but still check
+completion status. Sleepable initialization retries retain their 10 ms minimum
+settling interval while yielding the CPU. This reduces busy waiting, not the
+required settling time. The atomic PPE mailbox protocol is unchanged.
+
+TRTCM configuration returns success only after matching readback. Read failure
+and exhausted mismatch retries return errors; a successful checked read no
+longer performs a second DONE poll or reads an unused high word.
+
+Power-table construction reuses temporary memory after the acknowledged rate
+upload. Both table uploads, regulatory/SAR/board limits and recalculation remain
+in place. There is no firmware power-table cache or raised power limit. Failed
+recovery still blocks MMIO and traffic restart until the existing recovery
+requirements are met.

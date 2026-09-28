@@ -1,29 +1,61 @@
-From: ACK72 <ACK72@users.noreply.github.com>
-Subject: [PATCH] wifi: coalesce device-wide STA queries across PHYs
+From: ACK72 <acikom72@gmail.com>
+Date: Mon, 28 Sep 2026 22:56:33 +0900
+Subject: [PATCH] wifi: coalesce NPU station statistics and unlock RSSI waits
 
-diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
---- a/package/kernel/mt76/Makefile
-+++ b/package/kernel/mt76/Makefile
-@@ -1,7 +1,7 @@
- include $(TOPDIR)/rules.mk
- 
- PKG_NAME:=mt76
--PKG_RELEASE=11
-+PKG_RELEASE=12
- 
- PKG_LICENSE:=BSD-3-Clause-Clear
- PKG_LICENSE_FILES:=
+Poll global station statistics once per device interval while retaining
+per-PHY counters, deadlines, error backoff, WED and NPU packet reporting.
+Preserve software byte and MLO accounting. Release the device mutex during
+solicited RSSI waits and reject replies across station reuse or MCU reset.
+Dispatch ALL_STA event tags once, retaining event bounds and delta rules.
+
+Consolidates ACK72 patches 0020, 0023, 0030.
+
+Adapted-from: Gilly <gilroyscott1970@gmail.com>, patches 039 and 046
+Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
+
 diff --git a/package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch b/package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch
-@@ -0,0 +1,183 @@
-+From: ACK72 <ACK72@users.noreply.github.com>
-+Subject: [PATCH] mt7996: coalesce device-wide STA queries across PHYs
+@@ -0,0 +1,647 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Mon, 28 Sep 2026 22:56:33 +0900
++Subject: [PATCH] wifi: coalesce NPU station statistics and unlock RSSI waits
 +
++Poll global station statistics once per device interval while retaining
++per-PHY counters, deadlines, error backoff, WED and NPU packet reporting.
++Preserve software byte and MLO accounting. Release the device mutex during
++solicited RSSI waits and reject replies across station reuse or MCU reset.
++Dispatch ALL_STA event tags once, retaining event bounds and delta rules.
++
++Consolidates ACK72 patches 0020, 0023, 0030.
++
++Adapted-from: Gilly <gilroyscott1970@gmail.com>, patches 039 and 046
++Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
++
++diff --git a/mt7996/mac.c b/mt7996/mac.c
++index abc0605..a94dfaa 100644
 +--- a/mt7996/mac.c
 ++++ b/mt7996/mac.c
-+@@ -2912,104 +2912,139 @@
++@@ -2894,140 +2894,182 @@ void mt7996_mac_update_stats(struct mt7996_phy *phy)
++ 	}
++ }
++ 
++ void mt7996_mac_sta_rc_work(struct work_struct *work)
++ {
++ 	struct mt7996_dev *dev = container_of(work, struct mt7996_dev, rc_work);
++ 	struct mt7996_sta_link *msta_link;
++ 	struct ieee80211_vif *vif;
++ 	struct mt7996_vif *mvif;
++ 	LIST_HEAD(list);
++ 	u32 changed;
++ 
++ 	mutex_lock(&dev->mt76.mutex);
++ 
++ 	spin_lock_bh(&dev->mt76.sta_poll_lock);
++ 	list_splice_init(&dev->sta_rc_list, &list);
++ 
++ 	while (!list_empty(&list)) {
 + 		msta_link = list_first_entry(&list, struct mt7996_sta_link,
 + 					     rc_list);
 + 		list_del_init(&msta_link->rc_list);
@@ -63,8 +95,10 @@ new file mode 100644
 ++	int ret, first_error = 0;
 ++
 ++	lockdep_assert_held(&dev->mt76.mutex);
-++	if (dev->sta_poll_valid && time_before(jiffies, dev->sta_poll_next))
+++	if (dev->sta_poll_busy ||
+++	    (dev->sta_poll_valid && time_before(jiffies, dev->sta_poll_next)))
 ++		return;
+++	dev->sta_poll_busy = true;
 ++
 ++	start = mt76_sta_diag_clock(&dev->mt76);
 ++	ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_RATE);
@@ -76,7 +110,10 @@ new file mode 100644
 ++	ret = mt7996_mcu_get_per_sta_info(phy, UNI_PER_STA_RSSI);
 ++	if (ret && !first_error)
 ++		first_error = ret;
-++	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
+++	if (test_bit(MT76_MCU_RESET, &dev->mphy.state))
+++		goto out;
+++	if (mtk_wed_device_active(&dev->mt76.mmio.wed) ||
+++	    mt76_npu_device_active(&dev->mt76)) {
 ++		ret = mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_ADM_STAT);
 ++		if (ret && !first_error)
 ++			first_error = ret;
@@ -89,6 +126,8 @@ new file mode 100644
 ++	 * Any active PHY may poll. Errors also back off to avoid retry bursts.
 ++	 * Start the interval after completion, including a slow MCU response.
 ++	 */
+++out:
+++	dev->sta_poll_busy = false;
 ++	dev->sta_poll_next = jiffies + 5 * MT7996_WATCHDOG_TIME;
 ++	dev->sta_poll_valid = true;
 ++	if (start)
@@ -170,10 +209,432 @@ new file mode 100644
 + 	int region;
 + 
 + 	switch (dev->mt76.region) {
++ 	case NL80211_DFS_ETSI:
++ 		region = 0;
++ 		break;
++ 	case NL80211_DFS_JP:
++ 		region = 2;
++ 		break;
++ 	case NL80211_DFS_FCC:
++ 	default:
++ 		region = 1;
++ 		break;
++ 	}
++ 
++ 	return mt7996_mcu_rdd_cmd(dev, RDD_START, rdd_idx, region);
++ }
++ 
++ static int mt7996_dfs_start_radar_detector(struct mt7996_phy *phy)
++ {
++ 	struct mt7996_dev *dev = phy->dev;
++diff --git a/mt7996/main.c b/mt7996/main.c
++index 0054062..753ccf5 100644
++--- a/mt7996/main.c
+++++ b/mt7996/main.c
++@@ -1248,39 +1248,41 @@ mt7996_mac_sta_init_link(struct mt7996_dev *dev,
++ 
++ 	ewma_avg_signal_init(&msta_link->avg_ack_signal);
++ 	ewma_signal_init(&msta_link->wcid.rssi);
++ 
++ 	rcu_assign_pointer(msta->link[link_id], msta_link);
++ 
++ 	mt7996_mac_wtbl_update(dev, idx, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
++ 	mt7996_mcu_add_sta(dev, link_conf, link_sta, link, msta_link,
++ 			   CONN_STATE_DISCONNECT, true);
++ 
++ 	rcu_assign_pointer(dev->mt76.wcid[idx], &msta_link->wcid);
++ 	mt76_wcid_init(&msta_link->wcid, phy->mt76->band_idx);
+++	msta_link->sta_poll_generation = ++dev->sta_poll_generation;
++ 
++ 	return 0;
++ }
++ 
++ void mt7996_mac_sta_remove_link(struct mt7996_dev *dev,
++ 				struct ieee80211_sta *sta,
++ 				unsigned int link_id, bool flush)
++ {
++ 	struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
++ 	struct mt7996_sta_link *msta_link;
++ 
++ 	msta_link = mt76_dereference(msta->link[link_id], &dev->mt76);
++ 	if (!msta_link)
++ 		return;
++ 
+++	msta_link->sta_poll_generation = ++dev->sta_poll_generation;
++ 	spin_lock_bh(&dev->mt76.sta_poll_lock);
++ 	if (!list_empty(&msta_link->wcid.poll_list))
++ 		list_del_init(&msta_link->wcid.poll_list);
++ 	if (!list_empty(&msta_link->rc_list))
++ 		list_del_init(&msta_link->rc_list);
++ 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
++ 
++ 	mt76_wcid_cleanup(&dev->mt76, &msta_link->wcid);
++ 
++ 	if (msta_link->wcid.link_valid) {
++ 		mt7996_mac_wtbl_update(dev, msta_link->wcid.idx,
++ 				       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
++@@ -1343,24 +1345,25 @@ mt7996_mac_sta_add_links(struct mt7996_dev *dev, struct ieee80211_vif *vif,
++ 	unsigned int link_id;
++ 	int err = 0;
++ 
++ 	for_each_set_bit(link_id, &new_links, IEEE80211_MLD_MAX_NUM_LINKS) {
++ 		struct ieee80211_bss_conf *link_conf;
++ 		struct ieee80211_link_sta *link_sta;
++ 		struct mt7996_sta_link *msta_link;
++ 		struct mt7996_vif_link *link;
++ 		struct mt76_phy *mphy;
++ 
++ 		msta_link = mt76_dereference(msta->link[link_id], &dev->mt76);
++ 		if (msta_link) {
+++			msta_link->sta_poll_generation = ++dev->sta_poll_generation;
++ 			msta_link->wcid.link_valid = true;
++ 			continue;
++ 		}
++ 
++ 		link_conf = link_conf_dereference_protected(vif, link_id);
++ 		if (!link_conf) {
++ 			err = -EINVAL;
++ 			goto error_unlink;
++ 		}
++ 
++ 		link = mt7996_vif_link(dev, vif, link_id);
++ 		if (!link) {
++@@ -2000,24 +2003,37 @@ static void mt7996_sta_statistics(struct ieee80211_hw *hw,
++ 	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
++ 		sinfo->tx_bytes = msta_link->wcid.stats.tx_bytes;
++ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BYTES64);
++ 
++ 		sinfo->rx_bytes = msta_link->wcid.stats.rx_bytes;
++ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BYTES64);
++ 
++ 		sinfo->tx_packets = msta_link->wcid.stats.tx_packets;
++ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_PACKETS);
++ 
++ 		sinfo->rx_packets = msta_link->wcid.stats.rx_packets;
++ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_PACKETS);
+++	} else if (mt76_npu_device_active(&dev->mt76) && !sta->mlo) {
+++		/* MSDU reports are accumulated by the existing ALL_STA handler.
+++		 * Keep one counter source even before the first report or after
+++		 * an idle/failed poll. A zero-based software fallback would make
+++		 * totals jump backwards when the first firmware report arrives.
+++		 * ADM_STAT bytes are not populated on all NPU bands; leave byte
+++		 * accounting to mac80211 for the entire association. MLO needs
+++		 * link/removed-link aggregation before using per-WCID counters.
+++		 */
+++		sinfo->tx_packets = READ_ONCE(msta_link->wcid.stats.tx_packets);
+++		sinfo->rx_packets = READ_ONCE(msta_link->wcid.stats.rx_packets);
+++		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
+++				 BIT_ULL(NL80211_STA_INFO_RX_PACKETS);
++ 	}
++ }
++ 
++ static void mt7996_link_rate_ctrl_update(void *data,
++ 					 struct mt7996_sta_link *msta_link)
++ {
++ 	struct mt7996_sta *msta = msta_link->sta;
++ 	struct mt7996_phy *phy = mt7996_vif_link_phy(&msta->vif->deflink);
++ 	struct mt7996_dev *dev;
++ 	u32 *changed = data;
++ 
++ 	if (!phy)
++diff --git a/mt7996/mcu.c b/mt7996/mcu.c
++index a25b627..575c92a 100644
++--- a/mt7996/mcu.c
+++++ b/mt7996/mcu.c
++@@ -918,96 +918,108 @@ mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
++ 		elem_size = sizeof(res->msdu_cnt[0]);
++ 		break;
++ 	case UNI_ALL_STA_TXRX_AIR_TIME:
++ 		elem_size = sizeof(res->airtime[0]);
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 	sta_num = le16_to_cpu(res->sta_num);
++ 	if (sta_num > (skb->len - sizeof(*res)) / elem_size)
++ 		return;
++ 
++-	for (i = 0; i < sta_num; i++) {
++-		u8 ac;
++-		u16 wlan_idx;
++-		struct mt76_wcid *wcid;
+++	switch (le16_to_cpu(res->tag)) {
+++	case UNI_ALL_STA_TXRX_RATE:
+++		for (i = 0; i < sta_num; i++) {
+++			u16 wlan_idx;
+++			struct mt76_wcid *wcid;
++ 
++-		switch (le16_to_cpu(res->tag)) {
++-		case UNI_ALL_STA_TXRX_RATE:
++ 			wlan_idx = le16_to_cpu(res->rate[i].wlan_idx);
++ 			wcid = mt76_wcid_ptr(dev, wlan_idx);
++ 
++ 			if (!wcid)
++-				break;
+++				continue;
++ 
++ 			if (mt7996_mcu_update_tx_gi(&wcid->rate, &res->rate[i]))
++-				dev_err(dev->mt76.dev, "Failed to update TX GI\n");
++-			break;
++-		case UNI_ALL_STA_TXRX_ADM_STAT:
+++				dev_err_ratelimited(dev->mt76.dev, "Failed to update TX GI\n");
+++		}
+++		break;
+++	case UNI_ALL_STA_TXRX_ADM_STAT:
+++		for (i = 0; i < sta_num; i++) {
+++			u8 ac;
+++			u16 wlan_idx;
+++			struct mt76_wcid *wcid;
+++
++ 			wlan_idx = le16_to_cpu(res->adm_stat[i].wlan_idx);
++ 			wcid = mt76_wcid_ptr(dev, wlan_idx);
++ 
++ 			if (!wcid)
++-				break;
+++				continue;
++ 
++ 			for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
++ 				wcid->stats.tx_bytes +=
++ 					le32_to_cpu(res->adm_stat[i].tx_bytes[ac]);
++ 				wcid->stats.rx_bytes +=
++ 					le32_to_cpu(res->adm_stat[i].rx_bytes[ac]);
++ 			}
++-			break;
++-		case UNI_ALL_STA_TXRX_MSDU_COUNT:
+++		}
+++		break;
+++	case UNI_ALL_STA_TXRX_MSDU_COUNT:
+++		for (i = 0; i < sta_num; i++) {
+++			u16 wlan_idx;
+++			struct mt76_wcid *wcid;
+++
++ 			wlan_idx = le16_to_cpu(res->msdu_cnt[i].wlan_idx);
++ 			wcid = mt76_wcid_ptr(dev, wlan_idx);
++ 
++ 			if (!wcid)
++-				break;
+++				continue;
++ 
++ 			wcid->stats.tx_packets +=
++ 				le32_to_cpu(res->msdu_cnt[i].tx_msdu_cnt);
++ 			wcid->stats.rx_packets +=
++ 				le32_to_cpu(res->msdu_cnt[i].rx_msdu_cnt);
++-			break;
++-		case UNI_ALL_STA_TXRX_AIR_TIME: {
+++		}
+++		break;
+++	case UNI_ALL_STA_TXRX_AIR_TIME:
+++		for (i = 0; i < sta_num; i++) {
+++			u8 ac;
+++			u16 wlan_idx;
+++			struct mt76_wcid *wcid;
++ 			static const u8 ac_to_tid[] = {
++ 				[IEEE80211_AC_BE] = 0,
++ 				[IEEE80211_AC_BK] = 1,
++ 				[IEEE80211_AC_VI] = 4,
++ 				[IEEE80211_AC_VO] = 6
++ 			};
++ 			struct ieee80211_sta *sta;
++ 
++ 			wlan_idx = le16_to_cpu(res->airtime[i].wlan_idx);
++ 			wcid = mt76_wcid_ptr(dev, wlan_idx);
++ 			sta = wcid_to_sta(wcid);
++ 			if (!sta)
++-				break;
+++				continue;
++ 
++ 			for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
++ 				u8 lmac_ac = mt76_connac_lmac_mapping(ac);
++ 				u32 tx_cur = le32_to_cpu(res->airtime[i].tx[lmac_ac]);
++ 				u32 rx_cur = le32_to_cpu(res->airtime[i].rx[lmac_ac]);
++ 
++ 				if (!tx_cur && !rx_cur)
++ 					continue;
++ 
++ 				ieee80211_sta_register_airtime(sta, ac_to_tid[ac], tx_cur, rx_cur);
++ 			}
++-			break;
++-		}
++-		default:
++-			break;
++ 		}
+++		break;
++ 	}
++ }
++ 
++ static void
++ mt7996_mcu_rx_thermal_notify(struct mt7996_dev *dev, struct sk_buff *skb)
++ {
++ #define THERMAL_NOTIFY_TAG 0x4
++ #define THERMAL_NOTIFY 0x2
++ 	struct mt76_phy *mphy = &dev->mt76.phy;
++ 	struct mt7996_mcu_thermal_notify *n;
++ 	struct mt7996_phy *phy;
++ 
++@@ -5928,93 +5940,131 @@ int mt7996_mcu_get_all_sta_info(struct mt7996_phy *phy, u16 tag)
++ 	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(ALL_STA_INFO),
++ 				 &req, sizeof(req), false);
++ }
++ 
++ int mt7996_mcu_get_per_sta_info(struct mt7996_phy *phy, u16 tag)
++ {
++ 	struct mt7996_dev *dev = phy->dev;
++ 	struct mt7996_mcu_per_sta_info_event *res;
++ 	struct mt76_wcid *wcid;
++ 	struct sk_buff *skb;
++ 	int i, ret, sta_num, resp_sta_num;
++ 	int wcid_idx = 0;
+++	u64 generation[PER_STA_INFO_MAX_NUM];
++ 	struct {
++ 		u8 _rsv1;
++ 		u8 unsolicit;
++ 		u8 _rsv2[2];
++ 
++ 		__le16 tag;
++ 		__le16 len;
++ 		__le16 sta_num;
++ 		u8 _rsv3[2];
++ 		__le16 wlan_idx[PER_STA_INFO_MAX_NUM];
++ 	} __packed req = {
++ 		.tag = cpu_to_le16(tag),
++ 		.len = cpu_to_le16(sizeof(req) - 4),
++ 	};
++ 
+++	lockdep_assert_held(&dev->mt76.mutex);
+++	if (tag != UNI_PER_STA_RSSI)
+++		return -EINVAL;
++ 	while (wcid_idx < mt7996_wtbl_size(dev)) {
+++		if (test_bit(MT76_MCU_RESET, &dev->mphy.state))
+++			return -ECANCELED;
++ 		sta_num = 0;
++ 
++ 		rcu_read_lock();
++ 		for (i = wcid_idx;
++ 		     i < mt7996_wtbl_size(dev) && sta_num < PER_STA_INFO_MAX_NUM;
++ 		     i++) {
++ 			wcid = rcu_dereference(dev->mt76.wcid[i]);
++ 			if (!wcid || !wcid->sta)
++ 				continue;
+++			generation[sta_num] = container_of(wcid,
+++				struct mt7996_sta_link, wcid)->sta_poll_generation;
++ 			req.wlan_idx[sta_num++] = cpu_to_le16(i);
++ 		}
++ 		rcu_read_unlock();
++ 		wcid_idx = i;
++ 
++ 		if (!sta_num)
++ 			continue;
++ 
++ 		req.sta_num = cpu_to_le16(sta_num);
++ 
+++		/* No station/link pointer is used across this wait. The MCU layer keeps
+++		 * its own command serialization and solicited response matching.
+++		 */
+++		mutex_unlock(&dev->mt76.mutex);
++ 		ret = mt76_mcu_send_and_get_msg(&dev->mt76,
++ 						MCU_WM_UNI_CMD(PER_STA_INFO),
++ 						&req, sizeof(req), true, &skb);
+++		mutex_lock(&dev->mt76.mutex);
++ 		if (ret)
++ 			return ret;
+++		if (test_bit(MT76_MCU_RESET, &dev->mphy.state)) {
+++			dev_kfree_skb(skb);
+++			return -ECANCELED;
+++		}
+++		if (skb->len < sizeof(*res)) {
+++			dev_kfree_skb(skb);
+++			return -EINVAL;
+++		}
++ 
++ 		res = (struct mt7996_mcu_per_sta_info_event *)skb->data;
++ 
++ 		resp_sta_num = le16_to_cpu(res->sta_num);
++-		if (resp_sta_num > sta_num ||
+++		if (le16_to_cpu(res->tag) != tag || resp_sta_num > sta_num ||
++ 		    skb->len < struct_size(res, rssi, resp_sta_num)) {
++ 			dev_kfree_skb(skb);
++ 			return -EINVAL;
++ 		}
++ 
++ 		rcu_read_lock();
++ 		for (i = 0; i < resp_sta_num; i++) {
++ 			struct mt7996_sta_link *msta_link;
++ 			struct mt76_vif_data *mvif;
++ 			struct mt76_vif_link *mlink;
++ 			struct mt76_phy *mphy;
++ 			u16 wlan_idx;
+++			int lo = 0, hi = sta_num;
++ 			s8 rssi[4];
++ 
++ 			switch (tag) {
++ 			case UNI_PER_STA_RSSI:
++ 				wlan_idx = le16_to_cpu(res->rssi[i].wlan_idx);
+++				/* Request IDs are sorted; firmware replies need not be.
+++				 * Match the ID before testing its allocation generation.
+++				 */
+++				while (lo < hi) {
+++					int mid = lo + (hi - lo) / 2;
+++
+++					if (le16_to_cpu(req.wlan_idx[mid]) < wlan_idx)
+++						lo = mid + 1;
+++					else
+++						hi = mid;
+++				}
+++				if (lo == sta_num ||
+++				    le16_to_cpu(req.wlan_idx[lo]) != wlan_idx)
+++					break;
++ 				wcid = mt76_wcid_ptr(dev, wlan_idx);
++ 				if (!wcid || !wcid->sta)
++ 					break;
++ 
++ 				msta_link = container_of(wcid,
++ 							 struct mt7996_sta_link,
++ 							 wcid);
+++				if (msta_link->sta_poll_generation != generation[lo])
+++					break;
++ 
++ 				rssi[0] = (res->rssi[i].rcpi[0] - 220) / 2;
++ 				rssi[1] = (res->rssi[i].rcpi[1] - 220) / 2;
++ 				rssi[2] = (res->rssi[i].rcpi[2] - 220) / 2;
++ 				rssi[3] = (res->rssi[i].rcpi[3] - 220) / 2;
++ 
++ 				mvif = &msta_link->sta->vif->mt76;
++ 				mlink = rcu_dereference(mvif->link[wcid->link_id]);
++ 				if (mlink) {
++ 					mphy = mt76_vif_link_phy(mlink);
++ 					if (mphy)
++ 						msta_link->ack_signal =
++diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
++index 93d4e32..04287b5 100644
 +--- a/mt7996/mt7996.h
 ++++ b/mt7996/mt7996.h
-+@@ -471,24 +471,28 @@
-+ 	u64 mld_remap_idx_mask;
++@@ -280,24 +280,25 @@ enum {
++ #define VOW_SCH_TYPE				GENMASK(8, 7)
++ #define VOW_SCH_POLICY				GENMASK(10, 9)
++ 
++ enum vow_drr_ctrl_id {
++ 	VOW_DRR_CTRL_STA_ALL = 0x00,
++ 	VOW_DRR_CTRL_AIRTIME_DEFICIT_BOUND = 0x10,
++ 	VOW_DRR_CTRL_AIRTIME_QUANTUM_ALL = 0x28,
++ 	VOW_DRR_CTRL_STA_PAUSE = 0x30,
++ };
++ 
++ struct mt7996_sta_link {
++ 	struct mt76_wcid wcid; /* must be first */
+++	u64 sta_poll_generation;
++ 
++ 	struct mt7996_sta *sta;
++ 
++ 	struct list_head rc_list;
++ 
++ 	int ack_signal;
++ 	struct ewma_avg_signal avg_ack_signal;
++ 
++ 	unsigned long changed;
++ 
++ 	struct mt76_connac_sta_key_conf bip;
++ 
++@@ -472,24 +473,30 @@ struct mt7996_dev {
 + 
 + 	const struct mt76_bus_ops *bus_ops;
 + 	struct mt7996_phy phy;
@@ -185,11 +646,13 @@ new file mode 100644
 + 	u16 chainmask;
 + 	u8 chainshift[__MT_MAX_BAND];
 + 	u32 hif_idx;
-++
++ 
 ++	/* Device-wide STA queries, serialized by mt76.mutex. */
 ++	unsigned long sta_poll_next;
 ++	bool sta_poll_valid;
-+ 
+++	bool sta_poll_busy;
+++	u64 sta_poll_generation;
+++
 + 	struct work_struct init_work;
 + 	struct work_struct rc_work;
 + 	struct work_struct dump_work;
@@ -201,3 +664,4 @@ new file mode 100644
 + 		u32 wm_reset_count;
 + 		bool hw_full_reset:1;
 + 		bool hw_init_done:1;
++ 		bool restart:1;

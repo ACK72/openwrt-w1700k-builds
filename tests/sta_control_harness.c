@@ -12,6 +12,7 @@ typedef _Bool bool;
 #define __MT_RXQ_MAX 8
 #define EINVAL 22
 #define ECANCELED 125
+#define ENODEV 19
 #define NSEC_PER_USEC 1000
 #define U32_MAX 0xffffffffU
 #define READ_ONCE(x) (x)
@@ -42,7 +43,7 @@ struct mt76_dev {
 struct mt7996_dev {
 	struct mt76_dev mt76;
 	unsigned long sta_poll_next;
-	bool sta_poll_valid;
+	bool sta_poll_valid, sta_poll_busy;
 };
 struct mt7996_phy { struct mt7996_dev *dev; struct mt76_phy *mt76; };
 
@@ -70,6 +71,13 @@ static void mutex_lock(int *p) { lock(p); }
 static void mutex_unlock(int *p) { unlock(p); }
 #define lockdep_assert_held(p) do { if (*(p) != 1) errors++; } while (0)
 #define EXPORT_SYMBOL_GPL(x)
+struct static_key_false mt76_sta_diag_key;
+static int mt76_sta_diag_mutex;
+#define static_branch_unlikely(k) ((k)->count != 0)
+static void static_branch_inc(struct static_key_false *k)
+{ if (device.mt76.sta_diag.lock) errors++; k->count++; }
+static void static_branch_dec(struct static_key_false *k)
+{ if (device.mt76.sta_diag.lock || !k->count) errors++; k->count--; }
 #include "diag_functions.h"
 
 #define MT7996_WATCHDOG_TIME 10UL
@@ -80,6 +88,7 @@ static void mutex_unlock(int *p) { unlock(p); }
 enum { UNI_ALL_STA_TXRX_RATE, UNI_ALL_STA_TXRX_AIR_TIME, UNI_PER_STA_RSSI,
 	UNI_ALL_STA_TXRX_ADM_STAT, UNI_ALL_STA_TXRX_MSDU_COUNT };
 static int mtk_wed_device_active(int *wed) { return *wed; }
+static int mt76_npu_device_active(struct mt76_dev *dev) { return 0; }
 static void mt76_update_survey(struct mt76_phy *phy)
 { (void)phy; surveys++; }
 static void mt7996_mac_update_stats(struct mt7996_phy *phy)
@@ -123,6 +132,7 @@ void run_case(int mode, u32 *out)
 	u64 start, before;
 	int i;
 
+	mt76_sta_diag_key.count = mt76_sta_diag_mutex = 0;
 	memset(&device, 0, sizeof(device));
 	memset(radios, 0, sizeof(radios));
 	memset(phys, 0, sizeof(phys));
@@ -171,7 +181,7 @@ void run_case(int mode, u32 *out)
 		mt76_sta_diag_set(dev, 1);
 		mt76_sta_diag_schedule(dev, 0);
 		clock_ns += mode == 3 ? 1000000 : 100000;
-		mt76_sta_diag_schedule(dev, 0); /* preserve first enqueue timestamp */
+		/* No second admission: duplicate scheduling is tested separately. */
 		if (mode == 3) clock_ns += 2000000;
 		start = mt76_sta_diag_poll_begin(dev, 0);
 		clock_ns += mode == 3 ? 2500000 : 200000;

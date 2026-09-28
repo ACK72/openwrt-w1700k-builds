@@ -48,7 +48,7 @@ class PackageReleasePatch(unittest.TestCase):
             git('commit', '-m', 'Current upstream and vendor package recipes')
             git('am', '--3way', '--committer-date-is-author-date', str(PATCH))
             for name, content in recipes.items():
-                expected = (content.replace('PKG_RELEASE=1', 'PKG_RELEASE=2')
+                expected = (content.replace('PKG_RELEASE=1', 'PKG_RELEASE=16')
                             if 'mt76' in name else
                             content.replace('PKG_RELEASE:=3', 'PKG_RELEASE:=4'))
                 self.assertEqual((root / name).read_text(encoding='utf-8'), expected)

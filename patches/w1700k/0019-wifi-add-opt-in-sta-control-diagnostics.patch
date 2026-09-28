@@ -1,29 +1,66 @@
-From: ACK72 <ACK72@users.noreply.github.com>
-Subject: [PATCH] wifi: add opt-in bounded STA control diagnostics
+From: ACK72 <acikom72@gmail.com>
+Date: Mon, 28 Sep 2026 22:56:33 +0900
+Subject: [PATCH] wifi: add opt-in station diagnostics with accepted NAPI timing
 
-diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
---- a/package/kernel/mt76/Makefile
-+++ b/package/kernel/mt76/Makefile
-@@ -1,7 +1,7 @@
- include $(TOPDIR)/rules.mk
- 
- PKG_NAME:=mt76
--PKG_RELEASE=10
-+PKG_RELEASE=11
- 
- PKG_LICENSE:=BSD-3-Clause-Clear
- PKG_LICENSE_FILES:=
+Provide bounded, disabled-by-default MCU, beacon, work and RX latency
+diagnostics. Timestamp only accepted NAPI admission before dispatch.
+Use a reference-counted static key to bypass disabled instrumentation;
+serialize enable/disable and teardown outside the diagnostic spinlock.
+
+Consolidates ACK72 patches 0019, 0022, 0029.
+
 diff --git a/package/kernel/mt76/patches/9999-zz-sta-control-diagnostics.patch b/package/kernel/mt76/patches/9999-zz-sta-control-diagnostics.patch
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-zz-sta-control-diagnostics.patch
-@@ -0,0 +1,946 @@
-+From: ACK72 <ACK72@users.noreply.github.com>
-+Subject: [PATCH] mt76: add opt-in bounded STA control diagnostics
+@@ -0,0 +1,1096 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Mon, 28 Sep 2026 22:56:33 +0900
++Subject: [PATCH] wifi: add opt-in station diagnostics with accepted NAPI timing
 +
++Provide bounded, disabled-by-default MCU, beacon, work and RX latency
++diagnostics. Timestamp only accepted NAPI admission before dispatch.
++Use a reference-counted static key to bypass disabled instrumentation;
++serialize enable/disable and teardown outside the diagnostic spinlock.
++
++Consolidates ACK72 patches 0019, 0022, 0029.
++
++diff --git a/Makefile b/Makefile
++index 4ba96d1..dcb1ca2 100644
++--- a/Makefile
+++++ b/Makefile
++@@ -2,25 +2,25 @@
++ ccflags-y += -Werror -DCONFIG_MT76_LEDS
++ obj-m := mt76.o
++ obj-$(CONFIG_MT76_USB) += mt76-usb.o
++ obj-$(CONFIG_MT76_SDIO) += mt76-sdio.o
++ obj-$(CONFIG_MT76x02_LIB) += mt76x02-lib.o
++ obj-$(CONFIG_MT76x02_USB) += mt76x02-usb.o
++ obj-$(CONFIG_MT76_CONNAC_LIB) += mt76-connac-lib.o
++ obj-$(CONFIG_MT792x_LIB) += mt792x-lib.o
++ obj-$(CONFIG_MT792x_USB) += mt792x-usb.o
++ 
++ mt76-y := \
++ 	mmio.o util.o trace.o dma.o mac80211.o debugfs.o eeprom.o \
++-	tx.o agg-rx.o mcu.o wed.o scan.o channel.o
+++	tx.o agg-rx.o mcu.o wed.o scan.o channel.o sta_diag.o
++ 
++ mt76-$(CONFIG_MT76_NPU) += npu.o
++ mt76-$(CONFIG_PCI) += pci.o
++ mt76-$(CONFIG_NL80211_TESTMODE) += testmode.o
++ 
++ mt76-usb-y := usb.o usb_trace.o
++ mt76-sdio-y := sdio.o sdio_txrx.o
++ 
++ CFLAGS_trace.o := -I$(src)
++ CFLAGS_usb_trace.o := -I$(src)
++ CFLAGS_mt76x02_trace.o := -I$(src)
++ CFLAGS_mt792x_trace.o := -I$(src)
++diff --git a/debugfs.c b/debugfs.c
++index 41d1d48..94cc2b3 100644
 +--- a/debugfs.c
 ++++ b/debugfs.c
-+@@ -106,21 +106,22 @@
++@@ -106,21 +106,22 @@ mt76_register_debugfs_fops(struct mt76_phy *phy,
 + {
 + 	const struct file_operations *fops = ops ? ops : &fops_regval;
 + 	struct mt76_dev *dev = phy->dev;
@@ -46,9 +83,11 @@ new file mode 100644
 + 	return dir;
 + }
 + EXPORT_SYMBOL_GPL(mt76_register_debugfs_fops);
++diff --git a/dma.c b/dma.c
++index a67880a..24305de 100644
 +--- a/dma.c
 ++++ b/dma.c
-+@@ -1093,38 +1093,41 @@
++@@ -1093,38 +1093,41 @@ mt76_dma_rx_process(struct mt76_dev *dev, struct mt76_queue *q, int budget)
 + free_frag:
 + 		mt76_put_page_pool_buf(data, allow_direct);
 + 	}
@@ -90,9 +129,11 @@ new file mode 100644
 + 		       int (*poll)(struct napi_struct *napi, int budget))
 + {
 + 	netif_napi_add(dev->napi_dev, &dev->napi[qid], poll);
++diff --git a/mac80211.c b/mac80211.c
++index 0dcedab..1e2df78 100644
 +--- a/mac80211.c
 ++++ b/mac80211.c
-+@@ -683,24 +683,25 @@
++@@ -683,24 +683,25 @@ mt76_alloc_device(struct device *pdev, unsigned int size,
 + 	dev->hw = hw;
 + 	dev->dev = pdev;
 + 	dev->init_wiphy = NULL;
@@ -118,7 +159,33 @@ new file mode 100644
 + 	init_waitqueue_head(&dev->mcu.wait);
 + 	mutex_init(&dev->mcu.mutex);
 + 	dev->tx_worker.fn = mt76_tx_worker;
-+@@ -2337,24 +2338,26 @@
++@@ -813,24 +814,25 @@ void mt76_unregister_device(struct mt76_dev *dev)
++ 		return;
++ 
++ 	if (IS_ENABLED(CONFIG_MT76_LEDS))
++ 		mt76_led_cleanup(&dev->phy);
++ 	mt76_tx_status_check(dev, true);
++ 	mt76_wcid_cleanup(dev, &dev->global_wcid);
++ 	ieee80211_unregister_hw(hw);
++ }
++ EXPORT_SYMBOL_GPL(mt76_unregister_device);
++ 
++ void mt76_free_device(struct mt76_dev *dev)
++ {
+++	mt76_sta_diag_cleanup(dev);
++ 	mt76_worker_teardown(&dev->tx_worker);
++ 	if (dev->wq) {
++ 		destroy_workqueue(dev->wq);
++ 		dev->wq = NULL;
++ 	}
++ 	mt76_npu_deinit(dev);
++ 	ieee80211_free_hw(dev->hw);
++ }
++ EXPORT_SYMBOL_GPL(mt76_free_device);
++ 
++ static void mt76_reset_phy(struct mt76_phy *phy)
++ {
++@@ -2337,24 +2339,26 @@ static void mt76_rx_beacon_iter(void *_data, u8 *mac,
 + 
 + 		link_conf = rcu_dereference(vif->link_conf[link_id]);
 + 		if (!link_conf)
@@ -145,7 +212,7 @@ new file mode 100644
 + 		.bssid = hdr->addr3,
 + 	};
 + 
-+@@ -2373,56 +2376,64 @@
++@@ -2373,56 +2377,64 @@ void mt76_rx_beacon(struct mt76_phy *phy, struct sk_buff *skb)
 + EXPORT_SYMBOL_GPL(mt76_rx_beacon);
 + 
 + struct mt76_beacon_mon_data {
@@ -213,38 +280,11 @@ new file mode 100644
 + 	if (phy->offchannel || test_bit(MT76_RESET, &phy->state) ||
 + 	    test_bit(MT76_MCU_RESET, &phy->dev->phy.state))
 + 		return;
-+--- a/Makefile
-++++ b/Makefile
-+@@ -2,25 +2,25 @@
-+ ccflags-y += -Werror -DCONFIG_MT76_LEDS
-+ obj-m := mt76.o
-+ obj-$(CONFIG_MT76_USB) += mt76-usb.o
-+ obj-$(CONFIG_MT76_SDIO) += mt76-sdio.o
-+ obj-$(CONFIG_MT76x02_LIB) += mt76x02-lib.o
-+ obj-$(CONFIG_MT76x02_USB) += mt76x02-usb.o
-+ obj-$(CONFIG_MT76_CONNAC_LIB) += mt76-connac-lib.o
-+ obj-$(CONFIG_MT792x_LIB) += mt792x-lib.o
-+ obj-$(CONFIG_MT792x_USB) += mt792x-usb.o
-+ 
-+ mt76-y := \
-+ 	mmio.o util.o trace.o dma.o mac80211.o debugfs.o eeprom.o \
-+-	tx.o agg-rx.o mcu.o wed.o scan.o channel.o
-++	tx.o agg-rx.o mcu.o wed.o scan.o channel.o sta_diag.o
-+ 
-+ mt76-$(CONFIG_MT76_NPU) += npu.o
-+ mt76-$(CONFIG_PCI) += pci.o
-+ mt76-$(CONFIG_NL80211_TESTMODE) += testmode.o
-+ 
-+ mt76-usb-y := usb.o usb_trace.o
-+ mt76-sdio-y := sdio.o sdio_txrx.o
-+ 
-+ CFLAGS_trace.o := -I$(src)
-+ CFLAGS_usb_trace.o := -I$(src)
-+ CFLAGS_mt76x02_trace.o := -I$(src)
-+ CFLAGS_mt792x_trace.o := -I$(src)
++diff --git a/mcu.c b/mcu.c
++index 7149b2f..a0f5235 100644
 +--- a/mcu.c
 ++++ b/mcu.c
-+@@ -68,29 +68,31 @@
++@@ -68,29 +68,31 @@ int mt76_mcu_send_and_get_msg(struct mt76_dev *dev, int cmd, const void *data,
 + 	return mt76_mcu_skb_send_and_get_msg(dev, skb, cmd, wait_resp, ret_skb);
 + }
 + EXPORT_SYMBOL_GPL(mt76_mcu_send_and_get_msg);
@@ -276,7 +316,7 @@ new file mode 100644
 + 	if (dev->mcu_ops->mcu_skb_prepare_msg) {
 + 		orig_skb = skb;
 + 		ret = dev->mcu_ops->mcu_skb_prepare_msg(dev, skb, cmd, &seq);
-+@@ -125,24 +127,28 @@
++@@ -125,24 +127,28 @@ retry:
 + 
 + 		ret = dev->mcu_ops->mcu_parse_response(dev, cmd, skb, seq);
 + 		if (!ret && ret_skb)
@@ -305,6 +345,8 @@ new file mode 100644
 + 
 + 	while (len > 0) {
 + 		cur_len = min_t(int, max_len, len);
++diff --git a/mt76.h b/mt76.h
++index df2b8bb..d67041f 100644
 +--- a/mt76.h
 ++++ b/mt76.h
 +@@ -1,21 +1,24 @@
@@ -332,7 +374,7 @@ new file mode 100644
 + #include "airoha_offload.h"
 + #endif
 + #include <linux/soc/mediatek/mtk_wed.h>
-+@@ -923,24 +926,26 @@
++@@ -923,24 +926,26 @@ struct mt76_phy {
 + 	} rx_amsdu[__MT_RXQ_MAX];
 + 
 + 	struct mt76_freq_range_power *frp;
@@ -359,7 +401,7 @@ new file mode 100644
 + 	spinlock_t cc_lock;
 + 
 + 	u32 cur_cc_bss_rx;
-+@@ -1047,25 +1052,38 @@
++@@ -1047,26 +1052,87 @@ struct mt76_dev {
 + 		u32 offset;
 + 	} test_mtd;
 + #endif
@@ -372,13 +414,60 @@ new file mode 100644
 + 	};
 + 
 + 	atomic_t bus_hung;
-+-};
 ++	struct mt76_sta_diag sta_diag;
-++};
++ };
++ 
+++static inline bool mt76_sta_diag_enabled(struct mt76_dev *dev)
+++{
+++	return static_branch_unlikely(&mt76_sta_diag_key) &&
+++	       READ_ONCE(dev->sta_diag.enabled);
+++}
+++
+++static inline void
+++mt76_sta_diag_event(struct mt76_dev *dev, u16 event, int band,
+++		    u64 start, u32 a, u32 b, u32 c, int result)
+++{
+++	if (mt76_sta_diag_enabled(dev))
+++		__mt76_sta_diag_event(dev, event, band, start, a, b, c, result);
+++}
+++
+++static inline void mt76_sta_diag_schedule(struct mt76_dev *dev, int qid)
+++{
+++	if (mt76_sta_diag_enabled(dev))
+++		__mt76_sta_diag_schedule(dev, qid);
+++}
+++
+++static inline u64 mt76_sta_diag_poll_begin(struct mt76_dev *dev, int qid)
+++{
+++	return mt76_sta_diag_enabled(dev) ?
+++		__mt76_sta_diag_poll_begin(dev, qid) : 0;
+++}
+++
+++static inline void
+++mt76_sta_diag_poll_end(struct mt76_dev *dev, int qid, u64 start,
+++		       int done, int budget)
+++{
+++	if (start && mt76_sta_diag_enabled(dev))
+++		__mt76_sta_diag_poll_end(dev, qid, start, done, budget);
+++}
+++
+++/* Match napi_schedule(): record only after acquiring scheduling ownership.
+++ * Recording after __napi_schedule() would race a threaded poll on another CPU.
+++ */
+++static inline bool mt76_napi_schedule(struct mt76_dev *dev, int qid)
+++{
+++	struct napi_struct *napi = &dev->napi[qid];
+++
+++	if (!napi_schedule_prep(napi))
+++		return false;
+++	mt76_sta_diag_schedule(dev, qid);
+++	__napi_schedule(napi);
+++	return true;
+++}
 ++
 ++static inline u64 mt76_sta_diag_clock(struct mt76_dev *dev)
 ++{
-++	return unlikely(READ_ONCE(dev->sta_diag.enabled)) ? ktime_get_ns() : 0;
+++	return mt76_sta_diag_enabled(dev) ? ktime_get_ns() : 0;
 ++}
 ++
 ++static inline u32 mt76_sta_diag_us(u64 start, u64 end)
@@ -387,7 +476,7 @@ new file mode 100644
 ++		return 0;
 ++	return min_t(u64, div_u64(end - start, NSEC_PER_USEC), U32_MAX);
 ++}
-+ 
+++
 + /* per-phy stats.  */
 + struct mt76_mib_stats {
 + 	u32 ack_fail_cnt;
@@ -399,9 +488,12 @@ new file mode 100644
 + 	u32 tx_mu_bf_cnt;
 + 	u32 tx_mu_mpdu_cnt;
 + 	u32 tx_mu_acked_mpdu_cnt;
++ 	u32 tx_su_acked_mpdu_cnt;
++diff --git a/mt7996/mac.c b/mt7996/mac.c
++index 5470ebc..abc0605 100644
 +--- a/mt7996/mac.c
 ++++ b/mt7996/mac.c
-+@@ -549,24 +549,30 @@
++@@ -549,24 +549,30 @@ mt7996_mac_fill_rx(struct mt7996_dev *dev, enum mt76_rxq_id q,
 + 
 + 	if (!hdr_trans) {
 + 		struct ieee80211_hdr *hdr;
@@ -432,7 +524,7 @@ new file mode 100644
 + 			 * de-amsdu, so here needs to clear amsdu present bit
 + 			 * to mark it as a normal mesh frame.
 + 			 */
-+@@ -2930,52 +2936,69 @@
++@@ -2930,52 +2936,69 @@ void mt7996_mac_sta_rc_work(struct work_struct *work)
 + 		spin_lock_bh(&dev->mt76.sta_poll_lock);
 + 	}
 + 
@@ -502,9 +594,11 @@ new file mode 100644
 + 	struct mt7996_dev *dev = phy->dev;
 + 	int rdd_idx = mt7996_get_rdd_idx(phy, false);
 + 
++diff --git a/mt7996/main.c b/mt7996/main.c
++index aae1b9b..0054062 100644
 +--- a/mt7996/main.c
 ++++ b/mt7996/main.c
-+@@ -1544,24 +1544,27 @@
++@@ -1544,24 +1544,27 @@ mt7996_set_active_links(struct ieee80211_vif *vif)
 + 
 + 	ieee80211_set_active_links_async(vif, active_links);
 + }
@@ -532,7 +626,7 @@ new file mode 100644
 + 	    new_state == IEEE80211_STA_ASSOC) {
 + 		mt7996_set_active_links(vif);
 + 		ev = MT76_STA_EVENT_ASSOC;
-+@@ -1657,24 +1660,34 @@
++@@ -1657,24 +1660,34 @@ static void mt7996_tx(struct ieee80211_hw *hw,
 + 	if (!mphy) {
 + 		ieee80211_free_txskb(hw, skb);
 + 		goto unlock;
@@ -567,9 +661,11 @@ new file mode 100644
 + 	int i, ret = 0;
 + 
 + 	mutex_lock(&dev->mt76.mutex);
++diff --git a/mt7996/mmio.c b/mt7996/mmio.c
++index 3e37c54..48c2338 100644
 +--- a/mt7996/mmio.c
 ++++ b/mt7996/mmio.c
-+@@ -760,32 +760,38 @@
++@@ -760,32 +760,35 @@ static void mt7996_irq_tasklet(struct tasklet_struct *t)
 + 	struct mt7996_dev *dev = from_tasklet(dev, t, mt76.irq_tasklet);
 + 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
 + 	struct mtk_wed_device *wed_hif2 = &dev->mt76.mmio.wed_hif2;
@@ -583,23 +679,21 @@ new file mode 100644
 + 		intr1 = mtk_wed_device_irq_get(wed_hif2,
 + 					       dev->mt76.mmio.irqmask);
 +-		if (intr1 & MT_INT_RX_TXFREE_EXT)
++-			napi_schedule(&dev->mt76.napi[MT_RXQ_TXFREE_BAND2]);
 ++		if (intr1 & MT_INT_RX_TXFREE_EXT) {
-++			mt76_sta_diag_schedule(&dev->mt76, MT_RXQ_TXFREE_BAND2);
-+ 			napi_schedule(&dev->mt76.napi[MT_RXQ_TXFREE_BAND2]);
-+-
+++			mt76_napi_schedule(&dev->mt76, MT_RXQ_TXFREE_BAND2);
+++		}
++ 
 +-		if (intr1 & MT_INT_RX_DONE_BAND2_EXT)
-++		}
-++
++-			napi_schedule(&dev->mt76.napi[MT_RXQ_BAND2]);
 ++		if (intr1 & MT_INT_RX_DONE_BAND2_EXT) {
-++			mt76_sta_diag_schedule(&dev->mt76, MT_RXQ_BAND2);
-+ 			napi_schedule(&dev->mt76.napi[MT_RXQ_BAND2]);
-+-
-+-		if (intr1 & MT_INT_RX_TXFREE_BAND1_EXT)
+++			mt76_napi_schedule(&dev->mt76, MT_RXQ_BAND2);
 ++		}
-++
++ 
++-		if (intr1 & MT_INT_RX_TXFREE_BAND1_EXT)
++-			napi_schedule(&dev->mt76.napi[MT_RXQ_BAND1_WA]);
 ++		if (intr1 & MT_INT_RX_TXFREE_BAND1_EXT) {
-++			mt76_sta_diag_schedule(&dev->mt76, MT_RXQ_BAND1_WA);
-+ 			napi_schedule(&dev->mt76.napi[MT_RXQ_BAND1_WA]);
+++			mt76_napi_schedule(&dev->mt76, MT_RXQ_BAND1_WA);
 ++		}
 + 	}
 + 
@@ -613,7 +707,7 @@ new file mode 100644
 + 			mt76_wr(dev, MT_INT1_MASK_CSR, 0);
 + 
 + 		intr = mt76_rr(dev, MT_INT_SOURCE_CSR);
-+@@ -801,26 +807,28 @@
++@@ -801,26 +804,27 @@ static void mt7996_irq_tasklet(struct tasklet_struct *t)
 + 
 + 	trace_dev_irq(&dev->mt76, intr, dev->mt76.mmio.irqmask);
 + 
@@ -627,9 +721,9 @@ new file mode 100644
 + 
 + 	for (i = 0; i < __MT_RXQ_MAX; i++) {
 +-		if ((intr & MT_INT_RX(i)))
++-			napi_schedule(&dev->mt76.napi[i]);
 ++		if ((intr & MT_INT_RX(i))) {
-++			mt76_sta_diag_schedule(&dev->mt76, i);
-+ 			napi_schedule(&dev->mt76.napi[i]);
+++			mt76_napi_schedule(&dev->mt76, i);
 ++		}
 + 	}
 + 
@@ -643,9 +737,11 @@ new file mode 100644
 + 		}
 + 	}
 + }
++diff --git a/npu.c b/npu.c
++index 2e2799f..a45fedf 100644
 +--- a/npu.c
 ++++ b/npu.c
-+@@ -191,48 +191,50 @@
++@@ -235,48 +235,50 @@ void mt76_npu_check_ppe(struct mt76_dev *dev, struct sk_buff *skb,
 + 	}
 + out:
 + 	rcu_read_unlock();
@@ -696,7 +792,7 @@ new file mode 100644
 + {
 + 	struct mt76_queue *q = q_instance;
 + 	struct mt76_dev *dev = q->dev;
-+@@ -242,24 +244,25 @@
++@@ -286,25 +288,25 @@ static irqreturn_t mt76_npu_irq_handler(int irq, void *q_instance)
 + 	u32 status;
 + 
 + 	rcu_read_lock();
@@ -709,8 +805,8 @@ new file mode 100644
 + 	airoha_npu_wlan_set_irq_status(npu, status);
 + 
 + 	airoha_npu_wlan_disable_irq(npu, index);
-++	mt76_sta_diag_schedule(dev, qid);
-+ 	napi_schedule(&dev->napi[qid]);
++-	napi_schedule(&dev->napi[qid]);
+++	mt76_napi_schedule(dev, qid);
 + out:
 + 	rcu_read_unlock();
 + 
@@ -722,11 +818,19 @@ new file mode 100644
 + 			 void *txwi_ptr)
 + {
 + 	u16 txwi_len = min_t(u16, phy->dev->drv->txwi_size, NPU_TXWI_LEN);
++ 	struct airoha_npu_tx_dma_desc *desc = (void *)q->desc;
++diff --git a/sta_diag.c b/sta_diag.c
++new file mode 100644
++index 0000000..ab9640b
 +--- /dev/null
 ++++ b/sta_diag.c
-+@@ -0,0 +1,184 @@
++@@ -0,0 +1,221 @@
 ++// SPDX-License-Identifier: BSD-3-Clause-Clear
 ++#include "mt76.h"
+++
+++DEFINE_STATIC_KEY_FALSE(mt76_sta_diag_key);
+++EXPORT_SYMBOL_GPL(mt76_sta_diag_key);
+++static DEFINE_MUTEX(mt76_sta_diag_mutex);
 ++
 ++/* Call only under sta_diag.lock; no packet bytes or peer addresses are kept. */
 ++static void
@@ -742,7 +846,7 @@ new file mode 100644
 ++	};
 ++}
 ++
-++void mt76_sta_diag_event(struct mt76_dev *dev, u16 event, int band,
+++void __mt76_sta_diag_event(struct mt76_dev *dev, u16 event, int band,
 ++			u64 start, u32 a, u32 b, u32 c, int result)
 ++{
 ++	struct mt76_sta_diag *diag = &dev->sta_diag;
@@ -757,9 +861,9 @@ new file mode 100644
 ++				    a, b, c, result);
 ++	spin_unlock_irqrestore(&diag->lock, flags);
 ++}
-++EXPORT_SYMBOL_GPL(mt76_sta_diag_event);
+++EXPORT_SYMBOL_GPL(__mt76_sta_diag_event);
 ++
-++void mt76_sta_diag_schedule(struct mt76_dev *dev, int qid)
+++void __mt76_sta_diag_schedule(struct mt76_dev *dev, int qid)
 ++{
 ++	struct mt76_sta_diag *diag = &dev->sta_diag;
 ++	unsigned long flags;
@@ -767,13 +871,14 @@ new file mode 100644
 ++	if (!READ_ONCE(diag->enabled))
 ++		return;
 ++	spin_lock_irqsave(&diag->lock, flags);
-++	if (diag->enabled && !diag->data.queued_ns[qid])
+++	/* A fresh successful admission supersedes any pre-disable timestamp. */
+++	if (diag->enabled)
 ++		diag->data.queued_ns[qid] = ktime_get_ns();
 ++	spin_unlock_irqrestore(&diag->lock, flags);
 ++}
-++EXPORT_SYMBOL_GPL(mt76_sta_diag_schedule);
+++EXPORT_SYMBOL_GPL(__mt76_sta_diag_schedule);
 ++
-++u64 mt76_sta_diag_poll_begin(struct mt76_dev *dev, int qid)
+++u64 __mt76_sta_diag_poll_begin(struct mt76_dev *dev, int qid)
 ++{
 ++	struct mt76_sta_diag *diag = &dev->sta_diag;
 ++	struct mt76_sta_diag_data *data = &diag->data;
@@ -798,9 +903,9 @@ new file mode 100644
 ++	spin_unlock_irqrestore(&diag->lock, flags);
 ++	return now;
 ++}
-++EXPORT_SYMBOL_GPL(mt76_sta_diag_poll_begin);
+++EXPORT_SYMBOL_GPL(__mt76_sta_diag_poll_begin);
 ++
-++void mt76_sta_diag_poll_end(struct mt76_dev *dev, int qid, u64 start,
+++void __mt76_sta_diag_poll_end(struct mt76_dev *dev, int qid, u64 start,
 ++			    int done, int budget)
 ++{
 ++	struct mt76_sta_diag *diag = &dev->sta_diag;
@@ -829,24 +934,56 @@ new file mode 100644
 ++out:
 ++	spin_unlock_irqrestore(&diag->lock, flags);
 ++}
-++EXPORT_SYMBOL_GPL(mt76_sta_diag_poll_end);
+++EXPORT_SYMBOL_GPL(__mt76_sta_diag_poll_end);
 ++
 ++static int mt76_sta_diag_set(void *priv, u64 value)
 ++{
 ++	struct mt76_dev *dev = priv;
 ++	struct mt76_sta_diag *diag = &dev->sta_diag;
 ++	unsigned long flags;
+++	int ret = 0;
 ++
 ++	if (value > 1)
 ++		return -EINVAL;
+++	/* Jump-label updates can sleep; never perform them under diag.lock. */
+++	mutex_lock(&mt76_sta_diag_mutex);
+++	if (diag->stopped) {
+++		ret = -ENODEV;
+++		goto out;
+++	}
+++	if (!!value == diag->enabled)
+++		goto out;
+++	if (value)
+++		static_branch_inc(&mt76_sta_diag_key);
 ++	spin_lock_irqsave(&diag->lock, flags);
-++	if (value && !diag->enabled) {
+++	if (value) {
 ++		memset(&diag->data, 0, sizeof(diag->data));
 ++		diag->data.since_ns = ktime_get_ns();
 ++	}
 ++	WRITE_ONCE(diag->enabled, !!value);
 ++	spin_unlock_irqrestore(&diag->lock, flags);
-++	return 0;
+++	if (!value)
+++		static_branch_dec(&mt76_sta_diag_key);
+++out:
+++	mutex_unlock(&mt76_sta_diag_mutex);
+++	return ret;
+++}
+++
+++void mt76_sta_diag_cleanup(struct mt76_dev *dev)
+++{
+++	struct mt76_sta_diag *diag = &dev->sta_diag;
+++	unsigned long flags;
+++	bool enabled;
+++
+++	mutex_lock(&mt76_sta_diag_mutex);
+++	spin_lock_irqsave(&diag->lock, flags);
+++	diag->stopped = true;
+++	enabled = diag->enabled;
+++	WRITE_ONCE(diag->enabled, false);
+++	spin_unlock_irqrestore(&diag->lock, flags);
+++	if (enabled)
+++		static_branch_dec(&mt76_sta_diag_key);
+++	mutex_unlock(&mt76_sta_diag_mutex);
 ++}
 ++
 ++static int mt76_sta_diag_get(void *priv, u64 *value)
@@ -909,12 +1046,19 @@ new file mode 100644
 ++	debugfs_create_devm_seqfile(dev->dev, "sta_control_diag", dir,
 ++				    mt76_sta_diag_read);
 ++}
++diff --git a/sta_diag.h b/sta_diag.h
++new file mode 100644
++index 0000000..2b4bbbb
 +--- /dev/null
 ++++ b/sta_diag.h
-+@@ -0,0 +1,52 @@
++@@ -0,0 +1,58 @@
 ++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 ++#ifndef __MT76_STA_DIAG_H
 ++#define __MT76_STA_DIAG_H
+++
+++#include <linux/jump_label.h>
+++
+++extern struct static_key_false mt76_sta_diag_key;
 ++
 ++#define MT76_STA_DIAG_SIZE 256
 ++#define MT76_STA_DIAG_SLOW_US 2000
@@ -952,15 +1096,17 @@ new file mode 100644
 ++struct mt76_sta_diag {
 ++	spinlock_t lock;
 ++	bool enabled;
+++	bool stopped;
 ++	struct mt76_sta_diag_data data;
 ++};
 ++
-++void mt76_sta_diag_event(struct mt76_dev *dev, u16 event, int band,
+++void __mt76_sta_diag_event(struct mt76_dev *dev, u16 event, int band,
 ++			u64 start, u32 a, u32 b, u32 c, int result);
-++void mt76_sta_diag_schedule(struct mt76_dev *dev, int qid);
-++u64 mt76_sta_diag_poll_begin(struct mt76_dev *dev, int qid);
-++void mt76_sta_diag_poll_end(struct mt76_dev *dev, int qid, u64 start,
+++void __mt76_sta_diag_schedule(struct mt76_dev *dev, int qid);
+++u64 __mt76_sta_diag_poll_begin(struct mt76_dev *dev, int qid);
+++void __mt76_sta_diag_poll_end(struct mt76_dev *dev, int qid, u64 start,
 ++			    int done, int budget);
+++void mt76_sta_diag_cleanup(struct mt76_dev *dev);
 ++void mt76_sta_diag_debugfs(struct mt76_dev *dev, struct dentry *dir);
 ++
 ++#endif

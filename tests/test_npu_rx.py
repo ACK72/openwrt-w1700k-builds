@@ -39,7 +39,9 @@ def patched_functions():
             level += (text[end] == '{') - (text[end] == '}')
             end += 1
         return text[start:end] + '\n'
-    return extract(old), extract(new)
+    from test_recovery import function
+    helper = 'static struct sk_buff *\n' + function('\n'.join(new), 'mt76_npu_dequeue_one')
+    return extract(old), helper + extract(new)
 
 class NpuRxOwnership(unittest.TestCase):
     @classmethod

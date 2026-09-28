@@ -1,5 +1,5 @@
 const fs=require('node:fs'), vm=require('node:vm'), assert=require('node:assert/strict');
-const patch=fs.readFileSync(__dirname+'/../patches/flowsense/0003-cpu-availability.patch','utf8');
+const patch=fs.readFileSync(__dirname+'/../patches/flowsense/0001-show-mean-rtt-and-stale-samples.patch','utf8');
 const added=patch.split('\n').filter(l=>l.startsWith('+')&&!l.startsWith('+++')).map(l=>l.slice(1));
 const source=added.filter(l=>l.includes('var cpu')).join('\n');
 const check=vm.runInNewContext('(function(bypass){'+source+';return {available:cpuAvailable,pct:cpuPct};})');

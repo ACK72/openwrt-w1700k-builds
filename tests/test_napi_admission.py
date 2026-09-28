@@ -9,6 +9,7 @@ from test_recovery import ROOT, compile_harness, function, inner_patch, patch_si
 import test_sta_control as sta_control
 
 SCHEDULING_MOCK = r'''
+static inline u64 mt76_sta_diag_poll_begin(struct mt76_dev *dev, int qid);
 enum { SCHEDULED = 1, DISABLED = 2, MISSED = 4 };
 static u32 prep_calls, dispatches;
 static bool poll_on_dispatch;
@@ -33,8 +34,8 @@ static void __napi_schedule(struct napi_struct *napi)
 class NapiAdmission(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        patch = inner_patch('0022-wifi-fix-napi-admission-latency-sampling.patch',
-            'package/kernel/mt76/patches/9999-zzzzz-mt76-diag-napi-admission.patch')
+        patch = inner_patch('0019-wifi-add-opt-in-sta-control-diagnostics.patch',
+            'package/kernel/mt76/patches/9999-zz-sta-control-diagnostics.patch')
         cls.temp = tempfile.TemporaryDirectory(prefix='w1700k-napi-admission-')
         folder=Path(cls.temp.name)
         # Share the diagnostic boundary environment; extract real current functions.
@@ -42,11 +43,17 @@ class NapiAdmission(unittest.TestCase):
         try: shutil.copytree(sta_control.StaControl.temp.name, folder, dirs_exist_ok=True)
         finally: sta_control.StaControl.tearDownClass()
         p=folder/'diag_functions.h';s=p.read_text()
-        original=function(s,'mt76_sta_diag_schedule')
-        latest=function(patch_side(patch,'sta_diag.c'),'mt76_sta_diag_schedule')
-        p.write_text(s.replace(original,latest)+
-            function(patch_side(patch,'mt76.h'),'mt76_napi_schedule')+
-            original.replace('mt76_sta_diag_schedule','legacy_diag_schedule')+'''
+        p.write_text(s+function(patch_side(patch,'mt76.h'),'mt76_napi_schedule')+'''
+/* Pre-admission implementation, retained only to reproduce the regression. */
+static void legacy_diag_schedule(struct mt76_dev *dev, int qid) {
+    struct mt76_sta_diag *diag = &dev->sta_diag;
+    unsigned long flags;
+    if (!READ_ONCE(diag->enabled)) return;
+    spin_lock_irqsave(&diag->lock, flags);
+    if (diag->enabled && !diag->data.queued_ns[qid])
+        diag->data.queued_ns[qid] = ktime_get_ns();
+    spin_unlock_irqrestore(&diag->lock, flags);
+}
 static void legacy_napi_schedule(struct mt76_dev *dev, int qid) {
     legacy_diag_schedule(dev, qid);
     if (napi_schedule_prep(&dev->napi[qid])) __napi_schedule(&dev->napi[qid]);

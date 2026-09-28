@@ -1,18 +1,6 @@
 From: ACK72 <ACK72@users.noreply.github.com>
 Subject: [PATCH] airoha: select Gilly event bounds and Ethernet correctness fixes
 
-diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
---- a/package/kernel/mt76/Makefile
-+++ b/package/kernel/mt76/Makefile
-@@ -1,7 +1,7 @@
- include $(TOPDIR)/rules.mk
- 
- PKG_NAME:=mt76
--PKG_RELEASE=4
-+PKG_RELEASE=5
- 
- PKG_LICENSE:=BSD-3-Clause-Clear
- PKG_LICENSE_FILES:=
 diff --git a/package/kernel/mt76/patches/9999-x-mt7996-bound-events.patch b/package/kernel/mt76/patches/9999-x-mt7996-bound-events.patch
 new file mode 100644
 --- /dev/null

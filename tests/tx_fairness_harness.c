@@ -13,6 +13,12 @@
 #define MT_DRV_HW_MGMT_TXQ 1
 #define MT_DRV_HW_PS_BUFFERING 2
 #define IEEE80211_TX_CTL_HW_80211_ENCAP 1
+#define IEEE80211_TX_CTL_REQ_TX_STATUS 2
+#define IEEE80211_TX_CTL_NO_PS_BUFFER 4
+#define IEEE80211_TX_STATUS_EOSP 8
+#define IEEE80211_TX_CTL_SEND_AFTER_DTIM 16
+#define IEEE80211_TX_CTRL_PORT_CTRL_PROTO 1
+#define IEEE80211_TX_CTRL_PS_RESPONSE 2
 #define MT_WCID_TX_INFO_SET 1
 void *memset(void *ptr, int value, __SIZE_TYPE__ n) {
     volatile unsigned char *p = ptr;
@@ -54,7 +60,7 @@ static void local_bh_enable(void) { bh_depth--; }
 static void rcu_read_lock(void) { rcu_depth++; }
 static void rcu_read_unlock(void) { rcu_depth--; }
 struct ieee80211_hdr { int frame_control; };
-struct ieee80211_tx_info { int flags; struct { void *vif; int rates[4]; } control; };
+struct ieee80211_tx_info { int flags; struct { void *vif; int rates[4]; int flags; } control; };
 struct sk_buff {
     struct ieee80211_hdr hdr;
     struct ieee80211_tx_info info;
@@ -123,6 +129,11 @@ static struct sk_buff *mt76_txq_dequeue(struct mt76_phy *p, struct mt76_txq *t) 
 }
 static struct sk_buff *skb_peek(struct sk_buff_head *h) { return h->head; }
 static int skb_queue_empty(struct sk_buff_head *h) { return !h->head; }
+static int skb_queue_len(struct sk_buff_head *h) {
+    int count = 0;
+    for (struct sk_buff *s = h->head; s; s = s->next) count++;
+    return count;
+}
 static void __skb_unlink(struct sk_buff *s, struct sk_buff_head *h) {
     h->head = s->next; if (!h->head) h->tail = NULL;
 }

@@ -10,7 +10,8 @@ These changes were introduced in mt76 package release 12. They do not move
 authentication or reconnection into the NPU. The diagnostic patch retains beacon thresholds,
 watchdog ordering, RX budgets, DMA ownership and recovery behavior.
 
-Patch `0022` (mt76 release 14) corrects NAPI admission timing. Earlier builds
+Patch `0019` includes the NAPI admission correction originally shipped as
+`0022` in mt76 release 14. Earlier builds
 recorded scheduling attempts even when NAPI rejected them, which could leave
 a stale timestamp and overstate a later wait. Treat earlier wait maxima as
 provisional; they do not by themselves prove CPU contention or a stalled queue.
@@ -57,7 +58,7 @@ overwritten count. Each queue row contains:
 `queue polls budget_hits wait_max_us run_max_us`
 
 `budget_hits` counts polls that consumed their budget; it is not a drop counter.
-With `0022`, wait time starts after an instrumented scheduling request acquires
+With the consolidated `0019`, wait time starts after an instrumented scheduling request acquires
 NAPI ownership, before dispatch to the poller, or at the previous budget-exhausted
 poll. Rejected attempts do not start or change a timestamp. A fresh accepted
 request replaces any timestamp left by a cancelled instance. This order also
@@ -87,7 +88,7 @@ time, not a timestamp measured over the air. Event meanings are:
 | 1 | Matching associated STA beacon RX | link ID | 0 | 0 | 0 |
 | 2 | Beacon-loss decision | link ID | age ms | threshold ms | 0 |
 | 3 | MAC work entry | 0 | 0 | 0 | 0 |
-| 4 | MAC work before beacon check | device mutex wait us | locked work us | 0 | 0; `-ECANCELED` if MCU reset caused an early return |
+| 4 | MAC work before beacon check | initial device mutex wait us | work elapsed after initial lock acquisition us | 0 | 0; `-ECANCELED` if MCU reset caused an early return |
 | 5 | MCU command completion | command ID | MCU mutex wait us | preparation/send/response/retry us | command return code |
 | 6 | Slow NAPI admission | queue ID | wait us | 0 | 0 |
 | 7 | Slow NAPI poll | queue ID | run us | processed count | budget |
@@ -107,7 +108,7 @@ independent firmware-side clock or every chipset-specific transport.
 ## Device-wide polling
 
 The first PHY whose statistics cycle is due performs the global rate, airtime
-and RSSI requests. The existing WED-specific requests remain conditional on WED.
+and RSSI requests. Byte and packet requests are enabled with either WED or NPU.
 Other PHYs share a deadline at least five watchdog ticks after that sequence
 finishes. The next request may be later because it still runs on an eligible
 PHY's normal statistics cycle. No dedicated primary PHY is required.
@@ -117,6 +118,27 @@ PHY. The next eligible cycle retries. The existing MCU serialization and
 per-radio counter collection remain in place. Compared with repeated global
 queries from multiple PHYs, the global sampling frequency is lower; verify
 airtime accounting and RSSI/rate update responsiveness during device testing.
+
+Starting with mt76 package release 16, only the solicited RSSI response wait
+releases the device mutex. A device-wide in-flight flag prevents another PHY
+from starting a duplicate poll. Each requested WCID carries a host-side lifetime
+snapshot; samples crossing that station's removal/reallocation are discarded.
+Unrelated station changes do not discard valid samples. MCU reset cancels the
+reply, and no station pointer is retained for use across the wait.
+Rate, airtime and traffic-counter requests retain their asynchronous protocol
+and counter semantics. An invalidated RSSI sample is retried on the next normal
+cycle, without extending the configured polling interval.
+
+Event 4's second duration includes this unlocked RSSI wait and subsequent lock
+reacquisition. It is elapsed work time, not continuous mutex ownership. Event 11
+also measures elapsed time; completion of asynchronous ALL_STA requests does
+not establish that every firmware statistics event has already arrived.
+
+Disabled collectors are gated at their call sites by a shared static key and
+a per-device enable flag. Enabling another adapter does not enable this one's
+collector. On kernels with jump labels, the globally disabled gate avoids the
+out-of-line collector call and per-device flag load. Kernels without jump labels
+use the normal conditional fallback. Teardown drops the device's key reference.
 
 The buffer can show where host processing waited. It cannot by itself establish
 whether a missing beacon originated at the AP, over the air, in firmware, or in

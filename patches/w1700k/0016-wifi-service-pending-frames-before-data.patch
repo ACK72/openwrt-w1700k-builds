@@ -1,64 +1,93 @@
-From: ACK72 <ACK72@users.noreply.github.com>
-Subject: [PATCH] wifi: avoid starving secondary-radio control frames
+From: ACK72 <acikom72@gmail.com>
+Date: Mon, 28 Sep 2026 22:56:33 +0900
+Subject: [PATCH] wifi: fairly service pending frames and batch ordinary TX kicks
 
-diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
---- a/package/kernel/mt76/Makefile
-+++ b/package/kernel/mt76/Makefile
-@@ -1,7 +1,7 @@
- include $(TOPDIR)/rules.mk
- 
- PKG_NAME:=mt76
--PKG_RELEASE=6
-+PKG_RELEASE=7
- 
- PKG_LICENSE:=BSD-3-Clause-Clear
- PKG_LICENSE_FILES:=
+Bound and fairly schedule pending traffic across shared radios without
+stranding data capacity. Batch ordinary same-queue TX doorbells in groups
+of four; flush control, power-save, status and off-channel traffic promptly
+and flush on every exit, queue change, error or budget boundary.
+
+Consolidates ACK72 patches 0016, 0028.
+
 diff --git a/package/kernel/mt76/patches/9999-z-mt76-pending-before-data.patch b/package/kernel/mt76/patches/9999-z-mt76-pending-before-data.patch
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-z-mt76-pending-before-data.patch
-@@ -0,0 +1,645 @@
-+From: ACK72 <ACK72@users.noreply.github.com>
-+Subject: [PATCH] mt76: service pending frames before shared data queues
+@@ -0,0 +1,672 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Mon, 28 Sep 2026 22:56:33 +0900
++Subject: [PATCH] wifi: fairly service pending frames and batch ordinary TX kicks
 +
-+Limit shared-hw pending work to 32 frames per PHY and prioritize at most
-+half of each ring's available descriptors (also capped at 32 per ring).
-+Rotate PHY and WCID service; an actual-admission credit alternates pending
-+and regular traffic when only one descriptor becomes free. After normal
-+data scheduling, deferred pending traffic may use otherwise idle space.
++Bound and fairly schedule pending traffic across shared radios without
++stranding data capacity. Batch ordinary same-queue TX doorbells in groups
++of four; flush control, power-save, status and off-channel traffic promptly
++and flush on every exit, queue change, error or budget boundary.
 +
-+Pending lists can contain payload. Preserve their FIFO order and the
-+existing reset/offchannel/queue-stop checks. The data scheduler retains
-+its normal limits, and the empty-pending path avoids ring budget setup.
-+Separate-hw devices and exported pending-drain callers retain their order.
-+This does not establish the cause of missed beacons or PCIe failures.
++Consolidates ACK72 patches 0016, 0028.
 +
-+Skip adjacent aliases while initializing shared-ring budgets. Keep
-+per-frame kicks and all admission checks unchanged.
-+
++diff --git a/mt76.h b/mt76.h
++index fc030be..df2b8bb 100644
++--- a/mt76.h
+++++ b/mt76.h
++@@ -250,24 +250,27 @@ struct mt76_queue {
++ 	struct mt76_desc *desc;
++ 
++ 	u16 first;
++ 	u16 head;
++ 	u16 tail;
++ 	u8 hw_idx;
++ 	u8 ep;
++ 	int ndesc;
++ 	int queued;
++ 	int buf_size;
++ 	bool stopped;
++ 	bool blocked;
+++	/* Shared-hw worker admission state, separate from hardware credits. */
+++	bool tx_pending_last;
+++	u16 tx_pending_budget;
++ 
++ 	u8 buf_offset;
++ 	u16 flags;
++ 	u8 magic_cnt;
++ 
++ 	__le16 *emi_cpu_idx;
++ 
++ 	struct mtk_wed_device *wed;
++ 	struct mt76_dev *dev;
++ 	u32 wed_regs;
++ 
++ 	dma_addr_t desc_dma;
++@@ -966,24 +969,25 @@ struct mt76_dev {
++ 	struct sk_buff_head rx_skb[__MT_RXQ_MAX];
++ 	struct tasklet_struct irq_tasklet;
++ 
++ 	struct list_head txwi_cache;
++ 	struct list_head rxwi_cache;
++ 	struct mt76_queue *q_mcu[__MT_MCUQ_MAX];
++ 	struct mt76_queue q_rx[__MT_RXQ_MAX];
++ 	const struct mt76_queue_ops *queue_ops;
++ 	int tx_dma_idx[4];
++ 	enum mt76_hwrro_mode hwrro_mode;
++ 
++ 	struct mt76_worker tx_worker;
+++	u8 tx_pending_head;
++ 	struct napi_struct tx_napi;
++ 
++ 	spinlock_t token_lock;
++ 	struct idr token;
++ 	u16 wed_token_count;
++ 	u16 token_count;
++ 	u16 token_start;
++ 	u16 token_size;
++ 
++ 	spinlock_t rx_token_lock;
++ 	struct idr rx_token;
++ 	u16 rx_token_size;
++diff --git a/tx.c b/tx.c
++index 946e08c..8eccad3 100644
 +--- a/tx.c
 ++++ b/tx.c
-+@@ -432,458 +432,594 @@
-+ 		info->flags |= IEEE80211_TX_STATUS_EOSP |
-+ 			       IEEE80211_TX_CTL_REQ_TX_STATUS;
-+ 
-+ 		if (reason == IEEE80211_FRAME_RELEASE_UAPSD &&
-+ 		    ieee80211_is_data_qos(hdr->frame_control))
-+ 			*ieee80211_get_qos_ctl(hdr) |= IEEE80211_QOS_CTL_EOSP;
-+ 	}
-+ 
-+ 	mt76_skb_set_moredata(skb, !last);
-+ 	__mt76_tx_queue_skb(phy, MT_TXQ_PSD, skb, wcid, sta, NULL);
-+ }
-+ 
-+ void
-+ mt76_release_buffered_frames(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
-+ 			     u16 tids, int nframes,
-+ 			     enum ieee80211_frame_release_type reason,
-+ 			     bool more_data)
-+ {
-+ 	struct mt76_phy *phy = hw->priv;
-+ 	struct mt76_dev *dev = phy->dev;
++@@ -452,418 +452,588 @@ mt76_release_buffered_frames(struct ieee80211_hw *hw, struct ieee80211_sta *sta,
 + 	struct sk_buff *last_skb = NULL;
 + 	struct mt76_queue *hwq = phy->q_tx[MT_TXQ_PSD];
 + 	int i;
@@ -304,7 +333,9 @@ new file mode 100644
 + {
 + 	struct mt76_dev *dev = phy->dev;
 + 	struct ieee80211_sta *sta;
-+ 	struct mt76_queue *q;
++-	struct mt76_queue *q;
+++	struct mt76_queue *q, *kick_q = NULL;
+++	unsigned int kick_count = 0;
 + 	struct sk_buff *skb;
 + 	int ret = 0;
 + 
@@ -313,6 +344,18 @@ new file mode 100644
 + 		struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
 + 		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 + 		int qid = skb_get_queue_mapping(skb);
+++		int idx;
+++		/* Keep single/control/status/port-control/offchannel frames immediate. */
+++		bool batch = pending && head == &wcid->tx_pending &&
+++			skb_queue_len(head) > 1 &&
+++			!(info->flags & (IEEE80211_TX_CTL_REQ_TX_STATUS |
+++					 IEEE80211_TX_CTL_NO_PS_BUFFER |
+++					 IEEE80211_TX_STATUS_EOSP |
+++					 IEEE80211_TX_CTL_SEND_AFTER_DTIM)) &&
+++			!(info->control.flags & (IEEE80211_TX_CTRL_PORT_CTRL_PROTO |
+++						 IEEE80211_TX_CTRL_PS_RESPONSE)) &&
+++			((info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) ||
+++			 ieee80211_is_data_present(hdr->frame_control));
 ++
 ++		if (pending && !pending->budget)
 ++			break;
@@ -346,18 +389,40 @@ new file mode 100644
 ++				q->tx_pending_budget--;
 ++		}
 + 
+++		/* Never acquire a ring lock while holding the pending skb lock. */
+++		if (kick_q && kick_q != q) {
+++			spin_lock(&kick_q->lock);
+++			dev->queue_ops->kick(dev, kick_q);
+++			spin_unlock(&kick_q->lock);
+++			kick_q = NULL;
+++			kick_count = 0;
+++		}
 + 		sta = wcid_to_sta(wcid);
 + 		spin_lock(&q->lock);
 +-		__mt76_tx_queue_skb(phy, qid, skb, wcid, sta, NULL);
-++		if (__mt76_tx_queue_skb(phy, qid, skb, wcid, sta, NULL) >= 0 &&
-++		    pending)
++-		dev->queue_ops->kick(dev, q);
+++		idx = __mt76_tx_queue_skb(phy, qid, skb, wcid, sta, NULL);
+++		if (idx >= 0 && pending)
 ++			q->tx_pending_last = true;
-+ 		dev->queue_ops->kick(dev, q);
+++		if (!batch || idx < 0 || !pending->budget ||
+++		    (pending->reserve && !q->tx_pending_budget) ||
+++		    mt76_txq_stopped(q) || ++kick_count >= 4) {
+++			dev->queue_ops->kick(dev, q);
+++			kick_q = NULL;
+++			kick_count = 0;
+++		} else {
+++			kick_q = q;
+++		}
 + 		spin_unlock(&q->lock);
 + 
 + 		spin_lock(&head->lock);
 + 	}
 + 	spin_unlock(&head->lock);
+++	if (kick_q) {
+++		spin_lock(&kick_q->lock);
+++		dev->queue_ops->kick(dev, kick_q);
+++		spin_unlock(&kick_q->lock);
+++	}
 + 
 + 	return ret;
 + }
@@ -400,7 +465,6 @@ new file mode 100644
 + 		     !skb_queue_empty(&wcid->tx_offchannel)) &&
 + 		    list_empty(&wcid->tx_list))
 + 			list_add_tail(&wcid->tx_list, &phy->tx_list);
-+-	}
 ++
 ++		/* A blocked fallback must not undo rotation from the first pass. */
 ++		if (pending && ret < 0 && pending->budget == before &&
@@ -409,7 +473,7 @@ new file mode 100644
 ++
 ++		if (pending && (!pending->budget || ret < 0))
 ++			break;
-++	}
++ 	}
 ++	/* Unvisited WCIDs precede the just-serviced WCID on the next pass. */
 ++	list_splice(&tx_list, &phy->tx_list);
 + 	spin_unlock(&phy->tx_lock);
@@ -524,24 +588,23 @@ new file mode 100644
 ++	struct mt76_phy *shared[ARRAY_SIZE(dev->phys) + 1];
 + 	struct mt76_phy *phy;
 +-	int i;
-+-
-+-	mt76_txq_schedule_all(&dev->phy);
 ++	int i, nphy = 1;
 ++
 ++	shared[0] = &dev->phy;
-+ 	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
-+ 		phy = dev->phys[i];
-+-		if (!phy)
+++	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
+++		phy = dev->phys[i];
 ++		if (phy && phy != &dev->phy && phy->hw == dev->phy.hw)
 ++			shared[nphy++] = phy;
 ++	}
-++
++ 
++-	mt76_txq_schedule_all(&dev->phy);
 ++	if (nphy > 1)
 ++		mt76_txq_schedule_shared(dev, shared, nphy);
 ++	else
 ++		mt76_txq_schedule_all(&dev->phy);
-++	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
-++		phy = dev->phys[i];
++ 	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
++ 		phy = dev->phys[i];
++-		if (!phy)
 ++		if (!phy || (nphy > 1 && phy->hw == dev->phy.hw))
 + 			continue;
 + 
@@ -623,43 +686,3 @@ new file mode 100644
 + 	struct mt76_dev *dev = phy->dev;
 + 
 + 	mt76_worker_schedule(&dev->tx_worker);
-+ }
-+ EXPORT_SYMBOL_GPL(mt76_wake_tx_queue);
-+ 
-+ u8 mt76_ac_to_hwq(u8 ac)
-+ {
-+ 	static const u8 wmm_queue_map[] = {
-+ 		[IEEE80211_AC_BE] = 0,
-+ 		[IEEE80211_AC_BK] = 1,
-+ 		[IEEE80211_AC_VI] = 2,
-+ 		[IEEE80211_AC_VO] = 3,
-+ 	};
-+ 
-+ 	if (WARN_ON(ac >= IEEE80211_NUM_ACS))
-+ 		return 0;
-+ 
-+ 	return wmm_queue_map[ac];
-+ }
-+ EXPORT_SYMBOL_GPL(mt76_ac_to_hwq);
-+ 
-+ int mt76_skb_adjust_pad(struct sk_buff *skb, int pad)
-+--- a/mt76.h
-++++ b/mt76.h
-+@@ -259,6 +259,9 @@
-+ 	int buf_size;
-+ 	bool stopped;
-+ 	bool blocked;
-++	/* Shared-hw worker admission state, separate from hardware credits. */
-++	bool tx_pending_last;
-++	u16 tx_pending_budget;
-+ 
-+ 	u8 buf_offset;
-+ 	u16 flags;
-+@@ -975,6 +978,7 @@
-+ 	enum mt76_hwrro_mode hwrro_mode;
-+ 
-+ 	struct mt76_worker tx_worker;
-++	u8 tx_pending_head;
-+ 	struct napi_struct tx_napi;
-+ 
-+ 	spinlock_t token_lock;

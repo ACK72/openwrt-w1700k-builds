@@ -16,7 +16,13 @@
     },
     {
       "file": "0004-package-bump-mt76-and-hostapd-releases-after-backpor.patch",
-      "original": "3700cffc4fc64e6a68fa1016831f8ba7405ce103"
+      "author": "ACK72 <acikom72@gmail.com>",
+      "description": "Set final mt76/hostapd releases once for the complete patch stack.",
+      "consolidated_from": [
+        "0004-package-bump-mt76-and-hostapd-releases-after-backpor.patch",
+        "0012-package-bump-mt76-after-imported-fixes.patch",
+        "0017-wifi-bump-recovery-failure-release.patch"
+      ]
     },
     {
       "file": "0005-airoha-initialize-perstout-reset-value.patch",
@@ -72,12 +78,13 @@
       "author": "Slavin Liu <bolin.liu@seu.edu.cn>"
     },
     {
-      "file": "0012-package-bump-mt76-after-imported-fixes.patch",
-      "description": "Identify the six imported fixes without attributing their code to the packager."
-    },
-    {
       "file": "0013-wifi-fix-npu-rx-buffer-ownership.patch",
-      "description": "Preserve page ownership across incomplete NPU RX chains and order DMA metadata reads."
+      "description": "wifi: validate NPU RX ownership with a single-buffer fast path",
+      "author": "ACK72 <acikom72@gmail.com>",
+      "consolidated_from": [
+        "0013-wifi-fix-npu-rx-buffer-ownership.patch",
+        "0027-wifi-specialize-single-buffer-npu-rx.patch"
+      ]
     },
     {
       "file": "0014-airoha-select-gilly-event-and-ethernet-fixes.patch",
@@ -96,11 +103,12 @@
     },
     {
       "file": "0016-wifi-service-pending-frames-before-data.patch",
-      "description": "Bound and fairly schedule shared-radio pending traffic without stranding data capacity."
-    },
-    {
-      "file": "0017-wifi-bump-recovery-failure-release.patch",
-      "description": "Bump mt76 package release for checked DMA errors and terminal STA disconnect handling."
+      "description": "wifi: fairly service pending frames and batch ordinary TX kicks",
+      "author": "ACK72 <acikom72@gmail.com>",
+      "consolidated_from": [
+        "0016-wifi-service-pending-frames-before-data.patch",
+        "0028-wifi-batch-ordinary-pending-tx-kicks.patch"
+      ]
     },
     {
       "file": "0018-airoha-name-qdma-napi-threads.patch",
@@ -108,36 +116,45 @@
     },
     {
       "file": "0019-wifi-add-opt-in-sta-control-diagnostics.patch",
-      "description": "Add disabled-by-default bounded diagnostics for MCU, beacon, work and RX scheduling latency."
+      "description": "wifi: add opt-in station diagnostics with accepted NAPI timing",
+      "author": "ACK72 <acikom72@gmail.com>",
+      "consolidated_from": [
+        "0019-wifi-add-opt-in-sta-control-diagnostics.patch",
+        "0022-wifi-fix-napi-admission-latency-sampling.patch",
+        "0029-wifi-gate-disabled-diagnostics-with-static-key.patch"
+      ]
     },
     {
       "file": "0020-wifi-coalesce-device-wide-sta-polling.patch",
-      "description": "Keep per-PHY counters while polling global STA statistics once per device interval."
+      "description": "wifi: coalesce NPU station statistics and unlock RSSI waits",
+      "author": "ACK72 <acikom72@gmail.com>",
+      "consolidated_from": [
+        "0020-wifi-coalesce-device-wide-sta-polling.patch",
+        "0023-wifi-integrate-npu-station-counters.patch",
+        "0030-wifi-release-device-lock-during-rssi-wait.patch"
+      ],
+      "source": "Gilly1970/Gemtek-W1700K-6.18@4b8fb8c3a2619dd239fb44fd511ee2848a07e768",
+      "selected": [
+        "039 (adapted)",
+        "046 (packet reporting; adapted)"
+      ]
     },
     {
       "file": "0021-wifi-name-napi-by-rx-queue-role.patch",
       "description": "Persist actual mt76 RX queue roles in threaded NAPI names for IRQ-local placement. Requires named-NAPI kernel API from 0018."
     },
     {
-      "file": "0022-wifi-fix-napi-admission-latency-sampling.patch",
-      "description": "Timestamp accepted NAPI admission before dispatch, excluding rejected requests and stale pre-disable timestamps."
-    },
-    {
-      "file": "0023-wifi-integrate-npu-station-counters.patch",
-      "selected": [
-        "039 (adapted)",
-        "046 (packet reporting; adapted)"
-      ],
-      "source": "Gilly1970/Gemtek-W1700K-6.18@4b8fb8c3a2619dd239fb44fd511ee2848a07e768",
-      "author": "ACK72 <acikom72@gmail.com>"
-    },
-    {
       "file": "0024-airoha-isolate-ipv6-source-mac-slots.patch",
       "selected": [
-        "972/973 (immutable-slot redesign)"
+        "972/973 (reference-counted slot redesign)"
       ],
       "source": "Gilly1970/Gemtek-W1700K-6.18@4b8fb8c3a2619dd239fb44fd511ee2848a07e768",
-      "author": "ACK72 <acikom72@gmail.com>"
+      "author": "ACK72 <acikom72@gmail.com>",
+      "description": "airoha: share and recycle IPv6 source MAC slots safely",
+      "consolidated_from": [
+        "0024-airoha-isolate-ipv6-source-mac-slots.patch",
+        "0026-airoha-recycle-idle-source-mac-slots.patch"
+      ]
     },
     {
       "file": "0025-airoha-harden-shared-qdma-gro-lifecycle.patch",
@@ -148,9 +165,13 @@
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0026-airoha-recycle-idle-source-mac-slots.patch",
-      "description": "Replace the lifetime MAC limit with shared references, idle-slot reuse and checked hardware flow removal.",
-      "source": "Gilly1970/Gemtek-W1700K-6.18@4b8fb8c3a2619dd239fb44fd511ee2848a07e768",
+      "file": "0031-wifi-reduce-mmio-and-power-table-overhead.patch",
+      "description": "wifi: reduce MMIO lookup and power-table preparation overhead",
+      "author": "ACK72 <acikom72@gmail.com>"
+    },
+    {
+      "file": "0032-airoha-reduce-guarded-control-path-overhead.patch",
+      "description": "airoha: reduce guarded L2, mailbox and initialization overhead",
       "author": "ACK72 <acikom72@gmail.com>"
     }
   ]

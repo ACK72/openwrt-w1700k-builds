@@ -18,18 +18,22 @@ class StaControl(unittest.TestCase):
             'package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch')
         cls.temp = tempfile.TemporaryDirectory(prefix='w1700k-sta-control-')
         folder = Path(cls.temp.name)
-        (folder/'diag_types.h').write_text(patch_side(diag, 'sta_diag.h'), newline='\n')
+        (folder/'diag_types.h').write_text(patch_side(diag, 'sta_diag.h').replace(
+            '#include <linux/jump_label.h>', 'struct static_key_false { int count; };'), newline='\n')
         source = patch_side(diag, 'sta_diag.c')
         funcs = 'static void\n' + function(source, 'mt76_sta_diag_store')
-        for name in ('mt76_sta_diag_event', 'mt76_sta_diag_schedule',
-                     'mt76_sta_diag_poll_begin', 'mt76_sta_diag_poll_end',
-                     'mt76_sta_diag_set', 'mt76_sta_diag_get'):
+        for name in ('__mt76_sta_diag_event', '__mt76_sta_diag_schedule',
+                     '__mt76_sta_diag_poll_begin', '__mt76_sta_diag_poll_end',
+                     'mt76_sta_diag_set', 'mt76_sta_diag_cleanup', 'mt76_sta_diag_get'):
             funcs += function(source, name)
         header = patch_side(diag, 'mt76.h')
-        (folder/'diag_functions.h').write_text(
-            function(header, 'mt76_sta_diag_clock') +
-            function(header, 'mt76_sta_diag_us') + funcs, newline='\n')
-        source = patch_side(poll, 'mt7996/mac.c')
+        wrappers = ''.join(('static inline void\n' if name in (
+            'mt76_sta_diag_event', 'mt76_sta_diag_poll_end') else '') + function(header, name)
+            for name in ('mt76_sta_diag_enabled', 'mt76_sta_diag_event',
+                         'mt76_sta_diag_schedule', 'mt76_sta_diag_poll_begin',
+                         'mt76_sta_diag_poll_end', 'mt76_sta_diag_clock', 'mt76_sta_diag_us'))
+        (folder/'diag_functions.h').write_text(wrappers + funcs, newline='\n')
+        source = patch_side(poll, 'mt7996/mac.c').replace('&dev->mphy.state', '&dev->mt76.phy.state')
         (folder/'poll_functions.h').write_text(
             function(source, 'mt7996_mac_sta_poll') +
             function(source, 'mt7996_mac_work'), newline='\n')

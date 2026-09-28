@@ -1,20 +1,13 @@
-From 3700cffc4fc64e6a68fa1016831f8ba7405ce103 Mon Sep 17 00:00:00 2001
 From: ACK72 <acikom72@gmail.com>
-Date: Thu, 17 Sep 2026 01:43:52 +0900
-Subject: [PATCH 4/4] package: bump mt76 and hostapd releases after backports
+Date: Mon, 28 Sep 2026 22:56:33 +0900
+Subject: [PATCH] package: identify the complete W1700K backport stack
 
-Increase mt76 PKG_RELEASE from 1 to 2 and hostapd PKG_RELEASE from 3 to 4 to identify package builds containing the imported fixes.
-
-Refresh the hostapd hunk after upstream 18a969c475807ed384b20e02c6adf80e48fc09ca
-(hostapd: restore Link Measurement Report handling) raised its release to 3.
-Keep the upstream fix and parallel-variant changes intact.
----
- package/kernel/mt76/Makefile              | 2 +-
- package/network/services/hostapd/Makefile | 2 +-
- 2 files changed, 2 insertions(+), 2 deletions(-)
+Set mt76 release 16 and hostapd release 4 once for the complete stack.
+Consolidates ACK72 release-only patches 0004, 0012 and 0017 and the
+intermediate release hunks from subsequent ACK72 mt76 patches.
+Preserve the upstream hostapd Link Measurement Report and parallel variants.
 
 diff --git a/package/kernel/mt76/Makefile b/package/kernel/mt76/Makefile
-index 753a4b581a..2265a8fec8 100644
 --- a/package/kernel/mt76/Makefile
 +++ b/package/kernel/mt76/Makefile
 @@ -1,7 +1,7 @@
@@ -22,12 +15,11 @@ index 753a4b581a..2265a8fec8 100644
  
  PKG_NAME:=mt76
 -PKG_RELEASE=1
-+PKG_RELEASE=2
++PKG_RELEASE=16
  
  PKG_LICENSE:=BSD-3-Clause-Clear
  PKG_LICENSE_FILES:=
 diff --git a/package/network/services/hostapd/Makefile b/package/network/services/hostapd/Makefile
-index 8a87d557ff38f843a0060b087f26565719d5b138..1650089c17932a2bb50675baeaffd190a668976e 100644
 --- a/package/network/services/hostapd/Makefile
 +++ b/package/network/services/hostapd/Makefile
 @@ -5,7 +5,7 @@

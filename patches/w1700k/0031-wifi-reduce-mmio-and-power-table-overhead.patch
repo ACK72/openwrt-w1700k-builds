@@ -1,0 +1,218 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Mon, 28 Sep 2026 22:32:48 +0900
+Subject: [PATCH] wifi: reduce MMIO lookup and power-table preparation overhead
+
+Use one unsigned interval test per static MMIO mapping entry and bypass
+translation after terminal recovery failure. Keep remap IRQ serialization
+and all hardware reads. Build enabled rate/path limits in one temporary
+allocation; retain all limits, computations, command ACKs and reapplication
+after channel, regulatory, SAR, thermal or firmware changes.
+
+diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0031-wifi-reduce-mmio-and-power-table-overhead.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0031-wifi-reduce-mmio-and-power-table-overhead.patch
+new file mode 100644
+--- /dev/null
++++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0031-wifi-reduce-mmio-and-power-table-overhead.patch
+@@ -0,0 +1,203 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Mon, 28 Sep 2026 22:32:48 +0900
++Subject: [PATCH] wifi: reduce MMIO lookup and power-table preparation overhead
++
++Use one unsigned interval test per static MMIO mapping entry and bypass
++translation after terminal recovery failure. Keep remap IRQ serialization
++and all hardware reads. Build enabled rate/path limits in one temporary
++allocation; retain all limits, computations, command ACKs and reapplication
++after channel, regulatory, SAR, thermal or firmware changes.
++
++--- a/mt7996/mmio.c
+++++ b/mt7996/mmio.c
++@@ -343,22 +343,17 @@
++ static u32 __mt7996_reg_addr(struct mt7996_dev *dev, u32 addr)
++ {
++ 	int i;
++ 
++ 	if (addr < 0x100000)
++ 		return addr;
++ 
++ 	for (i = 0; i < dev->reg.map_size; i++) {
++-		u32 ofs;
++-
++-		if (addr < dev->reg.map[i].phys)
++-			continue;
++-
++-		ofs = addr - dev->reg.map[i].phys;
+++		u32 ofs = addr - dev->reg.map[i].phys;
++ 		if (ofs >= dev->reg.map[i].size)
++ 			continue;
++ 
++ 		return dev->reg.map[i].mapped + ofs;
++ 	}
++ 
++ 	return INVALID_REG_ADDR;
++ }
++@@ -385,82 +380,86 @@
++ 	}
++ 
++ 	return mt7996_reg_map_l2(dev, addr);
++ }
++ 
++ void mt7996_memcpy_fromio(struct mt7996_dev *dev, void *buf, u32 offset,
++ 			  size_t len)
++ {
++-	u32 addr = __mt7996_reg_addr(dev, offset);
+++	u32 addr;
++ 	unsigned long flags;
++ 
++ 	if (unlikely(READ_ONCE(dev->recovery.failed))) {
++ 		memset(buf, 0xff, len);
++ 		return;
++ 	}
++ 
+++	addr = __mt7996_reg_addr(dev, offset);
++ 	if (addr != INVALID_REG_ADDR) {
++ 		memcpy_fromio(buf, dev->mt76.mmio.regs + addr, len);
++ 		return;
++ 	}
++ 
++ 	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	memcpy_fromio(buf, dev->mt76.mmio.regs +
++ 			   __mt7996_reg_remap_addr(dev, offset), len);
++ 	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ }
++ 
++ static u32 mt7996_rr(struct mt76_dev *mdev, u32 offset)
++ {
++ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++-	u32 addr = __mt7996_reg_addr(dev, offset), val;
+++	u32 addr, val;
++ 	unsigned long flags;
++ 
++ 	if (unlikely(READ_ONCE(dev->recovery.failed)))
++ 		return ~0U;
++ 
+++	addr = __mt7996_reg_addr(dev, offset);
++ 	if (addr != INVALID_REG_ADDR)
++ 		return dev->bus_ops->rr(mdev, addr);
++ 
++ 	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	val = dev->bus_ops->rr(mdev, __mt7996_reg_remap_addr(dev, offset));
++ 	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ 
++ 	return val;
++ }
++ 
++ static void mt7996_wr(struct mt76_dev *mdev, u32 offset, u32 val)
++ {
++ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++-	u32 addr = __mt7996_reg_addr(dev, offset);
+++	u32 addr;
++ 	unsigned long flags;
++ 
++ 	if (unlikely(READ_ONCE(dev->recovery.failed)))
++ 		return;
++ 
+++	addr = __mt7996_reg_addr(dev, offset);
++ 	if (addr != INVALID_REG_ADDR) {
++ 		dev->bus_ops->wr(mdev, addr, val);
++ 		return;
++ 	}
++ 
++ 	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	dev->bus_ops->wr(mdev, __mt7996_reg_remap_addr(dev, offset), val);
++ 	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ }
++ 
++ static u32 mt7996_rmw(struct mt76_dev *mdev, u32 offset, u32 mask, u32 val)
++ {
++ 	struct mt7996_dev *dev = container_of(mdev, struct mt7996_dev, mt76);
++-	u32 addr = __mt7996_reg_addr(dev, offset);
+++	u32 addr;
++ 	unsigned long flags;
++ 
++ 	if (unlikely(READ_ONCE(dev->recovery.failed)))
++ 		return ~0U;
++ 
+++	addr = __mt7996_reg_addr(dev, offset);
++ 	if (addr != INVALID_REG_ADDR)
++ 		return dev->bus_ops->rmw(mdev, addr, mask, val);
++ 
++ 	spin_lock_irqsave(&dev->reg_lock, flags);
++ 	val = dev->bus_ops->rmw(mdev, __mt7996_reg_remap_addr(dev, offset), mask, val);
++ 	spin_unlock_irqrestore(&dev->reg_lock, flags);
++ 
++ 	return val;
++--- a/mt7996/mcu.c
+++++ b/mt7996/mcu.c
++@@ -6185,17 +6185,17 @@
++ 	struct mt7996_power_path_limits *path;
++ 	struct mt76_power_limits *la;
++ 	struct sk_buff *skb;
++ 	int i, ret, target_power, tx_power;
++ 
++ 	target_power = mt76_get_power_bound(mphy, phy->txpower);
++ 	tx_power = target_power;
++ 	if (phy->sku_limit_en) {
++-		la = kzalloc(sizeof(*la), GFP_KERNEL);
+++		la = kzalloc(max_t(size_t, sizeof(*la), sizeof(*path)), GFP_KERNEL);
++ 		if (!la)
++ 			return -ENOMEM;
++ 
++ 		tx_power = mt76_get_rate_power_limits(mphy, mphy->chandef.chan,
++ 						      la, tx_power);
++ 		mphy->txpower_cur = tx_power;
++ 	} else {
++ 		mphy->txpower_cur = tx_power;
++@@ -6232,27 +6232,28 @@
++ 	ret = mt76_mcu_skb_send_msg(&dev->mt76, skb,
++ 				    MCU_WM_UNI_CMD(TXPOWER), true);
++ 	if (ret)
++ 		goto out;
++ 
++ 	if (!phy->sku_path_en)
++ 		goto out;
++ 
++-	path = kzalloc(sizeof(*path), GFP_KERNEL);
++-	if (!path)
++-		goto err_nomem;
+++	/* The rate table has been copied into the acknowledged MCU skb.
+++	 * The path builder initializes every byte before using the scratch.
+++	 */
+++	path = (void *)la;
++ 
++ 	mt7996_get_power_path_limits(mphy, mphy->chandef.chan, path,
++ 				     target_power);
++ 
++ 	skb = mt76_mcu_msg_alloc(&dev->mt76, NULL,
++ 				 sizeof(req) + MT7996_SKU_PATH_NUM);
++ 	if (!skb)
++-		goto err_nomem_path;
+++		goto err_nomem;
++ 
++ 	req.power_limit_type = TX_POWER_LIMIT_TABLE_PATH;
++ 
++ 	skb_put_data(skb, &req, sizeof(req));
++ 	skb_put_data(skb, &path->cck, MT7996_SKU_PATH_CCK_LEN);
++ 	skb_put_data(skb, &path->ofdm, MT7996_SKU_PATH_OFDM_LEN);
++ 	skb_put_data(skb, &path->ofdm_bf, MT7996_SKU_PATH_OFDM_BF_LEN);
++ 
++@@ -6261,21 +6262,18 @@
++ 		u8 idx = i / 2;
++ 		s8 *buf = bf ? path->ru_bf[idx] : path->ru[idx];
++ 
++ 		skb_put_data(skb, buf, MT7996_SKU_PATH_RU_LEN);
++ 	}
++ 
++ 	ret = mt76_mcu_skb_send_msg(&dev->mt76, skb,
++ 				    MCU_WM_UNI_CMD(TXPOWER), true);
++-	kfree(path);
++ 	goto out;
++ 
++-err_nomem_path:
++-	kfree(path);
++ err_nomem:
++ 	ret = -ENOMEM;
++ out:
++ 	kfree(la);
++ 	return ret;
++ }
++ 
++ int mt7996_mcu_cp_support(struct mt7996_dev *dev, u8 mode)

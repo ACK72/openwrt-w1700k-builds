@@ -6,6 +6,7 @@ void run_case(int mode, u32 *out)
 	struct napi_struct *napi = &dev->napi[0];
 	u64 start;
 
+	mt76_sta_diag_key.count = mt76_sta_diag_mutex = 0;
 	memset(&device, 0, sizeof(device));
 	clock_ns = 1000000;
 	clock_reads = errors = prep_calls = dispatches = 0;
