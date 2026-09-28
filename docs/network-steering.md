@@ -32,7 +32,7 @@ The kernel patch names Ethernet threads `napi/qdma0-r0` through
 identification only; ring routing and packet scheduling are unchanged.
 Names are assigned when each thread is created and retained for recreation,
 so the identity read through `/proc` matches the hardware group.
-Patch `0021` uses the same registration API for Wi-Fi, giving each RX NAPI a
+Patch `0019` uses the same registration API for Wi-Fi, giving each RX NAPI a
 name such as `napi/phy0-wm` or `napi/phy0-npu1`. The suffix is selected from
 `enum mt76_rxq_id` at registration, not from PID, NAPI ID or creation order.
 Names are copied by the kernel and survive NAPI thread recreation. The shared

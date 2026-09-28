@@ -9,10 +9,10 @@ and retry limit. Avoid redundant TRTCM DONE polling and unused high-word
 reads after checked readback; propagate read errors and exhausted mismatch
 retries. Atomic PPE mailbox locking and timeout behavior are unchanged.
 
-diff --git a/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0032-airoha-reduce-guarded-control-path-overhead.patch b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0032-airoha-reduce-guarded-control-path-overhead.patch
+diff --git a/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0023-airoha-reduce-guarded-control-path-overhead.patch b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0023-airoha-reduce-guarded-control-path-overhead.patch
 new file mode 100644
 --- /dev/null
-+++ b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0032-airoha-reduce-guarded-control-path-overhead.patch
++++ b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0023-airoha-reduce-guarded-control-path-overhead.patch
 @@ -0,0 +1,146 @@
 +From: ACK72 <acikom72@gmail.com>
 +Date: Mon, 28 Sep 2026 22:32:48 +0900

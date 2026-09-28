@@ -1,7 +1,7 @@
 From: ACK72 <ACK72@users.noreply.github.com>
 Subject: [PATCH] wifi: identify threaded NAPI by actual RX queue role
 
-Reuse the Airoha named-NAPI registration API added by patch 0018.
+Reuse the Airoha named-NAPI registration API added by patch 0016.
 Copy the role name at registration so /proc and recreated threads retain
 it. Preserve callbacks, weights, threaded mode and DMA ownership.
 

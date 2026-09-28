@@ -3,7 +3,7 @@ Date: Mon, 28 Sep 2026 22:56:33 +0900
 Subject: [PATCH] package: identify the complete W1700K backport stack
 
 Set mt76 release 16 and hostapd release 4 once for the complete stack.
-Consolidates ACK72 release-only patches 0004, 0012 and 0017 and the
+Consolidates former ACK72 release-only patches 0004, 0012 and 0017 and the
 intermediate release hunks from subsequent ACK72 mt76 patches.
 Preserve the upstream hostapd Link Measurement Report and parallel variants.
 

@@ -6,7 +6,7 @@ Validate DONE, DMA ordering and complete descriptor chains before taking
 page ownership. Specialize the validated single-buffer path while keeping
 the same bounds, recycle rules and allocation failure handling.
 
-Consolidates ACK72 patches 0013, 0027.
+Consolidates former ACK72 patches 0013, 0027.
 
 diff --git a/package/kernel/mt76/patches/9999-wifi-mt76-fix-npu-rx-buffer-ownership.patch b/package/kernel/mt76/patches/9999-wifi-mt76-fix-npu-rx-buffer-ownership.patch
 new file mode 100644
@@ -21,7 +21,7 @@ new file mode 100644
 +page ownership. Specialize the validated single-buffer path while keeping
 +the same bounds, recycle rules and allocation failure handling.
 +
-+Consolidates ACK72 patches 0013, 0027.
++Consolidates former ACK72 patches 0013, 0027.
 +
 +diff --git a/npu.c b/npu.c
 +index dd954df..2e2799f 100644

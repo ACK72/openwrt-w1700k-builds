@@ -8,7 +8,7 @@ Preserve software byte and MLO accounting. Release the device mutex during
 solicited RSSI waits and reject replies across station reuse or MCU reset.
 Dispatch ALL_STA event tags once, retaining event bounds and delta rules.
 
-Consolidates ACK72 patches 0020, 0023, 0030.
+Consolidates former ACK72 patches 0020, 0023, 0030.
 
 Adapted-from: Gilly <gilroyscott1970@gmail.com>, patches 039 and 046
 Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
@@ -28,7 +28,7 @@ new file mode 100644
 +solicited RSSI waits and reject replies across station reuse or MCU reset.
 +Dispatch ALL_STA event tags once, retaining event bounds and delta rules.
 +
-+Consolidates ACK72 patches 0020, 0023, 0030.
++Consolidates former ACK72 patches 0020, 0023, 0030.
 +
 +Adapted-from: Gilly <gilroyscott1970@gmail.com>, patches 039 and 046
 +Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches

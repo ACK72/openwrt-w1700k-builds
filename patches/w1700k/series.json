@@ -78,7 +78,7 @@
       "author": "Slavin Liu <bolin.liu@seu.edu.cn>"
     },
     {
-      "file": "0013-wifi-fix-npu-rx-buffer-ownership.patch",
+      "file": "0012-wifi-fix-npu-rx-buffer-ownership.patch",
       "description": "wifi: validate NPU RX ownership with a single-buffer fast path",
       "author": "ACK72 <acikom72@gmail.com>",
       "consolidated_from": [
@@ -87,7 +87,7 @@
       ]
     },
     {
-      "file": "0014-airoha-select-gilly-event-and-ethernet-fixes.patch",
+      "file": "0013-airoha-select-gilly-event-and-ethernet-fixes.patch",
       "selected": [
         "026 (adapted)",
         "044 (adapted)",
@@ -98,11 +98,11 @@
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed"
     },
     {
-      "file": "0015-wifi-fix-channel-and-npu-recovery-lifecycle.patch",
+      "file": "0014-wifi-fix-channel-and-npu-recovery-lifecycle.patch",
       "description": "Complete scan/ROC, propagate channel failures and check NPU stop/restart before resuming recovery. Includes adapted Gilly 047."
     },
     {
-      "file": "0016-wifi-service-pending-frames-before-data.patch",
+      "file": "0015-wifi-service-pending-frames-before-data.patch",
       "description": "wifi: fairly service pending frames and batch ordinary TX kicks",
       "author": "ACK72 <acikom72@gmail.com>",
       "consolidated_from": [
@@ -111,11 +111,11 @@
       ]
     },
     {
-      "file": "0018-airoha-name-qdma-napi-threads.patch",
+      "file": "0016-airoha-name-qdma-napi-threads.patch",
       "description": "Expose real QDMA/ring names for IRQ/NAPI group locality; no RSS or PID-order inference."
     },
     {
-      "file": "0019-wifi-add-opt-in-sta-control-diagnostics.patch",
+      "file": "0017-wifi-add-opt-in-sta-control-diagnostics.patch",
       "description": "wifi: add opt-in station diagnostics with accepted NAPI timing",
       "author": "ACK72 <acikom72@gmail.com>",
       "consolidated_from": [
@@ -125,7 +125,7 @@
       ]
     },
     {
-      "file": "0020-wifi-coalesce-device-wide-sta-polling.patch",
+      "file": "0018-wifi-coalesce-device-wide-sta-polling.patch",
       "description": "wifi: coalesce NPU station statistics and unlock RSSI waits",
       "author": "ACK72 <acikom72@gmail.com>",
       "consolidated_from": [
@@ -140,11 +140,11 @@
       ]
     },
     {
-      "file": "0021-wifi-name-napi-by-rx-queue-role.patch",
-      "description": "Persist actual mt76 RX queue roles in threaded NAPI names for IRQ-local placement. Requires named-NAPI kernel API from 0018."
+      "file": "0019-wifi-name-napi-by-rx-queue-role.patch",
+      "description": "Persist actual mt76 RX queue roles in threaded NAPI names for IRQ-local placement. Requires named-NAPI kernel API from 0016."
     },
     {
-      "file": "0024-airoha-isolate-ipv6-source-mac-slots.patch",
+      "file": "0020-airoha-isolate-ipv6-source-mac-slots.patch",
       "selected": [
         "972/973 (reference-counted slot redesign)"
       ],
@@ -157,7 +157,7 @@
       ]
     },
     {
-      "file": "0025-airoha-harden-shared-qdma-gro-lifecycle.patch",
+      "file": "0021-airoha-harden-shared-qdma-gro-lifecycle.patch",
       "selected": [
         "975/977 (shared-QDMA adaptation)"
       ],
@@ -165,12 +165,12 @@
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0031-wifi-reduce-mmio-and-power-table-overhead.patch",
+      "file": "0022-wifi-reduce-mmio-and-power-table-overhead.patch",
       "description": "wifi: reduce MMIO lookup and power-table preparation overhead",
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0032-airoha-reduce-guarded-control-path-overhead.patch",
+      "file": "0023-airoha-reduce-guarded-control-path-overhead.patch",
       "description": "airoha: reduce guarded L2, mailbox and initialization overhead",
       "author": "ACK72 <acikom72@gmail.com>"
     }

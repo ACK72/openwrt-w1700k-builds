@@ -7,7 +7,7 @@ diagnostics. Timestamp only accepted NAPI admission before dispatch.
 Use a reference-counted static key to bypass disabled instrumentation;
 serialize enable/disable and teardown outside the diagnostic spinlock.
 
-Consolidates ACK72 patches 0019, 0022, 0029.
+Consolidates former ACK72 patches 0019, 0022, 0029.
 
 diff --git a/package/kernel/mt76/patches/9999-zz-sta-control-diagnostics.patch b/package/kernel/mt76/patches/9999-zz-sta-control-diagnostics.patch
 new file mode 100644
@@ -23,7 +23,7 @@ new file mode 100644
 +Use a reference-counted static key to bypass disabled instrumentation;
 +serialize enable/disable and teardown outside the diagnostic spinlock.
 +
-+Consolidates ACK72 patches 0019, 0022, 0029.
++Consolidates former ACK72 patches 0019, 0022, 0029.
 +
 +diff --git a/Makefile b/Makefile
 +index 4ba96d1..dcb1ca2 100644

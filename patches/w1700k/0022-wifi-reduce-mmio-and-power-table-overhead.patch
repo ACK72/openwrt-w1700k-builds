@@ -8,10 +8,10 @@ and all hardware reads. Build enabled rate/path limits in one temporary
 allocation; retain all limits, computations, command ACKs and reapplication
 after channel, regulatory, SAR, thermal or firmware changes.
 
-diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0031-wifi-reduce-mmio-and-power-table-overhead.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0031-wifi-reduce-mmio-and-power-table-overhead.patch
+diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-reduce-mmio-and-power-table-overhead.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-reduce-mmio-and-power-table-overhead.patch
 new file mode 100644
 --- /dev/null
-+++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0031-wifi-reduce-mmio-and-power-table-overhead.patch
++++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-reduce-mmio-and-power-table-overhead.patch
 @@ -0,0 +1,203 @@
 +From: ACK72 <acikom72@gmail.com>
 +Date: Mon, 28 Sep 2026 22:32:48 +0900

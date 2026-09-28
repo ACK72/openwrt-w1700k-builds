@@ -2,16 +2,16 @@
 
 The firmware includes two separate mt76 changes:
 
-- `0019`: optional host-side timing diagnostics. Recording is **off by default**.
-- `0020`: device-wide STA statistics polling shared by the active PHYs. Per-radio
+- `0017`: optional host-side timing diagnostics. Recording is **off by default**.
+- `0018`: device-wide STA statistics polling shared by the active PHYs. Per-radio
   survey and MAC counters retain their existing work cycle.
 
 These changes were introduced in mt76 package release 12. They do not move
 authentication or reconnection into the NPU. The diagnostic patch retains beacon thresholds,
 watchdog ordering, RX budgets, DMA ownership and recovery behavior.
 
-Patch `0019` includes the NAPI admission correction originally shipped as
-`0022` in mt76 release 14. Earlier builds
+Patch `0017` includes the NAPI admission correction introduced in mt76 release 14.
+Earlier builds
 recorded scheduling attempts even when NAPI rejected them, which could leave
 a stale timestamp and overstate a later wait. Treat earlier wait maxima as
 provisional; they do not by themselves prove CPU contention or a stalled queue.
@@ -58,7 +58,7 @@ overwritten count. Each queue row contains:
 `queue polls budget_hits wait_max_us run_max_us`
 
 `budget_hits` counts polls that consumed their budget; it is not a drop counter.
-With the consolidated `0019`, wait time starts after an instrumented scheduling request acquires
+With patch `0017`, wait time starts after an instrumented scheduling request acquires
 NAPI ownership, before dispatch to the poller, or at the previous budget-exhausted
 poll. Rejected attempts do not start or change a timestamp. A fresh accepted
 request replaces any timestamp left by a cancelled instance. This order also

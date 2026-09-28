@@ -7,7 +7,7 @@ stranding data capacity. Batch ordinary same-queue TX doorbells in groups
 of four; flush control, power-save, status and off-channel traffic promptly
 and flush on every exit, queue change, error or budget boundary.
 
-Consolidates ACK72 patches 0016, 0028.
+Consolidates former ACK72 patches 0016, 0028.
 
 diff --git a/package/kernel/mt76/patches/9999-z-mt76-pending-before-data.patch b/package/kernel/mt76/patches/9999-z-mt76-pending-before-data.patch
 new file mode 100644
@@ -23,7 +23,7 @@ new file mode 100644
 +of four; flush control, power-save, status and off-channel traffic promptly
 +and flush on every exit, queue change, error or budget boundary.
 +
-+Consolidates ACK72 patches 0016, 0028.
++Consolidates former ACK72 patches 0016, 0028.
 +
 +diff --git a/mt76.h b/mt76.h
 +index fc030be..df2b8bb 100644

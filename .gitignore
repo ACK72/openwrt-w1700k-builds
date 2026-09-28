@@ -4,3 +4,9 @@ artifacts/
 logs/
 __pycache__/
 *.pyc
+
+# Local investigation and regression assets belong outside this repository.
+/tests/
+/Tests/
+/Logs/
+/Artifacts/

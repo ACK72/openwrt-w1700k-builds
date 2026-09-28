@@ -8,7 +8,7 @@ hardware invalidation, and quarantine uncertain writes or deletions.
 Serialize UPDMEM writes and preserve flow ownership when hardware entries
 age, move or are reused. Exhaustion falls back to software forwarding.
 
-Consolidates ACK72 patches 0024, 0026.
+Consolidates former ACK72 patches 0024, 0026.
 
 Adapted-from: Gilly1970 <gilroyscott@hotmail.com>, patches 972 and 973
 Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
@@ -30,7 +30,7 @@ new file mode 100644
 +Serialize UPDMEM writes and preserve flow ownership when hardware entries
 +age, move or are reused. Exhaustion falls back to software forwarding.
 +
-+Consolidates ACK72 patches 0024, 0026.
++Consolidates former ACK72 patches 0024, 0026.
 +
 +Adapted-from: Gilly1970 <gilroyscott@hotmail.com>, patches 972 and 973
 +Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
