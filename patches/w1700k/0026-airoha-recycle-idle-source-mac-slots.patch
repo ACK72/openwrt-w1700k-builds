@@ -1,0 +1,445 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Mon, 28 Sep 2026 19:53:25 +0900
+Subject: [PATCH] airoha: reuse idle source MAC slots without evicting live flows
+
+Follow up the overly restrictive immutable-slot policy in 0024.
+Share live MAC slots by reference count and cache unused slots for reuse.
+Use slot 0 and unregistered GDM indices as well as 5..14, while keeping
+registered GDM base slots and KEEP separate. Reclaim least-recently released
+slots only after their last software flow and checked hardware invalidation.
+Quarantine only slots with failed UPDMEM writes or uncertain flow deletion.
+
+Acquire after validation/allocation and release on insertion failure or
+deletion. Before rebinding a flow to another hardware hash, invalidate its
+old binding; retain the old hash if that fails. Track a timed-out new bind
+for later cleanup. Avoid overwriting a hardware entry that has aged/reused.
+The normal packet forwarding path does not maintain slot references.
+
+Adapted-from: Gilly1970 <gilroyscott@hotmail.com>, patch 973
+Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/blob/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches/973-net-airoha-UPDMEM-slot-allocator-for-IPv6-source-MACs.patch
+
+diff --git a/target/linux/airoha/patches-6.18/9999-zzz-airoha-recycle-source-mac-slots.patch b/target/linux/airoha/patches-6.18/9999-zzz-airoha-recycle-source-mac-slots.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/airoha/patches-6.18/9999-zzz-airoha-recycle-source-mac-slots.patch
+@@ -0,0 +1,420 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Mon, 28 Sep 2026 19:53:25 +0900
++Subject: [PATCH] airoha: recycle unused IPv6 MAC slots after checked flow removal
++
++Follow up the overly restrictive immutable-slot policy in 0024.
++Share live MAC slots by reference count and cache unused slots for reuse.
++Use slot 0 and unregistered GDM indices as well as 5..14, while keeping
++registered GDM base slots and KEEP separate. Reclaim least-recently released
++slots only after their last software flow and checked hardware invalidation.
++Quarantine only slots with failed UPDMEM writes or uncertain flow deletion.
++
++Acquire after validation/allocation and release on insertion failure or
++deletion. Before rebinding a flow to another hardware hash, invalidate its
++old binding; retain the old hash if that fails. Track a timed-out new bind
++for later cleanup. Avoid overwriting a hardware entry that has aged/reused.
++The normal packet forwarding path does not maintain slot references.
++
++Adapted-from: Gilly1970 <gilroyscott@hotmail.com>, patch 973
++Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/blob/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches/973-net-airoha-UPDMEM-slot-allocator-for-IPv6-source-MACs.patch
++
++--- a/drivers/net/ethernet/airoha/airoha_eth.h
+++++ b/drivers/net/ethernet/airoha/airoha_eth.h
++@@ -494,16 +494,17 @@
++ 		};
++ 	};
++ 
++ 	struct hlist_node l2_subflow_node; /* PPE L2 subflow entry */
++ 	u32 hash;
++ 
++ 	struct airoha_foe_stats64 stats;
++ 	enum airoha_flow_entry_type type;
+++	bool smac_failed;
++ 	u32 ingress_dev_idx;
++ 	unsigned long ingress_stamp;
++ 	unsigned long no_hw_since;
++ 
++ 	struct rhash_head node;
++ 	unsigned long cookie;
++ 
++ 	/* Must be last --ends in a flexible-array member. */
++@@ -639,23 +640,25 @@
++ 	struct reset_control_bulk_data rsts[AIROHA_MAX_NUM_RSTS];
++ 	struct reset_control_bulk_data *xsi_rsts;
++ 
++ 	struct net_device *napi_dev;
++ 
++ 	struct airoha_qdma qdma[AIROHA_MAX_NUM_QDMA];
++ 	struct airoha_gdm_port *ports[AIROHA_MAX_NUM_GDM_PORTS];
++ 
++-	/* Slots 0..4 belong to GDM; 15 means keep the original source MAC.
++-	 * Dynamic slots are immutable until the next full hardware init.
++-	 */
+++	/* Registered GDM base slots and KEEP (15) are outside the pool. */
++ 	spinlock_t updmem_lock;
++ 	u16 updmem_used;
++ 	u16 updmem_valid;
+++	u16 updmem_poisoned;
++ 	u8 updmem_mac[16][ETH_ALEN];
+++	u32 updmem_refcnt[16];
+++	u64 updmem_stamp[16];
+++	u64 updmem_seq;
++ };
++ 
++ u32 airoha_rr(void __iomem *base, u32 offset);
++ void airoha_wr(void __iomem *base, u32 offset, u32 val);
++ u32 airoha_rmw(void __iomem *base, u32 offset, u32 mask, u32 val);
++ 
++ #define airoha_fe_rr(eth, offset)				\
++ 	airoha_rr((eth)->fe_regs, (offset))
++--- a/drivers/net/ethernet/airoha/airoha_ppe.c
+++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
++@@ -340,55 +340,107 @@
++ 					    struct ethhdr *eh)
++ {
++ 	br->dest_mac_hi = get_unaligned_be32(eh->h_dest);
++ 	br->dest_mac_lo = get_unaligned_be16(eh->h_dest + 4);
++ 	br->src_mac_hi = get_unaligned_be16(eh->h_source);
++ 	br->src_mac_lo = get_unaligned_be32(eh->h_source + 2);
++ }
++ 
++-/* Keep GDM slots reserved even when their ports are not registered.
++- * Do not recycle a slot on flow deletion: a successful SRAM invalidation
++- * does not establish that every in-flight packet has consumed its SMAC.
++- */
++-#define AIROHA_UPDMEM_FIRST 5
++ #define AIROHA_UPDMEM_KEEP 15
++ 
++ static int airoha_ppe_write_upd_mem(struct airoha_eth *eth, u8 slot,
++ 				     const u8 *addr);
++ 
+++static bool airoha_ppe_smac_poolable(struct airoha_eth *eth, int slot)
+++{
+++	int i;
+++
+++	if (slot < 0 || slot >= AIROHA_UPDMEM_KEEP)
+++		return false;
+++
+++	/* All ports are allocated before any netdev is registered. Keep even
+++	 * down ports reserved: ndo_set_mac_address can rewrite their slot.
+++	 */
+++	for (i = 0; i < ARRAY_SIZE(eth->ports); i++)
+++		if (eth->ports[i] && eth->ports[i]->id == slot)
+++			return false;
+++
+++	return true;
+++}
+++
++ static int airoha_ppe_get_smac_id(struct airoha_eth *eth, const u8 *addr)
++ {
++-	int slot, free = -1, ret;
+++	int slot, free = -1, evict = -1, ret;
++ 
++ 	spin_lock_bh(&eth->updmem_lock);
++-	for (slot = AIROHA_UPDMEM_FIRST; slot < AIROHA_UPDMEM_KEEP; slot++) {
+++	for (slot = 0; slot < AIROHA_UPDMEM_KEEP; slot++) {
+++		if (!airoha_ppe_smac_poolable(eth, slot) ||
+++		    (eth->updmem_poisoned & BIT(slot)))
+++			continue;
++ 		if ((eth->updmem_valid & BIT(slot)) &&
++ 		    ether_addr_equal(eth->updmem_mac[slot], addr)) {
+++			eth->updmem_refcnt[slot]++;
++ 			ret = slot;
++ 			goto unlock;
++ 		}
++-		if (!(eth->updmem_used & BIT(slot)) && free < 0)
++-			free = slot;
++-	}
+++		if (!(eth->updmem_used & BIT(slot))) {
+++			if (free < 0)
+++				free = slot;
+++		} else if (!eth->updmem_refcnt[slot] &&
+++			   (evict < 0 || eth->updmem_stamp[slot] <
+++					 eth->updmem_stamp[evict])) {
+++			evict = slot;
+++		}
+++	}
+++	if (free < 0)
+++		free = evict;
++ 	ret = -ENOSPC;
++ 	if (free < 0)
++ 		goto unlock;
++ 
++-	/* Quarantine partial writes too: never match or reassign that slot. */
+++	/* Retire the cached MAC before either word can be changed. */
++ 	eth->updmem_used |= BIT(free);
+++	eth->updmem_valid &= ~BIT(free);
++ 	ret = airoha_ppe_write_upd_mem(eth, free, addr);
++-	if (ret)
+++	if (ret) {
+++		eth->updmem_poisoned |= BIT(free);
++ 		goto unlock;
+++	}
++ 	ether_addr_copy(eth->updmem_mac[free], addr);
++ 	eth->updmem_valid |= BIT(free);
+++	eth->updmem_refcnt[free] = 1;
++ 	ret = free;
++ unlock:
++ 	spin_unlock_bh(&eth->updmem_lock);
++ 	return ret;
+++}
+++
+++static void airoha_ppe_put_smac_id(struct airoha_eth *eth,
+++				   struct airoha_foe_entry *hwe, bool failed)
+++{
+++	int slot;
+++
+++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) <
+++	    PPE_PKT_TYPE_IPV6_ROUTE_3T)
+++		return;
+++
+++	slot = FIELD_GET(AIROHA_FOE_MAC_SMAC_ID, hwe->ipv6.l2.src_mac_hi);
+++	if (!airoha_ppe_smac_poolable(eth, slot))
+++		return;
+++
+++	spin_lock_bh(&eth->updmem_lock);
+++	if (failed)
+++		eth->updmem_poisoned |= BIT(slot);
+++	if (WARN_ON_ONCE(!eth->updmem_refcnt[slot]))
+++		goto unlock;
+++	if (!--eth->updmem_refcnt[slot])
+++		eth->updmem_stamp[slot] = ++eth->updmem_seq;
+++unlock:
+++	spin_unlock_bh(&eth->updmem_lock);
++ }
++ 
++ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
++ 					struct airoha_foe_entry *hwe,
++ 					struct net_device *netdev, int type,
++ 					struct airoha_flow_data *data,
++ 					int l4proto, u8 dsfield)
++ {
++@@ -458,28 +510,18 @@
++ 			 * forwarding descriptors queue.
++ 			 */
++ 			if (airoha_is_lan_gdm_dev(dev))
++ 				val |= AIROHA_FOE_IB2_FAST_PATH;
++ 			if (dsa_port >= 0)
++ 				val |= FIELD_PREP(AIROHA_FOE_IB2_NBQ,
++ 						  dsa_port);
++ 
+++			/* Resolved to a referenced slot after rule validation. */
++ 			smac_id = port->id;
++-			if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
++-				int sid;
++-
++-				/* Even the base MAC uses an immutable flow slot so
++-				 * ndo_set_mac_address cannot rewrite a live flow.
++-				 */
++-				sid = airoha_ppe_get_smac_id(eth, data->eth.h_source);
++-				if (sid < 0)
++-					return sid;
++-				smac_id = sid;
++-			}
++ 		}
++ 	}
++ 
++ 	if (is_multicast_ether_addr(data->eth.h_dest))
++ 		val |= AIROHA_FOE_IB2_MULTICAST;
++ 
++ 	ports_pad = 0xa5a5a500 | (l4proto & 0xff);
++ 	if (type == PPE_PKT_TYPE_IPV4_ROUTE)
++@@ -860,23 +902,76 @@
++ 	if (hash < sram_num_entries)
++ 		err = airoha_ppe_foe_commit_sram_entry(ppe, hash);
++ unlock:
++ 	rcu_read_unlock();
++ 
++ 	return err;
++ }
++ 
+++static int airoha_ppe_foe_unbind(struct airoha_ppe *ppe,
+++				 struct airoha_flow_table_entry *e)
+++{
+++	struct airoha_foe_entry *hwe, invalid;
+++	int type, err;
+++
+++	lockdep_assert_held(&ppe_lock);
+++	if (e->hash == 0xffff)
+++		return 0;
+++
+++	hwe = airoha_ppe_foe_get_entry_locked(ppe, e->hash);
+++	if (!hwe) {
+++		e->smac_failed = true;
+++		return -ETIMEDOUT;
+++	}
+++
+++	type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, e->data.ib1);
+++	if (FIELD_GET(AIROHA_FOE_IB1_BIND_STATE, hwe->ib1) !=
+++	    AIROHA_FOE_STATE_BIND ||
+++	    FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1) != type ||
+++	    !airoha_ppe_foe_compare_entry(e, hwe))
+++		goto forget;
+++	if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T &&
+++	    ((hwe->ipv6.l2.src_mac_hi ^ e->data.ipv6.l2.src_mac_hi) &
+++	     AIROHA_FOE_MAC_SMAC_ID))
+++		goto forget;
+++
+++	/* Keep the software template bindable. SRAM ACK (or the ordered
+++	 * coherent DRAM write) must complete before releasing its MAC.
+++	 */
+++	invalid = *hwe;
+++	invalid.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
+++	invalid.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
+++				 AIROHA_FOE_STATE_INVALID);
+++	err = airoha_ppe_foe_commit_entry(ppe, &invalid, e->hash, false);
+++	if (err) {
+++		e->smac_failed = true;
+++		return err;
+++	}
+++	wmb();
+++forget:
+++	e->hash = 0xffff;
+++	return 0;
+++}
+++
++ static void airoha_ppe_foe_remove_flow(struct airoha_ppe *ppe,
++ 				       struct airoha_flow_table_entry *e)
++ {
++ 	lockdep_assert_held(&ppe_lock);
++ 
++ 	hlist_del_init(&e->list);
++-	if (e->hash != 0xffff) {
+++	if (e->type == FLOW_TYPE_L4) {
+++		int err = airoha_ppe_foe_unbind(ppe, e);
+++
+++		/* A failed delete may leave a hardware reference behind. Only
+++		 * that slot is quarantined, even after its last software user.
+++		 */
+++		airoha_ppe_put_smac_id(ppe->eth, &e->data,
+++				       err != 0 || e->smac_failed);
+++	} else if (e->hash != 0xffff) {
++ 		e->data.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
++ 		e->data.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
++ 					  AIROHA_FOE_STATE_INVALID);
++ 		airoha_ppe_foe_commit_entry(ppe, &e->data, e->hash, false);
++ 		e->hash = 0xffff;
++ 	}
++ 	if (e->type == FLOW_TYPE_L2_SUBFLOW) {
++ 		hlist_del_init(&e->l2_subflow_node);
++@@ -1015,17 +1110,16 @@
++ 
++ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
++ 					struct sk_buff *skb,
++ 					u32 hash, bool rx_wlan)
++ {
++ 	struct airoha_flow_table_entry *e;
++ 	struct airoha_foe_bridge br = {};
++ 	struct airoha_foe_entry *hwe;
++-	bool commit_done = false;
++ 	struct hlist_node *n;
++ 	u32 index, state, ingress = airoha_ppe_foe_ingress(skb);
++ 
++ 	spin_lock_bh(&ppe_lock);
++ 
++ 	hwe = airoha_ppe_foe_get_entry_locked(ppe, hash);
++ 	if (!hwe)
++ 		goto unlock;
++@@ -1043,23 +1137,27 @@
++ 				airoha_ppe_foe_remove_flow(ppe, e);
++ 			}
++ 			continue;
++ 		}
++ 
++ 		if (!airoha_ppe_foe_compare_entry(e, hwe))
++ 			continue;
++ 
++-		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
++-		commit_done = true;
+++		if (e->hash != hash && airoha_ppe_foe_unbind(ppe, e))
+++			goto unlock;
+++		e->data.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
+++		e->data.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
+++					  AIROHA_FOE_STATE_BIND);
+++		/* Track even a timed-out bind: it may have reached hardware. */
++ 		e->hash = hash;
++-	}
++-
++-	if (commit_done)
+++		if (airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan))
+++			e->smac_failed = true;
++ 		goto unlock;
+++	}
++ 
++ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
++ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
++ 				   airoha_l2_flow_table_params);
++ 	if (e && !airoha_ppe_foe_l2_claim(ppe, e, ingress))
++ 		airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, rx_wlan);
++ unlock:
++ 	spin_unlock_bh(&ppe_lock);
++@@ -1394,34 +1492,47 @@
++ 		if (err)
++ 			return err;
++ 	}
++ 
++ 	e = kzalloc(sizeof(*e), GFP_KERNEL);
++ 	if (!e)
++ 		return -ENOMEM;
++ 
+++	if (offload_type >= PPE_PKT_TYPE_IPV6_ROUTE_3T &&
+++	    FIELD_GET(AIROHA_FOE_MAC_SMAC_ID, hwe.ipv6.l2.src_mac_hi) !=
+++	    AIROHA_UPDMEM_KEEP) {
+++		err = airoha_ppe_get_smac_id(eth, data.eth.h_source);
+++		if (err < 0)
+++			goto free_entry;
+++		hwe.ipv6.l2.src_mac_hi &= ~AIROHA_FOE_MAC_SMAC_ID;
+++		hwe.ipv6.l2.src_mac_hi |= FIELD_PREP(AIROHA_FOE_MAC_SMAC_ID, err);
+++	}
+++
++ 	e->cookie = f->cookie;
++ 	e->ingress_dev_idx = meta.key->ingress_ifindex;
++ 	e->ingress_stamp = jiffies;
++ 	memcpy(&e->data, &hwe, sizeof(e->data));
++ 
++ 	err = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);
++ 	if (err)
++-		goto free_entry;
+++		goto put_smac;
++ 
++ 	err = rhashtable_insert_fast(&eth->flow_table, &e->node,
++ 				     airoha_flow_table_params);
++ 	if (err < 0)
++ 		goto remove_foe_entry;
++ 
++ 	return 0;
++ 
++ remove_foe_entry:
++ 	airoha_ppe_foe_flow_remove_entry(eth->ppe, e);
+++	goto free_entry;
+++put_smac:
+++	airoha_ppe_put_smac_id(eth, &e->data, false);
++ free_entry:
++ 	kfree(e);
++ 
++ 	return err;
++ }
++ 
++ static int airoha_ppe_flow_offload_destroy(struct airoha_eth *eth,
++ 					   struct flow_cls_offload *f)
++@@ -1800,16 +1911,20 @@
++ 	err = airoha_ppe_flush_sram_entries(ppe);
++ 	if (err)
++ 		return err;
++ 
++ 	/* Hardware was reset and its flow SRAM was successfully flushed. */
++ 	spin_lock_init(&eth->updmem_lock);
++ 	eth->updmem_used = 0;
++ 	eth->updmem_valid = 0;
+++	eth->updmem_poisoned = 0;
+++	eth->updmem_seq = 0;
+++	memset(eth->updmem_refcnt, 0, sizeof(eth->updmem_refcnt));
+++	memset(eth->updmem_stamp, 0, sizeof(eth->updmem_stamp));
++ 
++ 	err = rhashtable_init(&eth->flow_table, &airoha_flow_table_params);
++ 	if (err)
++ 		return err;
++ 
++ 	err = rhashtable_init(&ppe->l2_flows, &airoha_l2_flow_table_params);
++ 	if (err)
++ 		goto error_flow_table_destroy;

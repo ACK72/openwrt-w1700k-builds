@@ -146,6 +146,12 @@
       ],
       "source": "Gilly1970/Gemtek-W1700K-6.18@4b8fb8c3a2619dd239fb44fd511ee2848a07e768",
       "author": "ACK72 <acikom72@gmail.com>"
+    },
+    {
+      "file": "0026-airoha-recycle-idle-source-mac-slots.patch",
+      "description": "Replace the lifetime MAC limit with shared references, idle-slot reuse and checked hardware flow removal.",
+      "source": "Gilly1970/Gemtek-W1700K-6.18@4b8fb8c3a2619dd239fb44fd511ee2848a07e768",
+      "author": "ACK72 <acikom72@gmail.com>"
     }
   ]
 }

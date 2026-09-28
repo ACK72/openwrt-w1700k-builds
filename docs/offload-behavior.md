@@ -15,17 +15,28 @@ across active and removed links is supported. WED reporting is unchanged.
 
 IPv6 hardware flows leaving a GDM port use a separate source-MAC slot for each
 distinct egress MAC, including addresses used by VLAN uppers. Flows with the
-same MAC share a slot. GDM base slots 0–4 and the hardware's preserve-MAC slot
-15 are reserved; changing an interface's base address cannot rewrite the MAC
-used by an existing flow.
+same MAC share a reference-counted slot. Each registered GDM port reserves its
+own base slot (IDs 1–4); the hardware's preserve-MAC slot 15 is also reserved.
+Slot 0 and base indices without a registered GDM port join the pool. Changing
+an interface's base address cannot rewrite the MAC used by an existing flow.
 
-Slots 5–14 remain assigned until full hardware initialization. They are not
-recycled when a flow is deleted, since deletion does not prove that all
-in-flight packets have stopped referencing the slot. This supports ten
-distinct IPv6 egress MACs per hardware lifetime. Further distinct addresses
-continue through software forwarding. A timed-out hardware write also reserves
-its slot without making it available to flows. Interface restart or firewall
-reload does not reclaim these slots. IPv4 inline MAC handling and bridge
+After the last flow releases a slot, its cached MAC can be reused without a
+hardware write or replaced by a different MAC. The allocator uses never-used
+slots first, then the least recently released slot. Live flows are never
+evicted. The pool holds 15 minus the number of registered GDM ports distinct
+MACs simultaneously (at least 11 with four ports), with no lifetime limit on
+MAC turnover. This counts IPv6 egress source MACs, not connected Wi-Fi clients
+or the number of flows sharing an address.
+
+Flow deletion checks hardware invalidation before releasing its MAC. Moving a
+flow to another hardware entry first removes the previous binding; a failed
+removal retains its owner. A timed-out MAC write or uncertain flow programming
+quarantines only the affected slot until full hardware initialization; a flow
+with an earlier hardware error cannot make its slot reusable on final deletion.
+When all usable slots have live references or are quarantined, additional
+distinct MACs use software forwarding. Slot reuse relies on the existing PPE
+invalidation/ACK and coherent-memory ordering contract; software fault tests
+do not establish hardware pipeline timing. IPv4 inline MAC handling and bridge
 subflows that preserve the original source MAC retain their existing behavior.
 
 Hardware GRO belongs to the shared QDMA. Feature changes remain synchronized
