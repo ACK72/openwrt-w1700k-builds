@@ -39,10 +39,10 @@ invalidation/ACK and coherent-memory ordering contract; software fault tests
 do not establish hardware pipeline timing. IPv4 inline MAC handling and bridge
 subflows that preserve the original source MAC retain their existing behavior.
 
-Hardware GRO belongs to the shared QDMA. Feature changes remain synchronized
-across its interfaces, and the engine is disabled when its last interface
-closes. A change while all interfaces are down updates their feature state
-without programming the engine. Zero or oversized aggregate counts and empty
+Hardware GRO is a QDMA-wide engine. The current base no longer enables it by
+default or shares it between interfaces: a second interface on the same QDMA
+cannot open while it is enabled. The engine is disabled when the last
+interface on its QDMA closes. Zero or oversized aggregate counts and empty
 TCP payloads are rejected before an aggregate SKB is allocated.
 
 These adaptations derive from Gilly's 039/046, 972/973 and selected 975/977

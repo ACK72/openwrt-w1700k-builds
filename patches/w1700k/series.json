@@ -158,6 +158,7 @@
     },
     {
       "file": "0021-airoha-harden-shared-qdma-gro-lifecycle.patch",
+      "description": "GRO aggregate checks and last-close engine disable; the fanboy base no longer shares HW GRO between QDMA users.",
       "selected": [
         "975/977 (shared-QDMA adaptation)"
       ],
