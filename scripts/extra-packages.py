@@ -4,13 +4,28 @@ import argparse
 import hashlib
 import io
 import json
+import re
 import shutil
 import subprocess
 import tarfile
+import time
 from pathlib import Path, PurePosixPath
+from urllib.error import URLError
 from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def fetch(url):
+    # codeload occasionally resets connections; the checksum still decides.
+    for attempt in range(3):
+        try:
+            with urlopen(url, timeout=90) as response:
+                return response.read()
+        except (URLError, TimeoutError):
+            if attempt == 2:
+                raise
+            time.sleep(5 * 2 ** attempt)
 
 
 def prepare(openwrt, cache):
@@ -19,8 +34,7 @@ def prepare(openwrt, cache):
     for item in lock:
         archive = cache / (item['commit'] + '.tar.gz')
         if not archive.exists():
-            with urlopen(item['url'], timeout=90) as response:
-                data = response.read()
+            data = fetch(item['url'])
             if hashlib.sha256(data).hexdigest() != item['sha256']:
                 raise RuntimeError('Source archive checksum mismatch: ' + item['repo'])
             archive.write_bytes(data)
@@ -49,7 +63,8 @@ def prepare(openwrt, cache):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
         recipe = dest / 'Makefile'
-        content = recipe.read_text().replace('PKG_RELEASE:=1', 'PKG_RELEASE:=2')
+        # Anchor the release bump; a plain substring would also rewrite :=10.
+        content = re.sub(r'(?m)^PKG_RELEASE:=1$', 'PKG_RELEASE:=2', recipe.read_text())
         # Avoid a wall-clock-dependent LuCI package version.
         content = content.replace('PKG_SRC_PREFIX:=$(shell date +%y).999', 'PKG_SRC_PREFIX:=26.999')
         recipe.write_text(content)

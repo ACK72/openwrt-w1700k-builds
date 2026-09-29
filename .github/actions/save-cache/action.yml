@@ -10,11 +10,18 @@ inputs:
   kind:
     required: true
     description: Cache family
+outputs:
+  reserved:
+    description: "'true' when the Actions cache holds this key or accepted the upload"
+    value: ${{ steps.budget.outputs.save == 'true' || steps.budget.outputs.exists == 'true' }}
 runs:
   using: composite
   steps:
     - name: Reserve cache storage
       id: budget
+      # Callers preserve state after cancellation; composite steps would
+      # otherwise inherit the cancelled job status and be skipped.
+      if: always()
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
@@ -24,7 +31,7 @@ runs:
         CACHE_KIND: ${{ inputs.kind }}
       run: python3 scripts/prune-caches.py reserve "$CACHE_KIND" "$CACHE_PATH" "$CACHE_KEY"
     - uses: actions/cache/save@v6.1.0
-      if: steps.budget.outputs.save == 'true'
+      if: always() && steps.budget.outputs.save == 'true'
       with:
         path: ${{ inputs.path }}
         key: ${{ inputs.key }}

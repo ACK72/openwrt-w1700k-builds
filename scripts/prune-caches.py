@@ -77,7 +77,7 @@ def reserve(kind, path, key):
         ledger.parent.mkdir(parents=True, exist_ok=True)
         ledger.write_text(json.dumps(reservations))
         print(f"Cache already exists: {key}")
-        return False
+        return "exists"
     size = upload_bound(path)
     remove = reservation_plan(items, reservations, key, size, family, ref)
     current = sum(item["size_in_bytes"] for item in items)
@@ -103,9 +103,13 @@ def reserve(kind, path, key):
 
 
 def candidates(items, prefix, replacements, ref):
+    """Remove a family's other entries once its first available replacement exists."""
     result = []
-    for kind, replacement in replacements.items():
-        if not any(item["key"] == replacement and item["ref"] == ref for item in items):
+    for kind, options in replacements.items():
+        present = {item["key"] for item in items if item["ref"] == ref}
+        replacement = next((key for key in ([options] if isinstance(options, str) else options)
+                            if key in present), None)
+        if replacement is None:
             continue
         result.extend(item["id"] for item in items
                       if item["ref"] == ref and item["key"].startswith(f"{prefix}-{kind}-")
@@ -148,20 +152,25 @@ def main():
         return
     if args.command == "reserve":
         try:
-            save = reserve(args.kind, args.path, args.key)
+            result = reserve(args.kind, args.path, args.key)
         except (subprocess.SubprocessError, OSError, json.JSONDecodeError) as error:
             print(f"::warning::Cache storage could not be verified; skipping upload: {error}")
-            save = False
+            result = False
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-            output.write(f"save={str(save).lower()}\n")
+            # Callers keep a registry copy when Actions refuses the upload.
+            output.write(f"save={str(result is True).lower()}\nexists={str(result == 'exists').lower()}\n")
         return
     env = os.environ
     prefix, repo, ref = env["CACHE_PREFIX"], env["GH_REPO"], env["GITHUB_REF"]
     run = f"{env['GITHUB_RUN_ID']}-{env['GITHUB_RUN_ATTEMPT']}"
+    # ccache is keyed by compiler identity, so it survives toolchain rebuilds.
+    # A complete toolchain supersedes interrupted progress; until then the
+    # newest partial snapshot supersedes older partial ones.
     replacements = {"dl": f"{prefix}-dl-{run}",
-                    "ccache": f"{prefix}-ccache-{env['TOOLCHAIN_KEY']}-{run}",
+                    "ccache": f"{prefix}-ccache-{env['COMPILER_KEY']}-{run}",
                     "build": f"{prefix}-build-{env['BUILD_KEY']}-{run}",
-                    "toolchain": f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}-dl1"}
+                    "toolchain": [f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}-dl1",
+                                  f"{prefix}-toolchain-{env['TOOLCHAIN_KEY']}-partial-{run}"]}
     items = list_caches(repo, ref)
     remove = candidates(items, prefix, replacements, ref)
     if any(item["key"] == replacements["build"] for item in items):

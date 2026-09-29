@@ -69,6 +69,7 @@ checkout_source() {
 }
 
 prepare() {
+    rm -f "$WORK/build-stopped" "$WORK/make.pgid" "$WORK/downloads-before"
     OPENWRT_REPO=${OPENWRT_REPO:-$(python3 "$ROOT/scripts/repositories.py" openwrt)}
     checkout_source "$OPENWRT_REPO" "$OPENWRT_REF" "$OPENWRT" full
     python3 "$ROOT/scripts/official_npu.py" check "$OPENWRT"
@@ -142,6 +143,73 @@ configure() {
     python3 "$ROOT/scripts/build-meta.py" keys "$OPENWRT" | tee "$WORK/keys.env"
 }
 
+# Run make so that cache preservation can always stop it cleanly. Actions
+# executes container steps through docker exec, which does not forward a
+# cancellation signal: the build would otherwise keep writing while its caches
+# are archived. BUILD_DEADLINE reserves the end of the job for preservation.
+group_make() {
+    local log=$1 remaining
+    shift
+    local command=(make -C "$OPENWRT" "$@")
+    if [[ -e $WORK/build-stopped ]]; then
+        echo 'ERROR: The build was stopped for cache preservation.' | tee -a "$log" >&2
+        return 130
+    fi
+    if [[ -n ${BUILD_DEADLINE:-} ]]; then
+        [[ $BUILD_DEADLINE =~ ^[0-9]+$ ]] || die 'Invalid BUILD_DEADLINE'
+        remaining=$((BUILD_DEADLINE - $(date +%s)))
+        if (( remaining < 60 )); then
+            echo 'ERROR: No build time is left before cache preservation.' | tee -a "$log" >&2
+            return 124
+        fi
+        # SIGINT lets make delete the targets it was writing.
+        command=(timeout --signal=INT --kill-after=120 "$remaining" "${command[@]}")
+    fi
+    if [[ ${GITHUB_ACTIONS:-false} == true ]]; then
+        # The session leader's PID is the process group stopped by 'stop'.
+        # shellcheck disable=SC2016 # Expanded by the inner shell.
+        setsid bash -c 'echo "$$" > "$1"; shift; exec "$@"' _ "$WORK/make.pgid" "${command[@]}" 2>&1 |
+            tee "$log"
+    else
+        "${command[@]}" 2>&1 | tee "$log"
+    fi
+}
+
+stop_build() {
+    local pgid waited phases
+    # Also refuse to start a later phase from a cancelled step's script.
+    touch "$WORK/build-stopped"
+    if [[ -s $WORK/make.pgid ]]; then
+        pgid=$(cat "$WORK/make.pgid")
+        [[ $pgid =~ ^[1-9][0-9]*$ ]] || die 'Invalid build process group'
+        if kill -0 -- "-$pgid" 2>/dev/null; then
+            echo "Stopping interrupted build process group $pgid before preserving caches."
+            kill -INT -- "-$pgid" 2>/dev/null || true
+            for (( waited = 0; waited < 90; waited++ )); do
+                kill -0 -- "-$pgid" 2>/dev/null || break
+                sleep 1
+            done
+            if kill -0 -- "-$pgid" 2>/dev/null; then
+                kill -TERM -- "-$pgid" 2>/dev/null || true
+                sleep 10
+                kill -KILL -- "-$pgid" 2>/dev/null || true
+            fi
+        fi
+    fi
+    # The phase script outlives its cancelled step; it must not save a
+    # snapshot while this job archives the same cache directories.
+    for (( waited = 0; waited < 60; waited++ )); do
+        phases=$(pgrep -f -- 'scripts/build\.sh (download|toolchain|compile)$' || true)
+        [[ -n $phases ]] || break
+        sleep 1
+    done
+    if [[ -n $phases ]]; then
+        # shellcheck disable=SC2086 # One PID per word.
+        kill -KILL $phases 2>/dev/null || true
+    fi
+    rm -f "$WORK/make.pgid"
+}
+
 run_make() {
     local name=$1
     shift
@@ -156,10 +224,14 @@ run_make() {
     } >> "$LOGS/environment.log"
     (command -v vmstat >/dev/null && exec vmstat 30) >> "$LOGS/resources.log" &
     local monitor=$!
-    make -C "$OPENWRT" -j"$JOBS" "$@" 2>&1 | tee "$LOGS/$name.log" || status=$?
+    group_make "$LOGS/$name.log" -j"$JOBS" "$@" || status=$?
+    rm -f "$WORK/make.pgid"
     kill "$monitor" 2>/dev/null || true
     wait "$monitor" 2>/dev/null || true
     printf '%s\t%s\t%s\n' "$name" "$((SECONDS-start))" "$status" >> "$LOGS/timings.tsv"
+    if (( status == 124 )); then
+        echo "ERROR: $name reached the time reserved for cache preservation." >&2
+    fi
     return "$status"
 }
 
@@ -171,27 +243,62 @@ restore_build() {
     for kind in toolchain build; do
         key=$(sed -n "s/^${kind}=//p" "$WORK/keys.env")
         [[ $key =~ ^[a-f0-9]{64}$ ]] || die 'Run configure before restoring build state'
+        rm -f "$WORK/cache-restored-$kind"
         python3 "$ROOT/scripts/build-cache.py" restore "$kind" "$OPENWRT" "$CACHE/$kind" "$key"
-        if [[ $kind == toolchain && ! -f $WORK/cache-restored ]]; then
-            if [[ ${GITHUB_ACTIONS:-false} == true ]]; then
-                python3 "$ROOT/scripts/cache-seed.py" restore toolchain "$key" "$CACHE/toolchain"
-                python3 "$ROOT/scripts/build-cache.py" restore toolchain "$OPENWRT" "$CACHE/toolchain" "$key"
+        if [[ -f $WORK/cache-restored && $(cat "$WORK/cache-restored") == "$kind" ]]; then
+            touch "$WORK/cache-restored-$kind"
+        elif [[ ${GITHUB_ACTIONS:-false} == true ]]; then
+            # Registry copies outlive Actions cache eviction and budget limits.
+            python3 "$ROOT/scripts/cache-seed.py" restore "$kind" "$key" "$CACHE/$kind"
+            python3 "$ROOT/scripts/build-cache.py" restore "$kind" "$OPENWRT" "$CACHE/$kind" "$key"
+            if [[ -f $WORK/cache-restored && $(cat "$WORK/cache-restored") == "$kind" ]]; then
+                touch "$WORK/cache-restored-$kind"
             fi
-            # Target state depends on a complete compatible compiler installation.
-            [[ -f $WORK/cache-restored ]] || break
         fi
+        # Target state depends on a compatible compiler installation.
+        [[ $kind != toolchain || -f $WORK/cache-restored-toolchain ]] || break
     done
 }
 
 save_build() {
     local kind=${1:-build} key
+    shift || true
     key=$(sed -n "s/^${kind}=//p" "$WORK/keys.env")
     [[ $key =~ ^[a-f0-9]{64}$ ]] || die 'Run configure before saving build state'
-    python3 "$ROOT/scripts/build-cache.py" save "$kind" "$OPENWRT" "$CACHE/$kind" "$key"
+    python3 "$ROOT/scripts/build-cache.py" save "$kind" "$OPENWRT" "$CACHE/$kind" "$key" "$@"
+}
+
+# Keep the progress of a failed, cancelled or timed-out phase. OpenWrt's stamps
+# resume it; stop_build has already let make remove partially written targets.
+save_partial() {
+    local kind=$1
+    [[ $kind == toolchain || $kind == build ]] || die 'Unknown snapshot kind'
+    stop_build
+    if save_build "$kind" --partial; then
+        echo "$kind" > "$WORK/partial-snapshot"
+    else
+        echo "No $kind progress to preserve."
+    fi
+}
+
+download_inventory() {
+    find "$CACHE/dl" -maxdepth 1 -type f -printf '%f %s\n' | sort
+}
+
+# Unchanged downloads need no new Actions cache generation. Compare against the
+# restored archives, so a failed or cancelled build still keeps new sources.
+downloads_changed() {
+    if [[ ! -f $WORK/downloads-before || $(download_inventory) == "$(cat "$WORK/downloads-before")" ]]; then
+        echo false
+    else
+        echo true
+    fi
 }
 
 download() {
-    make -C "$OPENWRT" -j"$DOWNLOAD_JOBS" download 2>&1 | tee "$LOGS/download.log"
+    download_inventory > "$WORK/downloads-before"
+    group_make "$LOGS/download.log" -j"$DOWNLOAD_JOBS" download
+    rm -f "$WORK/make.pgid"
     python3 "$ROOT/scripts/build-cache.py" downloads "$OPENWRT"
 }
 
@@ -201,10 +308,11 @@ toolchain() {
     fi
     run_make tools tools/install
     run_make toolchain toolchain/install
-    # Upgrade snapshots without download metadata once; compatible immutable
-    # snapshots need no repeated compression or upload on subsequent runs.
-    if [[ ! -f $WORK/cache-restored || ! -f $CACHE/toolchain/state.json ]] ||
-       ! python3 -c 'import json,sys; sys.exit("downloads" not in json.load(open(sys.argv[1])))' "$CACHE/toolchain/state.json"; then
+    # Upgrade snapshots without download metadata once, and replace a resumed
+    # partial snapshot. Compatible complete snapshots are immutable.
+    if [[ ! -f $WORK/cache-restored-toolchain || ! -f $CACHE/toolchain/state.json ]] ||
+       ! python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); sys.exit("downloads" not in s or s.get("complete") is False)' \
+           "$CACHE/toolchain/state.json"; then
         save_build toolchain
     fi
 }
@@ -237,7 +345,7 @@ compile() {
     fi
     if (( status != 0 )); then
         echo 'Firmware compilation failed. See build.log and the per-package logs in the diagnostic artifact.' >&2
-        echo 'The complete build will not be repeated serially; compiler and download caches are retained.' >&2
+        echo 'The complete build will not be repeated serially; compiler, download and partial build state are retained.' >&2
     fi
     return "$status"
 }
@@ -284,10 +392,13 @@ case ${1:-all} in
     configure) configure ;;
     restore) restore_build ;;
     snapshot) save_build build ;;
+    snapshot-partial) save_partial "${2:-}" ;;
+    stop) stop_build ;;
+    downloads-changed) downloads_changed ;;
     download) download ;;
     toolchain) toolchain ;;
     compile) compile ;;
     collect) cd "$OPENWRT"; collect ;;
     all) prepare; distfeeds; configure; restore_build; download; toolchain; compile; cd "$OPENWRT"; collect; save_build build ;;
-    *) die 'Usage: bash scripts/build.sh [all|prepare|distfeeds|configure|restore|download|toolchain|compile|collect|snapshot]' ;;
+    *) die 'Usage: bash scripts/build.sh [all|prepare|distfeeds|configure|restore|download|toolchain|compile|collect|snapshot|snapshot-partial KIND|stop|downloads-changed]' ;;
 esac

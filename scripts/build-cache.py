@@ -74,14 +74,21 @@ def product_paths(root, kind):
                   if (path.name == "host" or path.name.startswith("toolchain-")) == (kind == "toolchain"))
 
 
-def products(root, kind):
+def products(root, kind, complete=True):
     paths = product_paths(root, kind)
     required = ("host", "toolchain-") if kind == "toolchain" else ("target-",)
-    if any(not any(p.parent.name == directory and p.name.startswith(prefix) and p.is_dir()
+    present = [any(p.parent.name == directory and p.name.startswith(prefix) and p.is_dir()
                    and not p.is_symlink() for p in paths)
-           for directory in ("build_dir", "staging_dir") for prefix in required):
+               for directory in ("build_dir", "staging_dir") for prefix in required]
+    # An interrupted build keeps whatever OpenWrt finished; its stamps decide
+    # what is resumed. A complete snapshot must contain every product root.
+    if not (all(present) if complete else any(present)):
         raise RuntimeError("Incomplete build products; refusing to save cache")
     return [p.relative_to(root).as_posix() for p in paths]
+
+
+def zstd_env(level):
+    return {**os.environ, "ZSTD_CLEVEL": str(level), "ZSTD_NBTHREADS": str(os.cpu_count() or 2)}
 
 
 def file_digest(path):
@@ -126,21 +133,26 @@ def configured_keys(root):
     return dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line)
 
 
-def save(root, cache, kind, key):
-    entries = products(root, kind)
+def save(root, cache, kind, key, complete=True):
+    entries = products(root, kind, complete)
     cache.mkdir(parents=True, exist_ok=True)
     metadata = {"schema": SCHEMA, "kind": kind, "key": key, "workspace": str(root.resolve()),
-                "inputs": source_state(root), "downloads": download_state(root)}
+                "complete": complete, "inputs": source_state(root), "downloads": download_state(root)}
     keys = configured_keys(root)
     metadata.update({name: keys[name] for name in ("toolchain", "build-base") if name in keys})
     # No root signing keys, old configuration, source files, or output images.
     archive = cache / "products.tar.zst"
+    # Invalidate the old metadata first: an interrupted save must not pair a
+    # new archive with an old checksum or an old archive with new metadata.
+    (cache / "state.json").unlink(missing_ok=True)
     subprocess.run(["tar", "--zstd", "-cf", str(archive) + ".tmp", "-C", str(root), *entries],
-                   check=True, env={**os.environ, "ZSTD_CLEVEL": "3", "ZSTD_NBTHREADS": "2"})
+                   check=True, env=zstd_env(3))
     os.replace(str(archive) + ".tmp", archive)
     metadata["sha256"] = file_digest(archive)
-    (cache / "state.json").write_text(json.dumps(metadata), encoding="utf-8")
-    print(f"Saved {kind} cache: {archive.stat().st_size / 1024**2:.0f} MiB")
+    (cache / "state.json.tmp").write_text(json.dumps(metadata), encoding="utf-8")
+    os.replace(cache / "state.json.tmp", cache / "state.json")
+    label = kind if complete else f"partial {kind}"
+    print(f"Saved {label} cache: {archive.stat().st_size / 1024**2:.0f} MiB")
 
 
 def restore(root, cache, kind, key):
@@ -175,9 +187,10 @@ def restore(root, cache, kind, key):
             shutil.rmtree(target)
         else:
             target.unlink()
+    complete = metadata.get("complete", True) is not False
     command = ["tar", "--zstd", "-xf", str(archive), "-C", str(root)]
     subprocess.run(command, check=True)
-    products(root, kind)
+    products(root, kind, complete)
     if kind == "build":
         # Package host builds can install into staging_dir/host (e.g. fwtool),
         # while their installed stamps live in hostpkg. The immutable toolchain
@@ -190,7 +203,8 @@ def restore(root, cache, kind, key):
     count = restore_mtimes(root, metadata["inputs"])
     (root.parent / f"restored-downloads-{kind}.json").write_text(
         json.dumps(metadata.get("downloads", {})), encoding="utf-8")
-    print(f"Restored {kind} products and {count} unchanged input timestamps")
+    label = kind if complete else f"partial {kind} (an interrupted build resumes from its stamps)"
+    print(f"Restored {label} products and {count} unchanged input timestamps")
     return kind
 
 
@@ -203,12 +217,15 @@ def main():
         command.add_argument("root", type=Path)
         command.add_argument("cache", type=Path)
         command.add_argument("key")
+        if operation == "save":
+            command.add_argument("--partial", action="store_true",
+                                 help="keep the progress of an interrupted or failed build")
     sub.add_parser("downloads").add_argument("root", type=Path)
     args = parser.parse_args()
     if args.operation == "downloads":
         restore_download_mtimes(args.root)
     elif args.operation == "save":
-        save(args.root, args.cache, args.kind, args.key)
+        save(args.root, args.cache, args.kind, args.key, not args.partial)
     else:
         restored_kind = restore(args.root, args.cache, args.kind, args.key)
         if restored_kind:

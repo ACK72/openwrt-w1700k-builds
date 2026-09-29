@@ -18,6 +18,10 @@ TOOLCHAIN_INPUTS = (
     "target/Config.in", "target/Makefile", "target/linux/Makefile",
     "target/linux/airoha/Makefile", "target/linux/airoha/an7581/target.mk",
 )
+# ccache hashes the compiler driver, whose version and configure arguments
+# cover include/ and rules.mk changes. Patches to cc1/as and the math
+# libraries linked into cc1 do not change the driver, so they key the cache.
+COMPILER_INPUTS = ("toolchain", "tools/gmp", "tools/mpfr", "tools/mpc", "tools/isl")
 KERNEL_INPUTS = ("target/linux/airoha", "target/linux/generic", "package/kernel/linux")
 PACKAGE = "airoha-en7581-mt7996-npu-firmware"
 REQUIRED_CONFIG = (
@@ -234,6 +238,14 @@ def keys(openwrt):
     toolchain = hashlib.sha256(
         ("toolchain-v3" + source_hash + host_hash + tool_config).encode()
     ).hexdigest()
+    # Compiler identity outlives toolchain snapshots: unrelated tools/include
+    # changes rebuild the toolchain but keep reusing its compiled objects.
+    compiler_tracked = git(openwrt, "ls-files", "--", *COMPILER_INPUTS).splitlines()
+    compiler_config = config_digest(openwrt / ".config", True,
+                                    toolchain_symbols(openwrt, compiler_tracked))
+    compiler = hashlib.sha256(
+        ("compiler-v1" + digest_paths(openwrt, compiler_tracked) + host_hash + compiler_config).encode()
+    ).hexdigest()
     # Feed-list changes require a new image, but only a changed kernel identity
     # invalidates kernel/package products. Both keep the compiler/toolchain cache.
     vermagic = (openwrt / "files/etc/vermagic.txt").read_text().strip()
@@ -252,7 +264,7 @@ def keys(openwrt):
         "npu": "linux-firmware:" + npu["version"],
         "npu_source": "linux-firmware", "npu_upstream": npu,
         "feeds": feeds, "builder": builder_hash, "builder_commit": commit, "toolchain": toolchain,
-        "host": host_hash, "build": build,
+        "compiler": compiler, "host": host_hash, "build": build,
         "config": digest_paths(openwrt, [".config"]), "channel": "w1700k-oc-rc",
         "distfeeds": distfeeds, "vermagic": vermagic, "build_base": build_base,
         "toolchain_source": source_hash, "toolchain_config": tool_config,
@@ -265,7 +277,8 @@ def keys(openwrt):
     # Store build identity in the image, outside /etc so restored settings cannot
     # carry an old firmware identity into a newer image. Promotion preserves it.
     write_build_identity(openwrt, state)
-    print(f"toolchain={toolchain}\nbuild={build}\nbuild-base={build_base}\nfingerprint={fingerprint}")
+    print(f"toolchain={toolchain}\ncompiler={compiler}\nbuild={build}\n"
+          f"build-base={build_base}\nfingerprint={fingerprint}")
 
 
 def write_build_identity(openwrt, state):

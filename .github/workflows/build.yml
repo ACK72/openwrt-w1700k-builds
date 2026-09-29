@@ -99,7 +99,9 @@ jobs:
     if: github.ref == 'refs/heads/main'
     needs: [environment, compose, clean-drafts]
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 350
+    # Hosted jobs stop at 360 minutes. make stops at BUILD_DEADLINE instead, so
+    # an overlong build still preserves its caches and partial state.
+    timeout-minutes: 355
     container:
       image: ${{ needs.environment.outputs.image }}
       credentials:
@@ -125,8 +127,13 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - name: Identify host cache namespace
-        run: echo "CACHE_PREFIX=w1700k-v3-Linux-ARM64" >> "$GITHUB_ENV"
+      - name: Identify host cache namespace and reserve preservation time
+        run: |
+          {
+            echo "CACHE_PREFIX=w1700k-v3-Linux-ARM64"
+            # Leave 35 minutes for stopping make and saving every cache.
+            echo "BUILD_DEADLINE=$(( $(date +%s) + 320 * 60 ))"
+          } >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v8.0.1
         with:
           name: ${{ needs.compose.outputs.artifact-name }}
@@ -209,6 +216,9 @@ jobs:
           key: ${{ env.CACHE_PREFIX }}-dl-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ${{ env.CACHE_PREFIX }}-dl-
+      # ccache hashes the compiler itself; its key only has to change with the
+      # compiler, not with every toolchain snapshot. The second prefix reads
+      # caches saved before compiler keys existed (same toolchain, same compiler).
       - name: Restore compiler cache
         if: steps.needed.outputs.build == 'true' && inputs.clean != true
         id: ccache
@@ -216,8 +226,9 @@ jobs:
         uses: actions/cache/restore@v6.1.0
         with:
           path: .cache/ccache
-          key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.compiler }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.compiler }}-
             ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-
       - name: Restore compatible toolchain
         if: steps.needed.outputs.build == 'true' && inputs.clean != true
@@ -237,12 +248,14 @@ jobs:
           path: .cache/build
           key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-
-      - name: Recover initial compiler cache when Actions has no copy
+      - name: Recover the compiler cache from the registry when Actions has no copy
         if: steps.needed.outputs.build == 'true' && inputs.clean != true && steps.ccache.outputs.cache-matched-key == ''
-        run: python3 scripts/cache-seed.py restore ccache '${{ steps.keys.outputs.toolchain }}' .cache/ccache
-      - name: Recover initial source downloads when Actions has no copy
+        run: >-
+          python3 scripts/cache-seed.py restore ccache '${{ steps.keys.outputs.compiler }}' .cache/ccache
+          --legacy '${{ steps.keys.outputs.toolchain }}'
+      - name: Recover source downloads from the registry when Actions has no copy
         if: steps.needed.outputs.build == 'true' && steps.dl.outputs.cache-matched-key == ''
-        run: python3 scripts/cache-seed.py restore dl '${{ steps.keys.outputs.toolchain }}' .cache/dl
+        run: python3 scripts/cache-seed.py restore dl - .cache/dl --legacy '${{ steps.keys.outputs.toolchain }}'
       - name: Restore build products before make download
         if: steps.needed.outputs.build == 'true'
         id: restored
@@ -273,12 +286,13 @@ jobs:
           kind: toolchain
           path: .cache/toolchain
           key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-dl1
-      - name: Preserve the compatible toolchain recovery artifact
+      - name: Keep the immutable toolchain in the registry
         if: steps.tools.outcome == 'success'
         continue-on-error: true
         run: python3 scripts/cache-seed.py publish toolchain '${{ steps.keys.outputs.toolchain }}' .cache/toolchain
       - name: Compile RC firmware
         if: steps.needed.outputs.build == 'true'
+        id: compile
         run: bash scripts/build.sh compile
       - name: Validate firmware and preserve build provenance
         if: steps.needed.outputs.build == 'true'
@@ -301,41 +315,116 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 14
-      - name: Save compiler cache, including clean builds
-        if: always() && steps.tools.outcome == 'success'
+      # Everything below also runs after a failure, a timeout or a cancellation.
+      # docker exec does not stop a cancelled step inside the job container, so
+      # stop make first: caches must never be archived while it still writes.
+      - name: Stop an interrupted build before preserving its state
+        if: always() && steps.needed.outputs.build == 'true'
+        id: stop
+        run: |
+          bash scripts/build.sh stop
+          echo "downloads-changed=$(bash scripts/build.sh downloads-changed)" >> "$GITHUB_OUTPUT"
+      - name: Save compiler cache, including failed and cancelled builds
+        if: >-
+          always() && steps.stop.outcome == 'success' &&
+          contains(fromJSON('["success", "failure", "cancelled"]'), steps.tools.outcome)
+        id: ccache-save
         continue-on-error: true
         uses: ./.github/actions/save-cache
         with:
           kind: ccache
           path: .cache/ccache
-          key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.toolchain }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Preserve initial compiler and download recovery artifacts
-        if: steps.firmware.outcome == 'success'
-        continue-on-error: true
-        run: |
-          python3 scripts/cache-seed.py publish ccache '${{ steps.keys.outputs.toolchain }}' .cache/ccache
-          python3 scripts/cache-seed.py publish dl '${{ steps.keys.outputs.toolchain }}' .cache/dl
-      - name: Snapshot successful kernel and package build state
-        if: steps.firmware.outcome == 'success'
+          key: ${{ env.CACHE_PREFIX }}-ccache-${{ steps.keys.outputs.compiler }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Snapshot build state for the next run
+        if: >-
+          always() && steps.stop.outcome == 'success' && (
+          contains(fromJSON('["success", "failure", "cancelled"]'), steps.compile.outcome) ||
+          contains(fromJSON('["failure", "cancelled"]'), steps.tools.outcome))
         id: snapshot
         continue-on-error: true
-        run: bash scripts/build.sh snapshot
-      - name: Save successful incremental build state
-        if: steps.snapshot.outcome == 'success'
+        env:
+          FIRMWARE: ${{ steps.firmware.outcome }}
+          COMPILE: ${{ steps.compile.outcome }}
+        run: |
+          rm -f .work/partial-snapshot
+          if [[ $FIRMWARE == success ]]; then
+            bash scripts/build.sh snapshot
+            echo kind=build >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Only verified firmware produces a complete snapshot. Any other
+          # progress is resumed by OpenWrt's stamps and never published.
+          if [[ -n $COMPILE && $COMPILE != skipped ]]; then
+            bash scripts/build.sh snapshot-partial build
+          else
+            bash scripts/build.sh snapshot-partial toolchain
+          fi
+          kind=none
+          if [[ -f .work/partial-snapshot ]]; then kind=$(cat .work/partial-snapshot); fi
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+          if [[ $kind != none ]]; then
+            echo "Partial $kind state preserved. If a failure repeats from it, rerun with clean=true." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Save kernel and package build state
+        if: always() && steps.snapshot.outputs.kind == 'build'
+        id: build-save
         continue-on-error: true
         uses: ./.github/actions/save-cache
         with:
           kind: build
           path: .cache/build
           key: ${{ env.CACHE_PREFIX }}-build-${{ steps.keys.outputs.build }}-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Save reusable downloads
-        if: always() && steps.dl.outcome == 'success'
+      - name: Save interrupted toolchain progress
+        if: always() && steps.snapshot.outputs.kind == 'toolchain'
+        continue-on-error: true
+        uses: ./.github/actions/save-cache
+        with:
+          kind: toolchain
+          path: .cache/toolchain
+          key: ${{ env.CACHE_PREFIX }}-toolchain-${{ steps.keys.outputs.toolchain }}-partial-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Save reusable downloads when they changed
+        if: >-
+          always() && steps.dl.outcome == 'success' && steps.stop.outcome == 'success' &&
+          (steps.dl.outputs.cache-matched-key == '' || steps.stop.outputs.downloads-changed == 'true')
+        id: dl-save
         continue-on-error: true
         uses: ./.github/actions/save-cache
         with:
           kind: dl
           path: .cache/dl
           key: ${{ env.CACHE_PREFIX }}-dl-${{ github.run_id }}-${{ github.run_attempt }}
+      # The container package keeps copies outside the 10 GB Actions cache:
+      # refreshed when missing or stale, and at once when Actions refused them.
+      # A complete build snapshot is only kept there as budget overflow.
+      - name: Refresh registry copies of the caches
+        if: always() && steps.stop.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TOOLCHAIN_KEY: ${{ steps.keys.outputs.toolchain }}
+          COMPILER_KEY: ${{ steps.keys.outputs.compiler }}
+          BUILD_KEY: ${{ steps.keys.outputs.build }}
+          CCACHE_SAVE: ${{ steps.ccache-save.outcome }}
+          CCACHE_RESERVED: ${{ steps.ccache-save.outputs.reserved }}
+          DL_SAVE: ${{ steps.dl-save.outcome }}
+          DL_RESERVED: ${{ steps.dl-save.outputs.reserved }}
+          SNAPSHOT: ${{ steps.snapshot.outputs.kind }}
+          FIRMWARE: ${{ steps.firmware.outcome }}
+          BUILD_RESERVED: ${{ steps.build-save.outputs.reserved }}
+        run: |
+          if [[ -n $CCACHE_SAVE && $CCACHE_SAVE != skipped ]]; then
+            force=(); [[ $CCACHE_RESERVED == true ]] || force=(--force)
+            python3 scripts/cache-seed.py publish ccache "$COMPILER_KEY" .cache/ccache --max-age 3 "${force[@]}"
+          fi
+          if [[ -n $DL_SAVE && $DL_SAVE != skipped ]]; then
+            force=(); [[ $DL_RESERVED == true ]] || force=(--force)
+            python3 scripts/cache-seed.py publish dl - .cache/dl --max-age 7 "${force[@]}"
+          fi
+          if [[ $SNAPSHOT == build && $FIRMWARE == success && $BUILD_RESERVED != true ]]; then
+            python3 scripts/cache-seed.py publish build "$BUILD_KEY" .cache/build --force
+          fi
+          python3 scripts/prune-registry.py
       - name: Report build timings even on failure
         if: always()
         run: |
@@ -352,6 +441,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TOOLCHAIN_KEY: ${{ steps.keys.outputs.toolchain }}
+          COMPILER_KEY: ${{ steps.keys.outputs.compiler }}
           BUILD_KEY: ${{ steps.keys.outputs.build }}
           BUILD_BASE_KEY: ${{ steps.keys.outputs.build-base }}
           DISTFEEDS_CACHE_KEY: ${{ steps.official.outputs.cache-key }}
