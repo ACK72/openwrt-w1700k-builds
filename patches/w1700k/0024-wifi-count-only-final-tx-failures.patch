@@ -1,0 +1,48 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Tue, 29 Sep 2026 23:30:00 +0900
+Subject: [PATCH] wifi: count only final TX failures in station statistics
+
+The TX-free header carries each frame's transmission count and final
+status. tx_failed added every retry to the final failure, so it equalled
+tx_retries whenever no frame was lost and overstated real losses
+otherwise. nl80211 defines TX_FAILED as failed packets, and mac80211
+reports frames that failed after all retries. Count the final status only;
+retries remain in tx_retries.
+
+diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0024-wifi-count-only-final-tx-failures.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0024-wifi-count-only-final-tx-failures.patch
+new file mode 100644
+--- /dev/null
++++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0024-wifi-count-only-final-tx-failures.patch
+@@ -0,0 +1,32 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Tue, 29 Sep 2026 23:30:00 +0900
++Subject: [PATCH] wifi: mt76: mt7996: count only final TX failures
++
++The TX-free header carries each frame's transmission count and final
++status. tx_failed added every retry to the final failure, so it equalled
++tx_retries whenever no frame was lost and overstated real losses
++otherwise. nl80211 defines TX_FAILED as failed packets, and mac80211
++reports frames that failed after all retries. Count the final status only;
++retries remain in tx_retries.
++
++--- a/mt7996/mac.c
+++++ b/mt7996/mac.c
++@@ -1308,14 +1308,16 @@
++
++ 			if (!wcid)
++ 				continue;
++
++ 			count = FIELD_GET(MT_TXFREE_INFO_COUNT, info);
++ 			tx_retries = count ? count - 1 : 0;
++-			tx_failed = tx_retries +
++-				!!FIELD_GET(MT_TXFREE_INFO_STAT, info);
+++			/* nl80211 and mac80211 count failed packets, not failed
+++			 * attempts; retries are reported separately.
+++			 */
+++			tx_failed = !!FIELD_GET(MT_TXFREE_INFO_STAT, info);
++
++ 			wcid->stats.tx_retries += tx_retries;
++ 			wcid->stats.tx_failed += tx_failed;
++ 			continue;
++ 		}
++
