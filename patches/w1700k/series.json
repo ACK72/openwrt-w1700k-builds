@@ -92,7 +92,7 @@
         "026 (adapted)",
         "044 (adapted)",
         "949",
-        "957",
+        "957 (adapted: BQL is no longer reset in ndo_stop, as in mainline)",
         "980"
       ],
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed"
