@@ -151,14 +151,6 @@ group_make() {
     local log=$1 remaining
     shift
     local command=(make -C "$OPENWRT" "$@")
-    if (( EUID == 0 )); then
-        # OpenWrt packs a git source from an extracted git archive. As root,
-        # tar keeps the archive's 0664/0775 modes instead of applying the
-        # umask, so the tarball misses PKG_MIRROR_HASH whenever the source
-        # mirror does not have it yet. Extract like the unprivileged builds
-        # that produced those hashes; the snapshot tar calls are unaffected.
-        command=(env "TAR_OPTIONS=--no-same-permissions${TAR_OPTIONS:+ $TAR_OPTIONS}" "${command[@]}")
-    fi
     if [[ -e $WORK/build-stopped ]]; then
         echo 'ERROR: The build was stopped for cache preservation.' | tee -a "$log" >&2
         return 130

@@ -179,6 +179,11 @@
       "file": "0024-wifi-count-only-final-tx-failures.patch",
       "description": "wifi: report frames lost after all retries as tx_failed, not every failed attempt",
       "author": "ACK72 <acikom72@gmail.com>"
+    },
+    {
+      "file": "0025-build-extract-git-archives-with-the-umask.patch",
+      "description": "build: pack git sources as root with the same modes as unprivileged builds, matching PKG_MIRROR_HASH",
+      "author": "ACK72 <acikom72@gmail.com>"
     }
   ]
 }
