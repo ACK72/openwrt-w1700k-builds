@@ -98,10 +98,13 @@ function sizeText(bytes) {
 }
 
 // Commit lines are indented in the release notes; markers are HTML comments.
+// LuCI's jsmin only recognises a regex after an operator such as '=' and
+// strips literal spaces from anything else, so keep this one out of arrows.
+const changeLine = /^\x20{4}([0-9a-f]{7,40})\x20(\S.*)$/;
+
 function changes(release) {
 	return String(release.notes || '').split('\n')
-		.filter(line => /^ {4}\S/.test(line))
-		.map(line => line.trim().match(/^([0-9a-f]{7,40}) (.+)$/))
+		.map(line => changeLine.exec(line))
 		.filter(Boolean);
 }
 

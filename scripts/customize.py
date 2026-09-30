@@ -17,6 +17,14 @@ RUNTIME_COMMANDS = ('sh', 'ls', 'awk', 'chmod', 'mkdir', 'mv', 'rm', 'rmdir',
                     'jq', 'curl', 'grep', 'sha256sum', 'wc', 'tr', 'df', 'sleep',
                     'ubus', 'uci', 'sysupgrade', 'devmem', 'cat', 'timeout', 'ping', 'ip', 'head', 'date',
                     'mktemp', 'logger', 'ucode', 'taskset')
+# Views this builder writes or patches. LuCI minifies them during the build,
+# and jsmin can corrupt valid source (a regex after '=>' loses its spaces).
+MINIFIED_VIEWS = (
+    'www/luci-static/resources/view/attendedsysupgrade/overview.js',
+    'www/luci-static/resources/view/status/channel_analysis.js',
+    'www/luci-static/resources/network.js',
+    'www/luci-static/resources/view/airoha_flowsense/status.js',
+)
 RETIRED_CUSTOMIZATION_FILES = (
     'usr/libexec/w1700k-frame-engine',
     'www/luci-static/resources/tools/w1700k-frame-engine.js',
@@ -127,6 +135,16 @@ def verify(openwrt):
     if len(roots) != 1:
         raise RuntimeError('Expected one compiled Airoha root filesystem')
     root = roots[0]
+    node = shutil.which('node')
+    if node:
+        for name in MINIFIED_VIEWS:
+            result = subprocess.run([node, '--check', str(root / name)], capture_output=True, text=True)
+            if result.returncode:
+                raise RuntimeError(f'Minified view does not parse: {name}\n{result.stderr.strip()}')
+    elif os.environ.get('GITHUB_ACTIONS') == 'true':
+        raise RuntimeError('node is required to check the minified LuCI views')
+    else:
+        print('node not found; skipping the minified view syntax check')
     for command in RUNTIME_COMMANDS:
         paths = [root / directory / command for directory in ('bin', 'sbin', 'usr/bin', 'usr/sbin')]
         if not any(path.is_file() or path.is_symlink() for path in paths):
