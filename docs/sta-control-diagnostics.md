@@ -16,6 +16,15 @@ recorded scheduling attempts even when NAPI rejected them, which could leave
 a stale timestamp and overstate a later wait. Treat earlier wait maxima as
 provisional; they do not by themselves prove CPU contention or a stalled queue.
 
+## Beacon-loss threshold
+
+Patch `0026` makes the STA beacon monitor wait 20 beacon intervals instead of 7
+before it reports beacon loss, about 2.2 s instead of 0.77 s at 100 TU. Some
+upstream APs skip beacons for one to two seconds while still serving the
+station; with 7 intervals each such gap became a local reason 4 disconnect.
+The kernel warning and event 2 below report the new threshold in ms. Losing
+the AP is still detected, about 1.4 s later than before.
+
 ## Enable and read
 
 The files are under the shared radio's mt76 debugfs directory. Verify the PHY

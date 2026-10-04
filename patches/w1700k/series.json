@@ -184,6 +184,11 @@
       "file": "0025-build-extract-git-archives-with-the-umask.patch",
       "description": "build: pack git sources as root with the same modes as unprivileged builds, matching PKG_MIRROR_HASH",
       "author": "ACK72 <acikom72@gmail.com>"
+    },
+    {
+      "file": "0026-wifi-raise-sta-beacon-loss-threshold.patch",
+      "description": "wifi: wait 20 beacon intervals (about 2.2 s) before reporting STA beacon loss, so short AP beacon gaps no longer disconnect the uplink",
+      "author": "ACK72 <acikom72@gmail.com>"
     }
   ]
 }
