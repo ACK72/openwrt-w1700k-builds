@@ -130,10 +130,10 @@ new file mode 100644
 + {
 + 	netif_napi_add(dev->napi_dev, &dev->napi[qid], poll);
 +diff --git a/mac80211.c b/mac80211.c
-+index 0dcedab..1e2df78 100644
++index b0bf052..6b14c8a 100644
 +--- a/mac80211.c
 ++++ b/mac80211.c
-+@@ -683,24 +683,25 @@ mt76_alloc_device(struct device *pdev, unsigned int size,
++@@ -684,24 +684,25 @@ mt76_alloc_device(struct device *pdev, unsigned int size,
 + 	dev->hw = hw;
 + 	dev->dev = pdev;
 + 	dev->init_wiphy = NULL;
@@ -185,7 +185,7 @@ new file mode 100644
 + 
 + static void mt76_reset_phy(struct mt76_phy *phy)
 + {
-+@@ -2337,24 +2339,26 @@ static void mt76_rx_beacon_iter(void *_data, u8 *mac,
++@@ -2351,24 +2353,26 @@ static void mt76_rx_beacon_iter(void *_data, u8 *mac,
 + 
 + 		link_conf = rcu_dereference(vif->link_conf[link_id]);
 + 		if (!link_conf)
@@ -212,7 +212,7 @@ new file mode 100644
 + 		.bssid = hdr->addr3,
 + 	};
 + 
-+@@ -2373,56 +2377,64 @@ void mt76_rx_beacon(struct mt76_phy *phy, struct sk_buff *skb)
++@@ -2387,56 +2391,64 @@ void mt76_rx_beacon(struct mt76_phy *phy, struct sk_buff *skb)
 + EXPORT_SYMBOL_GPL(mt76_rx_beacon);
 + 
 + struct mt76_beacon_mon_data {
@@ -346,7 +346,7 @@ new file mode 100644
 + 	while (len > 0) {
 + 		cur_len = min_t(int, max_len, len);
 +diff --git a/mt76.h b/mt76.h
-+index df2b8bb..d67041f 100644
++index cc27e24..a5beae2 100644
 +--- a/mt76.h
 ++++ b/mt76.h
 +@@ -1,21 +1,24 @@
@@ -374,7 +374,7 @@ new file mode 100644
 + #include "airoha_offload.h"
 + #endif
 + #include <linux/soc/mediatek/mtk_wed.h>
-+@@ -923,24 +926,26 @@ struct mt76_phy {
++@@ -930,24 +933,26 @@ struct mt76_phy {
 + 	} rx_amsdu[__MT_RXQ_MAX];
 + 
 + 	struct mt76_freq_range_power *frp;
@@ -401,7 +401,7 @@ new file mode 100644
 + 	spinlock_t cc_lock;
 + 
 + 	u32 cur_cc_bss_rx;
-+@@ -1047,26 +1052,87 @@ struct mt76_dev {
++@@ -1049,26 +1054,87 @@ struct mt76_dev {
 + 		u32 offset;
 + 	} test_mtd;
 + #endif
@@ -490,7 +490,7 @@ new file mode 100644
 + 	u32 tx_mu_acked_mpdu_cnt;
 + 	u32 tx_su_acked_mpdu_cnt;
 +diff --git a/mt7996/mac.c b/mt7996/mac.c
-+index 5470ebc..abc0605 100644
++index 8e8f8c3..b8215dc 100644
 +--- a/mt7996/mac.c
 ++++ b/mt7996/mac.c
 +@@ -549,24 +549,30 @@ mt7996_mac_fill_rx(struct mt7996_dev *dev, enum mt76_rxq_id q,
@@ -524,7 +524,7 @@ new file mode 100644
 + 			 * de-amsdu, so here needs to clear amsdu present bit
 + 			 * to mark it as a normal mesh frame.
 + 			 */
-+@@ -2930,52 +2936,69 @@ void mt7996_mac_sta_rc_work(struct work_struct *work)
++@@ -2938,52 +2944,69 @@ void mt7996_mac_sta_rc_work(struct work_struct *work)
 + 		spin_lock_bh(&dev->mt76.sta_poll_lock);
 + 	}
 + 
@@ -595,12 +595,12 @@ new file mode 100644
 + 	int rdd_idx = mt7996_get_rdd_idx(phy, false);
 + 
 +diff --git a/mt7996/main.c b/mt7996/main.c
-+index aae1b9b..0054062 100644
++index dbc0d7f..02639e5 100644
 +--- a/mt7996/main.c
 ++++ b/mt7996/main.c
-+@@ -1544,24 +1544,27 @@ mt7996_set_active_links(struct ieee80211_vif *vif)
-+ 
-+ 	ieee80211_set_active_links_async(vif, active_links);
++@@ -2013,24 +2013,27 @@ mt7996_sta_pre_rcu_remove(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
++ 	spin_unlock_bh(&dev->mt76.status_lock);
++ 	mutex_unlock(&dev->mt76.mutex);
 + }
 + 
 + static int
@@ -622,11 +622,11 @@ new file mode 100644
 + 	    new_state == IEEE80211_STA_NOTEXIST)
 + 		mt7996_mac_sta_remove(dev, vif, sta);
 + 
-+ 	if (old_state == IEEE80211_STA_AUTH &&
++ 	if (old_state == IEEE80211_STA_AUTHORIZED &&
 + 	    new_state == IEEE80211_STA_ASSOC) {
-+ 		mt7996_set_active_links(vif);
-+ 		ev = MT76_STA_EVENT_ASSOC;
-+@@ -1657,24 +1660,34 @@ static void mt7996_tx(struct ieee80211_hw *hw,
++ 		struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
++ 
++@@ -2137,24 +2140,34 @@ static void mt7996_tx(struct ieee80211_hw *hw,
 + 	if (!mphy) {
 + 		ieee80211_free_txskb(hw, skb);
 + 		goto unlock;

@@ -15,10 +15,10 @@ Wait twenty intervals, about 2.2 s at 100 TU, which is close to the
 missed-beacon limit iwlwifi applies before declaring connection loss.
 Losing the AP is still detected, about 1.4 s later than before.
 
-diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0026-wifi-raise-sta-beacon-loss-threshold.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0026-wifi-raise-sta-beacon-loss-threshold.patch
+diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-raise-sta-beacon-loss-threshold.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-raise-sta-beacon-loss-threshold.patch
 new file mode 100644
 --- /dev/null
-+++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0026-wifi-raise-sta-beacon-loss-threshold.patch
++++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-raise-sta-beacon-loss-threshold.patch
 @@ -0,0 +1,32 @@
 +From: ACK72 <acikom72@gmail.com>
 +Date: Sun, 4 Oct 2026 17:15:00 +0900

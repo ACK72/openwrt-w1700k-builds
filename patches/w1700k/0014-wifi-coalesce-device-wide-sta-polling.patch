@@ -17,7 +17,7 @@ diff --git a/package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch b
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch
-@@ -0,0 +1,647 @@
+@@ -0,0 +1,563 @@
 +From: ACK72 <acikom72@gmail.com>
 +Date: Mon, 28 Sep 2026 22:56:33 +0900
 +Subject: [PATCH] wifi: coalesce NPU station statistics and unlock RSSI waits
@@ -34,48 +34,10 @@ new file mode 100644
 +Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
 +
 +diff --git a/mt7996/mac.c b/mt7996/mac.c
-+index abc0605..a94dfaa 100644
++index b8215dc..20c6a0d 100644
 +--- a/mt7996/mac.c
 ++++ b/mt7996/mac.c
-+@@ -2894,140 +2894,182 @@ void mt7996_mac_update_stats(struct mt7996_phy *phy)
-+ 	}
-+ }
-+ 
-+ void mt7996_mac_sta_rc_work(struct work_struct *work)
-+ {
-+ 	struct mt7996_dev *dev = container_of(work, struct mt7996_dev, rc_work);
-+ 	struct mt7996_sta_link *msta_link;
-+ 	struct ieee80211_vif *vif;
-+ 	struct mt7996_vif *mvif;
-+ 	LIST_HEAD(list);
-+ 	u32 changed;
-+ 
-+ 	mutex_lock(&dev->mt76.mutex);
-+ 
-+ 	spin_lock_bh(&dev->mt76.sta_poll_lock);
-+ 	list_splice_init(&dev->sta_rc_list, &list);
-+ 
-+ 	while (!list_empty(&list)) {
-+ 		msta_link = list_first_entry(&list, struct mt7996_sta_link,
-+ 					     rc_list);
-+ 		list_del_init(&msta_link->rc_list);
-+ 
-+ 		changed = msta_link->changed;
-+ 		msta_link->changed = 0;
-+ 		mvif = msta_link->sta->vif;
-+ 		vif = container_of((void *)mvif, struct ieee80211_vif,
-+ 				   drv_priv);
-+ 
-+ 		spin_unlock_bh(&dev->mt76.sta_poll_lock);
-+ 
-+ 		if (changed & (IEEE80211_RC_SUPP_RATES_CHANGED |
-+ 			       IEEE80211_RC_NSS_CHANGED |
-+ 			       IEEE80211_RC_BW_CHANGED))
-+ 			mt7996_mcu_add_rate_ctrl(dev, msta_link->sta, vif,
-+ 						 msta_link->wcid.link_id,
-+ 						 true);
-+ 
-+ 		if (changed & IEEE80211_RC_SMPS_CHANGED)
++@@ -2940,24 +2940,72 @@ void mt7996_mac_sta_rc_work(struct work_struct *work)
 + 			mt7996_mcu_set_fixed_field(dev, msta_link->sta, NULL,
 + 						   msta_link->wcid.link_id,
 + 						   RATE_PARAM_MMPS_UPDATE);
@@ -148,15 +110,7 @@ new file mode 100644
 + 	diag_start = mt76_sta_diag_clock(mphy->dev);
 + 	if (diag_start)
 + 		mt76_sta_diag_event(mphy->dev, MT76_DIAG_WORK_BEGIN,
-+ 				    mphy->band_idx, diag_start, 0, 0, 0, 0);
-+ 
-+ 	mutex_lock(&mphy->dev->mutex);
-+ 	diag_locked = diag_start ? ktime_get_ns() : 0;
-+ 
-+ 	if (test_bit(MT76_MCU_RESET, &mphy->dev->phy.state)) {
-+ 		mutex_unlock(&mphy->dev->mutex);
-+ 		if (diag_start)
-+ 			mt76_sta_diag_event(mphy->dev, MT76_DIAG_WORK_END,
++@@ -2973,31 +3021,25 @@ void mt7996_mac_work(struct work_struct *work)
 + 				mphy->band_idx, diag_start,
 + 				mt76_sta_diag_us(diag_start, diag_locked),
 + 				mt76_sta_diag_us(diag_locked, ktime_get_ns()),
@@ -189,58 +143,20 @@ new file mode 100644
 + 	mt76_beacon_mon_check(mphy);
 + 	mt76_tx_status_check(mphy->dev, false);
 + 
-+ 	ieee80211_queue_delayed_work(mphy->hw, &mphy->mac_work,
-+ 				     MT7996_WATCHDOG_TIME);
-+ }
-+ 
-+ static void mt7996_dfs_stop_radar_detector(struct mt7996_phy *phy)
-+ {
-+ 	struct mt7996_dev *dev = phy->dev;
-+ 	int rdd_idx = mt7996_get_rdd_idx(phy, false);
-+ 
-+ 	if (rdd_idx < 0)
-+ 		return;
-+ 
-+ 	mt7996_mcu_rdd_cmd(dev, RDD_STOP, rdd_idx, 0);
-+ }
-+ 
-+ static int mt7996_dfs_start_rdd(struct mt7996_dev *dev, int rdd_idx)
-+ {
-+ 	int region;
-+ 
-+ 	switch (dev->mt76.region) {
-+ 	case NL80211_DFS_ETSI:
-+ 		region = 0;
-+ 		break;
-+ 	case NL80211_DFS_JP:
-+ 		region = 2;
-+ 		break;
-+ 	case NL80211_DFS_FCC:
-+ 	default:
-+ 		region = 1;
-+ 		break;
-+ 	}
-+ 
-+ 	return mt7996_mcu_rdd_cmd(dev, RDD_START, rdd_idx, region);
-+ }
-+ 
-+ static int mt7996_dfs_start_radar_detector(struct mt7996_phy *phy)
-+ {
-+ 	struct mt7996_dev *dev = phy->dev;
 +diff --git a/mt7996/main.c b/mt7996/main.c
-+index 0054062..753ccf5 100644
++index 02639e5..d341878 100644
 +--- a/mt7996/main.c
 ++++ b/mt7996/main.c
-+@@ -1248,39 +1248,41 @@ mt7996_mac_sta_init_link(struct mt7996_dev *dev,
++@@ -1346,39 +1346,41 @@ mt7996_mac_sta_init_link(struct mt7996_dev *dev,
++ 	mt7996_sta_link_hdr_trans_set(msta, msta_link);
 + 
 + 	ewma_avg_signal_init(&msta_link->avg_ack_signal);
 + 	ewma_signal_init(&msta_link->wcid.rssi);
 + 
 + 	rcu_assign_pointer(msta->link[link_id], msta_link);
++ 	msta->seclink_id = mt7996_sta_seclink_get(dev, msta);
 + 
 + 	mt7996_mac_wtbl_update(dev, idx, MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
-+ 	mt7996_mcu_add_sta(dev, link_conf, link_sta, link, msta_link,
-+ 			   CONN_STATE_DISCONNECT, true);
 + 
 + 	rcu_assign_pointer(dev->mt76.wcid[idx], &msta_link->wcid);
 + 	mt76_wcid_init(&msta_link->wcid, phy->mt76->band_idx);
@@ -273,12 +189,12 @@ new file mode 100644
 + 	if (msta_link->wcid.link_valid) {
 + 		mt7996_mac_wtbl_update(dev, msta_link->wcid.idx,
 + 				       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
-+@@ -1343,24 +1345,25 @@ mt7996_mac_sta_add_links(struct mt7996_dev *dev, struct ieee80211_vif *vif,
++@@ -1452,24 +1454,25 @@ mt7996_mac_sta_add_links(struct mt7996_dev *dev, struct ieee80211_vif *vif,
++ 	unsigned long created = 0, returned = 0;
 + 	unsigned int link_id;
 + 	int err = 0;
 + 
 + 	for_each_set_bit(link_id, &new_links, IEEE80211_MLD_MAX_NUM_LINKS) {
-+ 		struct ieee80211_bss_conf *link_conf;
 + 		struct ieee80211_link_sta *link_sta;
 + 		struct mt7996_sta_link *msta_link;
 + 		struct mt7996_vif_link *link;
@@ -288,18 +204,18 @@ new file mode 100644
 + 		if (msta_link) {
 ++			msta_link->sta_poll_generation = ++dev->sta_poll_generation;
 + 			msta_link->wcid.link_valid = true;
++ 			mt7996_sta_link_hdr_trans_set(msta, msta_link);
++ 			if (msta->deflink_id == IEEE80211_LINK_UNSPECIFIED)
++ 				mt7996_sta_deflink_set(sta, link_id,
++ 						       msta_link->wcid.idx);
++ 			msta->seclink_id = mt7996_sta_seclink_get(dev, msta);
++ 			returned |= BIT(link_id);
 + 			continue;
 + 		}
 + 
-+ 		link_conf = link_conf_dereference_protected(vif, link_id);
-+ 		if (!link_conf) {
++ 		if (!link_conf_dereference_protected(vif, link_id)) {
 + 			err = -EINVAL;
-+ 			goto error_unlink;
-+ 		}
-+ 
-+ 		link = mt7996_vif_link(dev, vif, link_id);
-+ 		if (!link) {
-+@@ -2000,24 +2003,37 @@ static void mt7996_sta_statistics(struct ieee80211_hw *hw,
++@@ -2515,24 +2518,37 @@ static void mt7996_sta_statistics(struct ieee80211_hw *hw,
 + 	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
 + 		sinfo->tx_bytes = msta_link->wcid.stats.tx_bytes;
 + 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BYTES64);
@@ -326,6 +242,9 @@ new file mode 100644
 ++		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
 ++				 BIT_ULL(NL80211_STA_INFO_RX_PACKETS);
 + 	}
++ 
++ out:
++ 	rcu_read_unlock();
 + }
 + 
 + static void mt7996_link_rate_ctrl_update(void *data,
@@ -334,14 +253,11 @@ new file mode 100644
 + 	struct mt7996_sta *msta = msta_link->sta;
 + 	struct mt7996_phy *phy = mt7996_vif_link_phy(&msta->vif->deflink);
 + 	struct mt7996_dev *dev;
-+ 	u32 *changed = data;
-+ 
-+ 	if (!phy)
 +diff --git a/mt7996/mcu.c b/mt7996/mcu.c
-+index a25b627..575c92a 100644
++index b76d764..d59246e 100644
 +--- a/mt7996/mcu.c
 ++++ b/mt7996/mcu.c
-+@@ -918,96 +918,108 @@ mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
++@@ -929,96 +929,108 @@ mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
 + 		elem_size = sizeof(res->msdu_cnt[0]);
 + 		break;
 + 	case UNI_ALL_STA_TXRX_AIR_TIME:
@@ -350,9 +266,9 @@ new file mode 100644
 + 	default:
 + 		return;
 + 	}
-+ 	sta_num = le16_to_cpu(res->sta_num);
++ 
 + 	if (sta_num > (skb->len - sizeof(*res)) / elem_size)
-+ 		return;
++ 		sta_num = (skb->len - sizeof(*res)) / elem_size;
 + 
 +-	for (i = 0; i < sta_num; i++) {
 +-		u8 ac;
@@ -471,7 +387,7 @@ new file mode 100644
 + 	struct mt7996_mcu_thermal_notify *n;
 + 	struct mt7996_phy *phy;
 + 
-+@@ -5928,93 +5940,131 @@ int mt7996_mcu_get_all_sta_info(struct mt7996_phy *phy, u16 tag)
++@@ -5959,93 +5971,131 @@ int mt7996_mcu_get_all_sta_info(struct mt7996_phy *phy, u16 tag)
 + 	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(ALL_STA_INFO),
 + 				 &req, sizeof(req), false);
 + }
@@ -605,7 +521,7 @@ new file mode 100644
 + 					if (mphy)
 + 						msta_link->ack_signal =
 +diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
-+index 93d4e32..04287b5 100644
++index 46a6f0b..6d5748f 100644
 +--- a/mt7996/mt7996.h
 ++++ b/mt7996/mt7996.h
 +@@ -280,24 +280,25 @@ enum {
@@ -624,6 +540,7 @@ new file mode 100644
 ++	u64 sta_poll_generation;
 + 
 + 	struct mt7996_sta *sta;
++ 	bool connected;
 + 
 + 	struct list_head rc_list;
 + 
@@ -633,8 +550,7 @@ new file mode 100644
 + 	unsigned long changed;
 + 
 + 	struct mt76_connac_sta_key_conf bip;
-+ 
-+@@ -472,24 +473,30 @@ struct mt7996_dev {
++@@ -489,24 +490,30 @@ struct mt7996_dev {
 + 
 + 	const struct mt76_bus_ops *bus_ops;
 + 	struct mt7996_phy phy;

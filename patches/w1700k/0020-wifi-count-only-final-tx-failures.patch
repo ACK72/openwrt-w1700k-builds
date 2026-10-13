@@ -9,10 +9,10 @@ otherwise. nl80211 defines TX_FAILED as failed packets, and mac80211
 reports frames that failed after all retries. Count the final status only;
 retries remain in tx_retries.
 
-diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0024-wifi-count-only-final-tx-failures.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0024-wifi-count-only-final-tx-failures.patch
+diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0020-wifi-count-only-final-tx-failures.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0020-wifi-count-only-final-tx-failures.patch
 new file mode 100644
 --- /dev/null
-+++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0024-wifi-count-only-final-tx-failures.patch
++++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0020-wifi-count-only-final-tx-failures.patch
 @@ -0,0 +1,32 @@
 +From: ACK72 <acikom72@gmail.com>
 +Date: Tue, 29 Sep 2026 23:30:00 +0900
