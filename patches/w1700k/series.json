@@ -156,6 +156,12 @@
       "file": "0022-wifi-raise-sta-beacon-loss-threshold.patch",
       "description": "wifi: wait 20 beacon intervals (about 2.2 s) before reporting STA beacon loss, so short AP beacon gaps no longer disconnect the uplink",
       "author": "ACK72 <acikom72@gmail.com>"
+    },
+    {
+      "file": "0023-kernel-drop-the-6.12-guards-from-netfilter-kmods.patch",
+      "description": "kernel: drop the LINUX_6_12 guards of the netfilter kmods, which make dnsmasq-full depend on its own ipset and nftset options once no target defines LINUX_6_12; drop this patch when upstream PR 25965 lands",
+      "source": "openwrt/openwrt#25965 (netfilter.mk only; CONFIG_NF_FLOW_TABLE_HW kept)",
+      "author": "ACK72 <acikom72@gmail.com>"
     }
   ]
 }

@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ACK72 <acikom72@gmail.com>
+Date: Mon, 19 Oct 2026 15:00:00 +0900
+Subject: [PATCH] kernel: drop the 6.12 guards from netfilter kmods
+
+Since imx moved to kernel 6.18, no target uses 6.12 and target-metadata.pl
+no longer defines LINUX_6_12. The guards that refer to it now reference an
+undefined symbol.
+
+package-metadata.pl copies the plain dependencies of a conditionally
+selected package onto the selecting package. dnsmasq-full selects
+kmod-ipt-ipset if PACKAGE_dnsmasq_full_ipset and nftables-json if
+PACKAGE_dnsmasq_full_nftset, and those closures reach kmod-iptables
+(@!LINUX_6_12) and kmod-lib-crc32c (@LINUX_6_12). dnsmasq-full therefore
+depends on
+
+  !(PACKAGE_dnsmasq_full_ipset && !LINUX_6_12) || !LINUX_6_12
+  !(PACKAGE_dnsmasq_full_nftset && LINUX_6_12) || LINUX_6_12
+
+Kconfig accepted the same dependencies while LINUX_6_12 was defined. With
+the symbol gone, it reports a recursive dependency between
+PACKAGE_dnsmasq-full and PACKAGE_dnsmasq_full_ipset. The nftset dependency
+has the same form, so dropping only the iptables guard is not enough.
+
+Without a 6.12 kernel !LINUX_6_12 always holds and LINUX_6_12 never does.
+Make kmod-nf-ipt select kmod-iptables unconditionally, drop the guard of
+kmod-iptables and drop the never-taken kmod-lib-crc32c selects of
+kmod-nft-core and kmod-nf-ipvs. These are the netfilter.mk changes of
+upstream PR 25965 ("kernel: drop kernel 6.12 conditionals and remove kmods
+only used with kernel 6.12"), except the removal of CONFIG_NF_FLOW_TABLE_HW
+from kmod-nf-flow, which this stack keeps.
+---
+ package/kernel/linux/modules/netfilter.mk | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/package/kernel/linux/modules/netfilter.mk b/package/kernel/linux/modules/netfilter.mk
+index 0134e81e9e8..7a0872cef87 100644
+--- a/package/kernel/linux/modules/netfilter.mk
++++ b/package/kernel/linux/modules/netfilter.mk
+@@ -62,7 +62,6 @@ define KernelPackage/iptables
+ 	CONFIG_IP6_NF_IPTABLES_LEGACY \
+ 	CONFIG_BRIDGE_NF_EBTABLES_LEGACY
+   HIDDEN:=1
+-  DEPENDS:=@!LINUX_6_12
+   FILES:= \
+ 	$(LINUX_DIR)/net/ipv4/netfilter/ip_tables.ko \
+ 	$(LINUX_DIR)/net/netfilter/x_tables.ko
+@@ -76,7 +75,7 @@ define KernelPackage/nf-ipt
+   SUBMENU:=$(NF_MENU)
+   TITLE:=Iptables core
+   KCONFIG:=$(KCONFIG_NF_IPT)
+-  DEPENDS:=+!LINUX_6_12:kmod-iptables
++  DEPENDS:=+kmod-iptables
+   FILES:=$(foreach mod,$(NF_IPT-m),$(LINUX_DIR)/net/$(mod).ko)
+   AUTOLOAD:=$(call AutoProbe,$(notdir $(NF_IPT-m)))
+ endef
+@@ -450,7 +449,7 @@ IPVS_MODULES:= \
+ define KernelPackage/nf-ipvs
+   SUBMENU:=Netfilter Extensions
+   TITLE:=IP Virtual Server modules
+-  DEPENDS:=@IPV6 +LINUX_6_12:kmod-lib-crc32c +kmod-ipt-conntrack +kmod-nf-conntrack
++  DEPENDS:=@IPV6 +kmod-ipt-conntrack +kmod-nf-conntrack
+   KCONFIG:= \
+ 	CONFIG_IP_VS \
+ 	CONFIG_IP_VS_IPV6=y \
+@@ -1309,7 +1308,7 @@ $(eval $(call KernelPackage,ipt-rpfilter))
+ define KernelPackage/nft-core
+   SUBMENU:=$(NF_MENU)
+   TITLE:=Netfilter nf_tables support
+-  DEPENDS:=+kmod-nfnetlink +kmod-nf-reject +IPV6:kmod-nf-reject6 +kmod-nf-nat +kmod-nf-log +IPV6:kmod-nf-log6 +LINUX_6_12:kmod-lib-crc32c
++  DEPENDS:=+kmod-nfnetlink +kmod-nf-reject +IPV6:kmod-nf-reject6 +kmod-nf-nat +kmod-nf-log +IPV6:kmod-nf-log6
+   FILES:=$(foreach mod,$(NFT_CORE-m),$(LINUX_DIR)/net/$(mod).ko)
+   AUTOLOAD:=$(call AutoProbe,$(notdir $(NFT_CORE-m)))
+   KCONFIG:= \
