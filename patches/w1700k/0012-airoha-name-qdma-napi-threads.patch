@@ -5,31 +5,30 @@ Assign QDMA/ring names when NAPI threads are created. Linux 6.18 keeps
 __set_task_comm internal and procfs prefers the original kthread full
 name, so changing task comm after creation cannot provide this identity.
 
-Add a GPL-exported named registration variant, preserve default NAPI
-registration, and keep names in control-path storage for recreation.
-Retain RX/TX poll callbacks, weight and TX busy-poll exclusion. Ring
-routing, IRQ ownership and packet scheduling are unchanged.
+Add a GPL-exported named registration variant and preserve default NAPI
+registration. net/core keeps the names for thread recreation in a table
+keyed by the NAPI context, not in struct napi_struct, so modules from the
+official package feeds keep the official structure layout. Retain RX/TX
+poll callbacks, weight and TX busy-poll exclusion. Ring routing, IRQ
+ownership and packet scheduling are unchanged.
 
 diff --git a/target/linux/airoha/patches-6.18/9999-airoha-name-qdma-napi-threads.patch b/target/linux/airoha/patches-6.18/9999-airoha-name-qdma-napi-threads.patch
 new file mode 100644
 --- /dev/null
 +++ b/target/linux/airoha/patches-6.18/9999-airoha-name-qdma-napi-threads.patch
-@@ -0,0 +1,291 @@
+@@ -0,0 +1,234 @@
 +Subject: [PATCH] net: airoha: assign NAPI thread names at creation
++
++Name the QDMA NAPI threads after their QDMA and ring. net/core keeps the
++names in a table keyed by the NAPI context instead of struct napi_struct, so
++the structure keeps the layout of the official kernel headers that modules
++from the official package feeds are built against. Default registration
++neither reads nor writes NAPI memory beyond that layout.
 +
 +diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
 +--- a/include/linux/netdevice.h
 ++++ b/include/linux/netdevice.h
-+@@ -417,6 +417,8 @@
-+ 	int			napi_rmap_idx;
-+ 	int			index;
-+ 	struct napi_config	*config;
-++	/* Optional name copied at registration and reused on thread recreation. */
-++	char			thread_name[IFNAMSIZ];
-+ };
-+ 
-+ enum {
-+@@ -2795,6 +2797,32 @@
++@@ -2816,6 +2816,33 @@
 +  */
 + #define NAPI_POLL_WEIGHT 64
 + 
@@ -47,7 +46,8 @@ new file mode 100644
 ++ * @name: optional thread name, copied and truncated to IFNAMSIZ - 1
 ++ *
 ++ * Call in process context without the netdev lock held. NULL or an empty
-++ * name retains the normal napi/<device>-<id> naming behavior.
+++ * name retains the normal napi/<device>-<id> naming behavior. The name is
+++ * kept by the core until the NAPI is deleted, not in struct napi_struct.
 ++ */
 ++static inline void
 ++netif_napi_add_weight_named(struct net_device *dev, struct napi_struct *napi,
@@ -65,33 +65,83 @@ new file mode 100644
 +diff --git a/net/core/dev.c b/net/core/dev.c
 +--- a/net/core/dev.c
 ++++ b/net/core/dev.c
-+@@ -1617,66 +1617,69 @@
-+ 	call_netdevice_notifiers(NETDEV_RESEND_IGMP, dev);
-+ }
-+ EXPORT_SYMBOL(__netdev_notify_peers);
-+ 
-+ /**
-+  * netdev_notify_peers - notify network peers about existence of @dev
-+  * @dev: network device
-+  *
-+  * Generate traffic such that interested network peers are aware of
-+  * @dev, such as by generating a gratuitous ARP. This may be used when
-+  * a device wants to inform the rest of the network about some sort of
-+  * reconfiguration such as a failover event or virtual machine
-+  * migration.
-+  */
-+ void netdev_notify_peers(struct net_device *dev)
-+ {
-+ 	rtnl_lock();
-+ 	__netdev_notify_peers(dev);
-+ 	rtnl_unlock();
++@@ -1632,18 +1632,90 @@
 + }
 + EXPORT_SYMBOL(netdev_notify_peers);
 + 
+++/* Optional NAPI thread names stay outside struct napi_struct, so that its
+++ * layout matches the official kernel headers that modules from the official
+++ * package feeds are built against. Every user runs in process context.
+++ */
+++struct napi_thread_name {
+++	struct hlist_node node;
+++	const struct napi_struct *napi;
+++	char name[IFNAMSIZ];
+++};
+++
+++static DEFINE_HASHTABLE(napi_thread_names, 6);
+++static DEFINE_SPINLOCK(napi_thread_names_lock);
+++
+++static struct napi_thread_name *
+++napi_thread_name_find(const struct napi_struct *napi)
+++{
+++	struct napi_thread_name *entry;
+++
+++	hash_for_each_possible(napi_thread_names, entry, node,
+++			       (unsigned long)napi)
+++		if (entry->napi == napi)
+++			return entry;
+++
+++	return NULL;
+++}
+++
+++/* Record @name for @napi; NULL or an empty name drops a stale entry. */
+++static void napi_thread_name_set(const struct napi_struct *napi,
+++				 const char *name)
+++{
+++	struct napi_thread_name *entry, *new = NULL;
+++
+++	if (name && *name) {
+++		/* Without memory the thread keeps its default name. */
+++		new = kzalloc(sizeof(*new), GFP_KERNEL);
+++		if (new) {
+++			new->napi = napi;
+++			strscpy(new->name, name, sizeof(new->name));
+++		}
+++	}
+++
+++	spin_lock(&napi_thread_names_lock);
+++	entry = napi_thread_name_find(napi);
+++	if (entry)
+++		hash_del(&entry->node);
+++	if (new)
+++		hash_add(napi_thread_names, &new->node, (unsigned long)napi);
+++	spin_unlock(&napi_thread_names_lock);
+++	kfree(entry);
+++}
+++
+++static bool napi_thread_name_get(const struct napi_struct *napi,
+++				 char name[IFNAMSIZ])
+++{
+++	struct napi_thread_name *entry;
+++	bool found = false;
+++
+++	spin_lock(&napi_thread_names_lock);
+++	entry = napi_thread_name_find(napi);
+++	if (entry) {
+++		memcpy(name, entry->name, IFNAMSIZ);
+++		found = true;
+++	}
+++	spin_unlock(&napi_thread_names_lock);
+++
+++	return found;
+++}
+++
 + static int napi_threaded_poll(void *data);
 + 
 + static int napi_kthread_create(struct napi_struct *n)
 + {
+++	char name[IFNAMSIZ];
 + 	int err = 0;
 + 
 + 	/* Create and wake up the kthread once to put it in
@@ -100,73 +150,15 @@ new file mode 100644
 + 	 */
 +-	n->thread = kthread_run(napi_threaded_poll, n, "napi/%s-%d",
 +-				n->dev->name, n->napi_id);
-++	if (n->thread_name[0])
-++		n->thread = kthread_run(napi_threaded_poll, n, "%s", n->thread_name);
+++	if (napi_thread_name_get(n, name))
+++		n->thread = kthread_run(napi_threaded_poll, n, "%s", name);
 ++	else
 ++		n->thread = kthread_run(napi_threaded_poll, n, "napi/%s-%d",
 ++					n->dev->name, n->napi_id);
 + 	if (IS_ERR(n->thread)) {
 + 		err = PTR_ERR(n->thread);
 + 		pr_err("kthread_run failed with err %d\n", err);
-+ 		n->thread = NULL;
-+ 	}
-+ 
-+ 	return err;
-+ }
-+ 
-+ static int __dev_open(struct net_device *dev, struct netlink_ext_ack *extack)
-+ {
-+ 	const struct net_device_ops *ops = dev->netdev_ops;
-+ 	int ret;
-+ 
-+ 	ASSERT_RTNL();
-+ 	dev_addr_check(dev);
-+ 
-+ 	if (!netif_device_present(dev)) {
-+ 		/* may be detached because parent is runtime-suspended */
-+ 		if (dev->dev.parent)
-+ 			pm_runtime_resume(dev->dev.parent);
-+ 		if (!netif_device_present(dev))
-+ 			return -ENODEV;
-+ 	}
-+ 
-+ 	/* Block netpoll from trying to do any rx path servicing.
-+ 	 * If we don't do this there is a chance ndo_poll_controller
-+ 	 * or ndo_poll may be running while we open the device
-+ 	 */
-+ 	netpoll_poll_disable(dev);
-+ 
-+ 	ret = call_netdevice_notifiers_extack(NETDEV_PRE_UP, dev, extack);
-+@@ -7444,107 +7447,117 @@
-+ 	list_for_each_entry(pos, &dev->napi_list, dev_list) {
-+ 		if (napi_id_valid(pos->napi_id))
-+ 			pos_id = pos->napi_id;
-+ 		else if (pos->config)
-+ 			pos_id = pos->config->napi_id;
-+ 		else
-+ 			pos_id = UINT_MAX;
-+ 
-+ 		if (pos_id <= new_id)
-+ 			break;
-+ 		higher = &pos->dev_list;
-+ 	}
-+ 	list_add_rcu(&napi->dev_list, higher); /* adds after higher */
-+ }
-+ 
-+ /* Double check that napi_get_frags() allocates skbs with
-+  * skb->head being backed by slab, not a page fragment.
-+  * This is to make sure bug fixed in 3226b158e67c
-+  * ("net: avoid 32 x truesize under-estimation for tiny skbs")
-+  * does not accidentally come back.
-+  */
-+ static void napi_get_frags_check(struct napi_struct *napi)
-+ {
-+ 	struct sk_buff *skb;
-+ 
-+ 	local_bh_disable();
-+ 	skb = napi_get_frags(napi);
-+ 	WARN_ON_ONCE(skb && skb->head_frag);
-+ 	napi_free_frags(napi);
++@@ -7466,15 +7538,16 @@
 + 	local_bh_enable();
 + }
 + 
@@ -183,42 +175,14 @@ new file mode 100644
 + 	if (WARN_ON(test_and_set_bit(NAPI_STATE_LISTED, &napi->state)))
 + 		return;
 + 
-++	strscpy(napi->thread_name, name ?: "", sizeof(napi->thread_name));
+++	napi_thread_name_set(napi, name);
 + 	INIT_LIST_HEAD(&napi->poll_list);
 + 	INIT_HLIST_NODE(&napi->napi_hash_node);
 + 	hrtimer_setup(&napi->timer, napi_watchdog, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
-+ 	gro_init(&napi->gro);
-+ 	napi->skb = NULL;
-+ 	napi->poll = poll;
-+ 	if (weight > NAPI_POLL_WEIGHT)
-+ 		netdev_err_once(dev, "%s() called with weight %d\n", __func__,
-+ 				weight);
-+ 	napi->weight = weight;
-+ 	napi->dev = dev;
-+ #ifdef CONFIG_NETPOLL
-+ 	napi->poll_owner = -1;
-+ #endif
-+ 	napi->list_owner = -1;
-+ 	set_bit(NAPI_STATE_SCHED, &napi->state);
-+ 	set_bit(NAPI_STATE_NPSVC, &napi->state);
-+ 	netif_napi_dev_list_add(dev, napi);
-+ 
-+ 	/* default settings from sysfs are applied to all NAPIs. any per-NAPI
-+ 	 * configuration will be loaded in napi_enable
-+ 	 */
-+ 	napi_set_defer_hard_irqs(napi, READ_ONCE(dev->napi_defer_hard_irqs));
-+ 	napi_set_gro_flush_timeout(napi, READ_ONCE(dev->gro_flush_timeout));
-+ 
-+ 	napi_get_frags_check(napi);
-+ 	/* Create kthread for this napi if dev->threaded is set.
-+ 	 * Clear dev->threaded if kthread creation failed so that
-+ 	 * threaded mode will not be enabled in napi_enable().
-+ 	 */
-+ 	if (napi_get_threaded_config(dev, napi))
-+ 		if (napi_kthread_create(napi))
++@@ -7510,6 +7583,15 @@
 + 			dev->threaded = NETDEV_NAPI_THREADED_DISABLED;
 + 	netif_napi_set_irq_locked(napi, -1);
-++}
++ }
 ++EXPORT_SYMBOL_GPL(netif_napi_add_weight_named_locked);
 ++
 ++void netif_napi_add_weight_locked(struct net_device *dev,
@@ -227,42 +191,23 @@ new file mode 100644
 ++				  int weight)
 ++{
 ++	netif_napi_add_weight_named_locked(dev, napi, poll, weight, NULL);
-+ }
+++}
 + EXPORT_SYMBOL(netif_napi_add_weight_locked);
 + 
 + void napi_disable_locked(struct napi_struct *n)
-+ {
-+ 	unsigned long val, new;
++@@ -7602,6 +7684,8 @@
++ 	if (!test_and_clear_bit(NAPI_STATE_LISTED, &napi->state))
++ 		return;
 + 
-+ 	might_sleep();
-+ 	netdev_assert_locked(n->dev);
+++	napi_thread_name_set(napi, NULL);
+++
++ 	/* Make sure NAPI is disabled (or was never enabled). */
++ 	WARN_ON(!test_bit(NAPI_STATE_SCHED, &napi->state));
 + 
-+ 	set_bit(NAPI_STATE_DISABLE, &n->state);
-+ 
-+ 	val = READ_ONCE(n->state);
-+ 	do {
-+ 		while (val & (NAPIF_STATE_SCHED | NAPIF_STATE_NPSVC)) {
-+ 			usleep_range(20, 200);
-+ 			val = READ_ONCE(n->state);
-+ 		}
-+ 
-+ 		new = val | NAPIF_STATE_SCHED | NAPIF_STATE_NPSVC;
-+ 		new &= ~(NAPIF_STATE_THREADED | NAPIF_STATE_PREFER_BUSY_POLL);
-+ 	} while (!try_cmpxchg(&n->state, &val, new));
-+ 
-+ 	hrtimer_cancel(&n->timer);
-+ 
-+ 	if (n->config)
-+ 		napi_save_config(n);
-+ 	else
-+ 		napi_hash_del(n);
-+ 
-+ 	clear_bit(NAPI_STATE_DISABLE, &n->state);
-+ }
 +diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
 +--- a/drivers/net/ethernet/airoha/airoha_eth.c
 ++++ b/drivers/net/ethernet/airoha/airoha_eth.c
-+@@ -1034,6 +1034,23 @@
++@@ -1030,6 +1030,23 @@
 + 	return done;
 + }
 + 
@@ -286,7 +231,7 @@ new file mode 100644
 + static int airoha_qdma_init_rx_queue(struct airoha_queue *q,
 + 				     struct airoha_qdma *qdma, int ndesc)
 + {
-+@@ -1076,7 +1093,7 @@
++@@ -1072,7 +1089,7 @@
 + 
 + 	q->buf_size = lro_q ? pp_params.max_len : pp_params.max_len / 2;
 + 	q->ndesc = ndesc;
@@ -295,7 +240,7 @@ new file mode 100644
 + 
 + 	airoha_qdma_wr(qdma, REG_RX_RING_BASE(qid), dma_addr);
 + 	airoha_qdma_rmw(qdma, REG_RX_RING_SIZE(qid),
-+@@ -1366,8 +1383,8 @@
++@@ -1385,8 +1402,8 @@
 + 	irq_q->size = size;
 + 	irq_q->qdma = qdma;
 + 

@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from urllib.request import urlopen
+import abi_review
 from repositories import repository_url
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -158,6 +159,8 @@ def main():
     args = parser.parse_args()
     builder = os.environ.get("GITHUB_SHA") or git(ROOT, "rev-parse", "HEAD")
     result = compose(args.work, ROOT / "patches/w1700k", builder)
+    # Official kmods install on this firmware only while the kernel keeps the official ABI.
+    abi_review.check(args.work, result["upstream"])
     if args.publish:
         publish(args.work, result, os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"])
     args.manifest.parent.mkdir(parents=True, exist_ok=True)

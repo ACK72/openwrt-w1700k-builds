@@ -1,0 +1,88 @@
+{
+  "description": "Reviewed kernel ABI differences between the source stack and the official OpenWrt tree. scripts/abi_review.py stops the source composition on any difference without an entry here; see docs/kmod-compatibility.md.",
+  "reviewed": [
+    {
+      "patch": "target/linux/generic/backport-6.18/602-v7.3-net-pass-net_device_path_ctx-to-dev_fill_forward_path.patch",
+      "change": "added",
+      "fingerprint": "4f901a00b33d4aab7bddfb5dc3d6f6375a743332f09f5e5556d8bca6555a06f7",
+      "verdict": "mitigated",
+      "reason": "Changes the exported dev_fill_forward_path() from (dev, daddr, stack) to (ctx, stack); xt_FLOWOFFLOAD in the official kmod-ipt-offload calls the 6.18 form. Series patch 0023 restores the official symbol and moves the in-tree callers to dev_fill_forward_path_ctx()."
+    },
+    {
+      "patch": "target/linux/airoha/patches-6.18/9999-zzzzzzzz-0023-net-keep-the-official-dev_fill_forward_path-abi.patch",
+      "change": "added",
+      "fingerprint": "baad7b4705942cb3b6dfc687140b74642a105272c273db9640ad9df3f286cb37",
+      "verdict": "compatible",
+      "reason": "Restores the official dev_fill_forward_path() declaration and declares the additional dev_fill_forward_path_ctx() export."
+    },
+    {
+      "patch": "target/linux/airoha/patches-6.18/9999-airoha-name-qdma-napi-threads.patch",
+      "change": "added",
+      "fingerprint": "3d98cc94dfc0ef5c7c15e524ff8f8103a5f637e73e452b93d64030a0ea3897e9",
+      "verdict": "compatible",
+      "reason": "Declares netif_napi_add_weight_named(_locked) only. struct napi_struct keeps the official layout; names live in a net/core table and default registration does not touch NAPI memory."
+    },
+    {
+      "patch": "target/linux/generic/backport-6.18/603-v7.3-netfilter-flowtable-tear-down-stale-dst-from-GC.patch",
+      "change": "added",
+      "fingerprint": "32b5a798513e8ff2d962d9b754a286017a51d56c97057977156b869d6ae24f05",
+      "verdict": "compatible",
+      "reason": "Adds the static inline nf_flow_dst_check(); no structure layout or exported interface changes."
+    },
+    {
+      "patch": "target/linux/generic/hack-6.18/672-net-core-raise-rmem-default.patch",
+      "change": "added",
+      "fingerprint": "8109c22a3e68962430cb1a3b1b8a75fa0c611c1cc73ac593ec79ba64f0fb5e39",
+      "verdict": "compatible",
+      "reason": "Raises the SK_RMEM_DEFAULT default value; no structure layout or interface change."
+    },
+    {
+      "patch": "target/linux/generic/pending-6.18/675-01-net-forward-path-exports-bridge-helper-and-vlan-modes.patch",
+      "change": "added",
+      "fingerprint": "6bc7e9a933851f899657b7e6b6bfc13a6ad03793c0ba442dde045905f61e0f09",
+      "verdict": "compatible",
+      "reason": "Declares the new export br_vlan_get_offload_info_rcu(); existing interfaces are unchanged."
+    },
+    {
+      "patch": "target/linux/generic/pending-6.18/675-03-netfilter-bridge-conntrack-vlan-pppoe-encapsulation.patch",
+      "change": "added",
+      "fingerprint": "9a8614ce755af4094cf6179ec5d30d3abd3580490fdbce553ead58c7d7af9a7b",
+      "verdict": "compatible",
+      "reason": "Appends fields to struct nf_bridge_frag_data. Only nf_conntrack_bridge (kmod-nft-bridge, in the image) reads and writes it; IPv6 passes the pointer through."
+    },
+    {
+      "patch": "target/linux/generic/pending-6.18/675-05-netfilter-nft_flow_offload-bridged-connections-crossing-twice.patch",
+      "change": "added",
+      "fingerprint": "c5910dbdebba40da04190c32d49755c7d13c2ebca7c150f7a41de584f504fc5d",
+      "verdict": "compatible",
+      "reason": "Adds NF_CT_EXT_BRXING before NF_CT_EXT_NUM. Existing IDs keep their values, modules only read ext->offset[id] as filled by the local conntrack core, and NF_CT_EXT_NUM is used only by the header and nf_conntrack_extend.c."
+    },
+    {
+      "patch": "target/linux/airoha/patches-6.18/886-uart-add-en7523-support.patch",
+      "change": "modified",
+      "fingerprint": "2d5c3549d0a38b3ef3ac8481c87bdc9b828ce6294d8bbb0c020932a9d913478a",
+      "verdict": "compatible",
+      "reason": "Replaces the exported en7523_set_uart_baud_rate() with en7523_set_divisor(). Both serve only the built-in 8250 core (CONFIG_SERIAL_8250_AIROHA=y); no official module references them. The uapi additions match the official patch."
+    },
+    {
+      "patch": "target/linux/generic/config-6.18, target/linux/airoha/config-6.18, target/linux/airoha/an7581/config-6.18",
+      "change": "config",
+      "fingerprint": "43875225bb8db009653034873efdd7fbb7dfbce1584133f7eac11c61c224daae",
+      "verdict": "safe failure",
+      "reason": "Sound is not built in and PSTORE is: official sound kmods fail to load with unresolved symbols and official pstore kmods duplicate built-in code. airoha_eth, the NPU and MT7530 are modules instead of built in, and the default cpufreq governor is performance. None changes structures or interfaces that official feed modules use."
+    },
+    {
+      "patch": "configs/w1700k.config",
+      "change": "kernel options",
+      "fingerprint": "76c1a76c162b394daef7970c40987ff8752faf1f0bc4c9f7c8975f6872bf8722",
+      "verdict": "compatible",
+      "reason": "CONFIG_KERNEL_BUILD_DOMAIN and CONFIG_KERNEL_BUILD_USER match the official build; CONFIG_KERNEL_DEVMEM only adds the /dev/mem driver."
+    }
+  ],
+  "official_must_not_contain": [
+    {
+      "text": "+int dev_fill_forward_path(struct net_device_path_ctx *ctx,",
+      "reason": "the official kernel now carries the dev_fill_forward_path() ctx backport; drop series patch 0023 and review 602 again"
+    }
+  ]
+}

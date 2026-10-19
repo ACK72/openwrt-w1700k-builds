@@ -1,0 +1,129 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Mon, 19 Oct 2026 18:00:00 +0900
+Subject: [PATCH] net: keep the official dev_fill_forward_path() ABI
+
+The forward-path backport 602 changes the exported dev_fill_forward_path()
+from (dev, daddr, stack) to (ctx, stack). Modules from the official package
+feeds are built without it; xt_FLOWOFFLOAD in kmod-ipt-offload would pass a
+net_device pointer as the context. Export the backported variant as
+dev_fill_forward_path_ctx(), switch the in-tree callers to it, and keep
+dev_fill_forward_path() with the 6.18 signature and behavior.
+
+scripts/abi_review.py stops the build once the official kernel carries the
+backport itself; drop this patch then.
+
+diff --git a/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0023-net-keep-the-official-dev_fill_forward_path-abi.patch b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0023-net-keep-the-official-dev_fill_forward_path-abi.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0023-net-keep-the-official-dev_fill_forward_path-abi.patch
+@@ -0,0 +1,110 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Mon, 19 Oct 2026 18:00:00 +0900
++Subject: [PATCH] net: keep the official dev_fill_forward_path() ABI
++
++The forward-path backport 602 changes the exported dev_fill_forward_path()
++from (dev, daddr, stack) to (ctx, stack). Modules from the official package
++feeds are built without it; xt_FLOWOFFLOAD in kmod-ipt-offload would pass a
++net_device pointer as the context. Export the backported variant as
++dev_fill_forward_path_ctx(), switch the in-tree callers to it, and keep
++dev_fill_forward_path() with the 6.18 signature and behavior.
++
++diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
++--- a/include/linux/netdevice.h
+++++ b/include/linux/netdevice.h
++@@ -3397,8 +3397,10 @@
++ 
++ int dev_get_iflink(const struct net_device *dev);
++ int dev_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb);
++-int dev_fill_forward_path(struct net_device_path_ctx *ctx,
+++int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
++ 			  struct net_device_path_stack *stack);
+++int dev_fill_forward_path_ctx(struct net_device_path_ctx *ctx,
+++			      struct net_device_path_stack *stack);
++ struct net_device *dev_get_by_name(struct net *net, const char *name);
++ struct net_device *dev_get_by_name_rcu(struct net *net, const char *name);
++ struct net_device *__dev_get_by_name(struct net *net, const char *name);
++diff --git a/net/core/dev.c b/net/core/dev.c
++--- a/net/core/dev.c
+++++ b/net/core/dev.c
++@@ -744,8 +744,8 @@
++ 	return &stack->path[k];
++ }
++ 
++-int dev_fill_forward_path(struct net_device_path_ctx *ctx,
++-			  struct net_device_path_stack *stack)
+++int dev_fill_forward_path_ctx(struct net_device_path_ctx *ctx,
+++			      struct net_device_path_stack *stack)
++ {
++ 	const struct net_device *last_dev;
++ 	struct net_device_path *path;
++@@ -778,6 +778,21 @@
++ 
++ 	return ret;
++ }
+++EXPORT_SYMBOL_GPL(dev_fill_forward_path_ctx);
+++
+++/* The 6.18 interface, still called by modules from the official package
+++ * feeds, which are built without the ctx backport.
+++ */
+++int dev_fill_forward_path(const struct net_device *dev, const u8 *daddr,
+++			  struct net_device_path_stack *stack)
+++{
+++	struct net_device_path_ctx ctx = {
+++		.dev	= dev,
+++	};
+++
+++	memcpy(ctx.daddr, daddr, sizeof(ctx.daddr));
+++	return dev_fill_forward_path_ctx(&ctx, stack);
+++}
++ EXPORT_SYMBOL_GPL(dev_fill_forward_path);
++ 
++ /* must be called under rcu_read_lock(), as we dont take a reference */
++diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
++--- a/drivers/net/ethernet/airoha/airoha_ppe.c
+++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
++@@ -304,7 +304,7 @@
++ 	ether_addr_copy(ctx.daddr, addr);
++ 
++ 	rcu_read_lock();
++-	err = dev_fill_forward_path(&ctx, &stack);
+++	err = dev_fill_forward_path_ctx(&ctx, &stack);
++ 	rcu_read_unlock();
++ 	if (err)
++ 		return err;
++diff --git a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++--- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+++++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++@@ -108,7 +108,7 @@
++ 	ether_addr_copy(ctx.daddr, addr);
++ 
++ 	rcu_read_lock();
++-	err = dev_fill_forward_path(&ctx, &stack);
+++	err = dev_fill_forward_path_ctx(&ctx, &stack);
++ 	rcu_read_unlock();
++ 	if (err)
++ 		return err;
++diff --git a/net/netfilter/nf_flow_table_path.c b/net/netfilter/nf_flow_table_path.c
++--- a/net/netfilter/nf_flow_table_path.c
+++++ b/net/netfilter/nf_flow_table_path.c
++@@ -78,7 +78,7 @@
++ 
++ out:
++ 	ether_addr_copy(ctx->daddr, ha);
++-	return dev_fill_forward_path(ctx, stack);
+++	return dev_fill_forward_path_ctx(ctx, stack);
++ }
++ 
++ struct nft_forward_info {
++diff --git a/net/netfilter/xt_FLOWOFFLOAD.c b/net/netfilter/xt_FLOWOFFLOAD.c
++--- a/net/netfilter/xt_FLOWOFFLOAD.c
+++++ b/net/netfilter/xt_FLOWOFFLOAD.c
++@@ -388,7 +388,7 @@
++ out:
++ 	ether_addr_copy(ctx.daddr, ha);
++ 
++-	return dev_fill_forward_path(&ctx, stack);
+++	return dev_fill_forward_path_ctx(&ctx, stack);
++ }
++ 
++ static void nf_dev_forward_path(struct nf_flow_route *route,
