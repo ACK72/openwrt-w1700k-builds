@@ -39,14 +39,15 @@ invalidation/ACK and coherent-memory ordering contract; software fault tests
 do not establish hardware pipeline timing. IPv4 inline MAC handling and bridge
 subflows that preserve the original source MAC retain their existing behavior.
 
-Hardware GRO is a QDMA-wide engine. The current base no longer enables it by
-default or shares it between interfaces: a second interface on the same QDMA
-cannot open while it is enabled. The engine is disabled when the last
-interface on its QDMA closes. Zero or oversized aggregate counts and empty
-TCP payloads are rejected before an aggregate SKB is allocated.
+Hardware LRO comes from the upstream backport (airoha 194) and is a QDMA-wide
+engine. It is off by default and can be enabled per interface with ethtool. A
+second interface on the same QDMA cannot open while it is enabled, and closing
+the interface or disabling LRO on it turns the engine off. Aggregates with
+too many segments or no TCP payload are dropped and counted as RX drops; a
+segment count of zero or one is delivered as an ordinary packet.
 
-These adaptations derive from Gilly's 039/046, 972/973 and selected 975/977
-ideas, with source links and contributor attribution in their build patches.
+These adaptations derive from Gilly's 039/046 and 972/973 ideas, with source
+links and contributor attribution in their build patches.
 See the [pinned source patch collection](https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches).
 
 ## Guarded forwarding and control paths
@@ -72,9 +73,10 @@ completion status. Sleepable initialization retries retain their 10 ms minimum
 settling interval while yielding the CPU. This reduces busy waiting, not the
 required settling time. The atomic PPE mailbox protocol is unchanged.
 
-TRTCM configuration returns success only after matching readback. Read failure
-and exhausted mismatch retries return errors; a successful checked read no
-longer performs a second DONE poll or reads an unused high word.
+TRTCM configuration follows the upstream backport (airoha 187): each write
+waits for completion and succeeds only after a matching readback of the low
+word. A timed-out write, failed read or mismatch is retried once more; after
+that the configuration fails with -EBUSY.
 
 Power-table construction reuses temporary memory after the acknowledged rate
 upload. Both table uploads, regulatory/SAR/board limits and recalculation remain

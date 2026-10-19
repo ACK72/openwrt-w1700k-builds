@@ -5,15 +5,16 @@ Subject: [PATCH] airoha: reduce guarded L2, mailbox and initialization overhead
 Resolve ingress metadata only for L2 fallback; retain the collision
 window and checked flow removal. Omit unused WLAN SET reply copies. Sleep
 between sleepable initialization retries while retaining the minimum wait
-and retry limit. Avoid redundant TRTCM DONE polling and unused high-word
-reads after checked readback; propagate read errors and exhausted mismatch
-retries. Atomic PPE mailbox locking and timeout behavior are unchanged.
+and retry limit. Atomic PPE mailbox locking and timeout behavior are
+unchanged. The TRTCM readback change this patch carried before is upstream
+as airoha 187 ("net: airoha: Add retry mechanism to
+airoha_qdma_set_trtcm_param()").
 
-diff --git a/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0019-airoha-reduce-guarded-control-path-overhead.patch b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0019-airoha-reduce-guarded-control-path-overhead.patch
+diff --git a/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0018-airoha-reduce-guarded-control-path-overhead.patch b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0018-airoha-reduce-guarded-control-path-overhead.patch
 new file mode 100644
 --- /dev/null
-+++ b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0019-airoha-reduce-guarded-control-path-overhead.patch
-@@ -0,0 +1,146 @@
++++ b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0018-airoha-reduce-guarded-control-path-overhead.patch
+@@ -0,0 +1,97 @@
 +From: ACK72 <acikom72@gmail.com>
 +Date: Mon, 28 Sep 2026 22:32:48 +0900
 +Subject: [PATCH] airoha: reduce guarded L2, mailbox and initialization overhead
@@ -21,9 +22,10 @@ new file mode 100644
 +Resolve ingress metadata only for L2 fallback; retain the collision
 +window and checked flow removal. Omit unused WLAN SET reply copies. Sleep
 +between sleepable initialization retries while retaining the minimum wait
-+and retry limit. Avoid redundant TRTCM DONE polling and unused high-word
-+reads after checked readback; propagate read errors and exhausted mismatch
-+retries. Atomic PPE mailbox locking and timeout behavior are unchanged.
++and retry limit. Atomic PPE mailbox locking and timeout behavior are
++unchanged. The TRTCM readback change this patch carried before is upstream
++as airoha 187 ("net: airoha: Add retry mechanism to
++airoha_qdma_set_trtcm_param()").
 +
 +--- a/drivers/net/ethernet/airoha/airoha_ppe.c
 ++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
@@ -110,53 +112,3 @@ new file mode 100644
 + static int airoha_npu_wlan_init_memory(struct airoha_npu *npu)
 + {
 + 	enum airoha_npu_wlan_set_cmd cmd = WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU;
-+--- a/drivers/net/ethernet/airoha/airoha_eth.c
-++++ b/drivers/net/ethernet/airoha/airoha_eth.c
-+@@ -3113,39 +3113,38 @@
-+ 
-+ 	return 0;
-+ }
-+ 
-+ static int airoha_qdma_set_trtcm_param(struct airoha_qdma *qdma, int channel,
-+ 				       u32 addr, enum trtcm_param_type param,
-+ 				       enum trtcm_mode_type mode, u32 val)
-+ {
-+-	u32 value_lo = 0, value_hi = 0;
-+-	int retry_num = 100;
-++	u32 value_lo;
-++	int ret, retry_num = 100;
-+ 	u32 idx = QDMA_METER_IDX(channel), group = QDMA_METER_GROUP(channel);
-+ 	u32 config = TRTCM_PARAM_RW_MASK |
-+ 		     FIELD_PREP(TRTCM_PARAM_TYPE_MASK, param) |
-+ 		     FIELD_PREP(TRTCM_METER_GROUP_MASK, group) |
-+ 		     FIELD_PREP(TRTCM_PARAM_INDEX_MASK, idx) |
-+ 		     FIELD_PREP(TRTCM_PARAM_RATE_TYPE_MASK, mode);
-+ 
-+ 	do {
-+ 		airoha_qdma_wr(qdma, REG_TRTCM_DATA_LOW(addr), val);
-+ 		wmb();
-+ 		airoha_qdma_wr(qdma, REG_TRTCM_CFG_PARAM(addr), config);
-+-		airoha_qdma_get_trtcm_param(qdma, channel, addr, param, mode,
-+-					    &value_lo, &value_hi);
-++		ret = airoha_qdma_get_trtcm_param(qdma, channel, addr, param,
-++						 mode, &value_lo, NULL);
-++		if (ret)
-++			return ret;
-+ 		if (val == value_lo)
-+-			break;
-++			return 0;
-+ 	} while (--retry_num);
-+ 
-+-	return read_poll_timeout(airoha_qdma_rr, val,
-+-				 val & TRTCM_PARAM_RW_DONE_MASK,
-+-				 USEC_PER_MSEC, 10 * USEC_PER_MSEC, true,
-+-				 qdma, REG_TRTCM_CFG_PARAM(addr));
-++	return -EIO;
-+ }
-+ 
-+ static int airoha_qdma_set_trtcm_config(struct airoha_qdma *qdma, int channel,
-+ 					u32 addr, enum trtcm_mode_type mode,
-+ 					bool enable, u32 enable_mask)
-+ {
-+ 	u32 val;
-+ 

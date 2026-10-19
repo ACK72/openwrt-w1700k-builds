@@ -58,8 +58,8 @@
       "selected": [
         "026 (upstream in mt76 56c8b4a4b407; AIR_TIME sizing kept)",
         "044 (upstream in mt76 d17b8d5eff29)",
-        "949",
-        "957 (adapted: BQL is no longer reset in ndo_stop, as in mainline)",
+        "949 (upstream in airoha 185)",
+        "957 (upstream in airoha 188)",
         "980"
       ],
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed"
@@ -124,41 +124,32 @@
       ]
     },
     {
-      "file": "0017-airoha-harden-shared-qdma-gro-lifecycle.patch",
-      "description": "GRO aggregate checks and last-close engine disable; the fanboy base no longer shares HW GRO between QDMA users.",
-      "selected": [
-        "975/977 (shared-QDMA adaptation)"
-      ],
-      "source": "Gilly1970/Gemtek-W1700K-6.18@4b8fb8c3a2619dd239fb44fd511ee2848a07e768",
-      "author": "ACK72 <acikom72@gmail.com>"
-    },
-    {
-      "file": "0018-wifi-reduce-mmio-and-power-table-overhead.patch",
+      "file": "0017-wifi-reduce-mmio-and-power-table-overhead.patch",
       "description": "wifi: reduce MMIO lookup and power-table preparation overhead",
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0019-airoha-reduce-guarded-control-path-overhead.patch",
-      "description": "airoha: reduce guarded L2, mailbox and initialization overhead",
+      "file": "0018-airoha-reduce-guarded-control-path-overhead.patch",
+      "description": "airoha: reduce guarded L2, mailbox and initialization overhead; the TRTCM readback change is upstream in airoha 187",
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0020-wifi-count-only-final-tx-failures.patch",
+      "file": "0019-wifi-count-only-final-tx-failures.patch",
       "description": "wifi: report frames lost after all retries as tx_failed, not every failed attempt",
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0021-build-extract-git-archives-with-the-umask.patch",
+      "file": "0020-build-extract-git-archives-with-the-umask.patch",
       "description": "build: pack git sources as root with the same modes as unprivileged builds, matching PKG_MIRROR_HASH",
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0022-wifi-raise-sta-beacon-loss-threshold.patch",
+      "file": "0021-wifi-raise-sta-beacon-loss-threshold.patch",
       "description": "wifi: wait 20 beacon intervals (about 2.2 s) before reporting STA beacon loss, so short AP beacon gaps no longer disconnect the uplink",
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0023-kernel-drop-the-6.12-guards-from-netfilter-kmods.patch",
+      "file": "0022-kernel-drop-the-6.12-guards-from-netfilter-kmods.patch",
       "description": "kernel: drop the LINUX_6_12 guards of the netfilter kmods, which make dnsmasq-full depend on its own ipset and nftset options once no target defines LINUX_6_12; drop this patch when upstream PR 25965 lands",
       "source": "openwrt/openwrt#25965 (netfilter.mk only; CONFIG_NF_FLOW_TABLE_HW kept)",
       "author": "ACK72 <acikom72@gmail.com>"

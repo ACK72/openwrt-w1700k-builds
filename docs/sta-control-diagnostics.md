@@ -18,7 +18,7 @@ provisional; they do not by themselves prove CPU contention or a stalled queue.
 
 ## Beacon-loss threshold
 
-Patch `0022` makes the STA beacon monitor wait 20 beacon intervals instead of 7
+Patch `0021` makes the STA beacon monitor wait 20 beacon intervals instead of 7
 before it reports beacon loss, about 2.2 s instead of 0.77 s at 100 TU. Some
 upstream APs skip beacons for one to two seconds while still serving the
 station; with 7 intervals each such gap became a local reason 4 disconnect.
