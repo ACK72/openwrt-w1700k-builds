@@ -13,7 +13,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 BASE = "https://downloads.openwrt.org/snapshots/targets/airoha/an7581/"
-IMAGE = "openwrt-airoha-an7581-airoha_an7581-evb-squashfs-sysupgrade.bin"
+IMAGE = "openwrt-airoha-an7581-airoha_an7581-evb-multievb-squashfs-sysupgrade.bin"
 FEEDS = "etc/apk/repositories.d/distfeeds.list"
 VERMAGIC = "etc/vermagic.txt"
 FILES = {"distfeeds.list": FEEDS, "vermagic.txt": VERMAGIC}
@@ -43,7 +43,7 @@ def resolve(path):
     profiles = json.loads(fetch(BASE + "profiles.json", 1024 * 1024))
     if profiles.get("target") != "airoha/an7581":
         raise ValueError("Unexpected official image target")
-    images = profiles.get("profiles", {}).get("airoha_an7581-evb", {}).get("images", [])
+    images = profiles.get("profiles", {}).get("airoha_an7581-evb-multievb", {}).get("images", [])
     matches = [item for item in images if item.get("name") == IMAGE
                and item.get("type") == "sysupgrade" and item.get("filesystem") == "squashfs"]
     if len(matches) != 1 or not re.fullmatch(r"[a-f0-9]{64}", matches[0].get("sha256", "")):
