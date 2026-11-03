@@ -147,11 +147,6 @@
       "file": "0021-wifi-raise-sta-beacon-loss-threshold.patch",
       "description": "wifi: wait 20 beacon intervals (about 2.2 s) before reporting STA beacon loss, so short AP beacon gaps no longer disconnect the uplink",
       "author": "ACK72 <acikom72@gmail.com>"
-    },
-    {
-      "file": "0023-net-keep-the-official-dev_fill_forward_path-abi.patch",
-      "description": "net: keep dev_fill_forward_path() with the official 6.18 signature for modules from the official feeds and export the backported ctx variant as dev_fill_forward_path_ctx(); drop it once the official kernel carries the 602 backport",
-      "author": "ACK72 <acikom72@gmail.com>"
     }
   ]
 }

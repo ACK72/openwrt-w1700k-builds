@@ -19,17 +19,13 @@ difference with its verdict and reason. In short:
 
 | Difference | Verdict |
 | --- | --- |
-| Backport 602 changes the exported `dev_fill_forward_path()` signature | Mitigated: series patch 0023 restores the official symbol; in-tree callers use `dev_fill_forward_path_ctx()` |
 | Patch 0012 names QDMA NAPI threads | Compatible: names live in a net/core table, `struct napi_struct` keeps the official layout |
 | 603, 672, 675-01, 675-03, 675-05, 886 (fanboy) | Compatible: no layout or exported interface used by official modules changes |
-| Kernel configuration (fanboy) | Safe failure only: official sound and pstore kmods do not load |
+| Kernel configuration (fanboy) | Safe failure only: official pstore kmods do not load |
 | Profile kernel options | Compatible |
 
 Official kmods that cannot work on this firmware:
 
-- **Sound** (`kmod-sound-*`, `kmod-usb-audio`): the official kernel has sound
-  built in, this one does not. The modules fail to load with unresolved
-  symbols.
 - **pstore/ramoops**: built into this kernel.
 - **mt76 drivers other than mt7996** (for example `kmod-mt7921e` or
   `kmod-mt7915e`): fanboy builds mt76 from a different revision than the
@@ -53,10 +49,10 @@ For each reported change:
 2. Decide whether a module from the official feeds can use it. Built-in code
    and modules shipped in the image are not affected.
 3. If an official module can, change the patch so that the official interface
-   stays, as 0023 does for 602.
+   stays.
 4. Add the printed entry to `patches/abi-review.json` with the verdict and the
    reason, and remove entries that the script reports as no longer present.
 
-The review also stops when the official tree carries the `dev_fill_forward_path()`
-ctx backport itself. Drop series patch 0023 then, since official modules would
-use the new signature.
+Entries in `official_must_not_contain` stop the review when the official tree
+gains the given line, for example to drop a compatibility patch once the
+official kernel carries the change it works around.
