@@ -7,9 +7,9 @@ Subject: [PATCH 2/4] wifi: add mt76 patches to improve 6 GHz EHT320
 (cherry picked from commit 53b15a77b543864e4b289b5952d5eaaa28d5447a)
 ---
  ...vertise-eht-to-firmware-rate-control.patch | 32 +++++++++++++
- ...-fill-160mhz-bf-fallback-for-eht-320.patch | 48 +++++++++++++++++++
+ ...-fill-160mhz-bf-fallback-for-eht-320.patch | 49 ++++++++++++++++++++
  ...ep-NPU-RRO-data-on-original-RX-queue.patch | 30 ++++++++++++
- 3 files changed, 110 insertions(+)
+ 3 files changed, 111 insertions(+)
  create mode 100644 package/kernel/mt76/patches/9990-wifi-mt76-mt7996-advertise-eht-to-firmware-rate-control.patch
  create mode 100644 package/kernel/mt76/patches/9991-wifi-mt76-mt7996-fill-160mhz-bf-fallback-for-eht-320.patch
  create mode 100644 package/kernel/mt76/patches/9992-wifi-mt76-keep-NPU-RRO-data-on-original-RX-queue.patch
@@ -57,7 +57,7 @@ new file mode 100644
 index 0000000000..4b48b39ca9
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9991-wifi-mt76-mt7996-fill-160mhz-bf-fallback-for-eht-320.patch
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,49 @@
 +From: Jihong Min <hurryman2212@gmail.com>
 +Subject: [PATCH] wifi: mt76: mt7996: fill 160 MHz BF fallback for EHT 320
 +
@@ -73,13 +73,14 @@ index 0000000000..4b48b39ca9
 +
 +Assisted-by: Codex:gpt-5.5
 +Signed-off-by: Jihong Min <hurryman2212@gmail.com>
++[ACK72: clamp the 160 MHz NSS like mt76 d2712ce4 does for the other widths]
 +---
 + mt7996/mcu.c | 13 +++++++++++--
 + 1 file changed, 11 insertions(+), 2 deletions(-)
 +
 +--- a/mt7996/mcu.c
 ++++ b/mt7996/mcu.c
-+@@ -2294,6 +2294,15 @@ mt7996_mcu_sta_bfer_eht(struct ieee80211
++@@ -2415,6 +2415,15 @@ mt7996_mcu_sta_bfer_eht(struct ieee80211
 + 		bf->ncol_gt_bw80 = nss_mcs;
 + 		break;
 + 	case IEEE80211_STA_RX_BW_320:
@@ -88,16 +89,16 @@ index 0000000000..4b48b39ca9
 ++					  ve->phy_cap_info[2]),
 ++			      EHT_PHY(CAP1_BEAMFORMEE_SS_160MHZ_MASK,
 ++				      pe->phy_cap_info[1]));
-++		bf->ncol_gt_bw80 =
-++			u8_get_bits(eht_nss->bw._160.rx_tx_mcs9_max_nss,
-++				    IEEE80211_EHT_MCS_NSS_RX) - 1;
+++		nss_mcs = u8_get_bits(eht_nss->bw._160.rx_tx_mcs9_max_nss,
+++				      IEEE80211_EHT_MCS_NSS_RX);
+++		bf->ncol_gt_bw80 = nss_mcs ? nss_mcs - 1 : 0;
 ++
 + 		snd_dim = EHT_PHY(CAP2_SOUNDING_DIM_320MHZ_MASK, ve->phy_cap_info[2]) +
 + 			  (EHT_PHY(CAP3_SOUNDING_DIM_320MHZ_MASK,
 + 				   ve->phy_cap_info[3]) << 1);
-+@@ -2301,8 +2310,8 @@ mt7996_mcu_sta_bfer_eht(struct ieee80211
-+ 		nss_mcs = u8_get_bits(eht_nss->bw._320.rx_tx_mcs9_max_nss,
-+ 				      IEEE80211_EHT_MCS_NSS_RX) - 1;
++@@ -2423,8 +2432,8 @@ mt7996_mcu_sta_bfer_eht(struct ieee80211
++ 				      IEEE80211_EHT_MCS_NSS_RX);
++ 		nss_mcs = nss_mcs ? nss_mcs - 1 : 0;
 + 
 +-		bf->nrow_gt_bw80 = min_t(u8, snd_dim, sts) << 4;
 +-		bf->ncol_gt_bw80 = nss_mcs << 4;

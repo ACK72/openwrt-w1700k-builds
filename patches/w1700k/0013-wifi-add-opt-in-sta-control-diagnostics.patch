@@ -13,7 +13,7 @@ diff --git a/package/kernel/mt76/patches/9999-zz-sta-control-diagnostics.patch b
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-zz-sta-control-diagnostics.patch
-@@ -0,0 +1,1102 @@
+@@ -0,0 +1,1114 @@
 +From: ACK72 <acikom72@gmail.com>
 +Date: Mon, 28 Sep 2026 22:56:33 +0900
 +Subject: [PATCH] wifi: add opt-in station diagnostics with accepted NAPI timing
@@ -27,6 +27,10 @@ new file mode 100644
 +
 +Rebased onto mt76 2026-10-28: beacon loss events use the interval that the
 +beacon monitor loads once.
++
++The TX classifier reads the 802.11 header only of frames that have one:
++802.3 frames from encapsulation offload are recorded only as EAPOL, with
++fc 0.
 +
 +diff --git a/Makefile b/Makefile
 +index 4ba96d1..dcb1ca2 100644
@@ -601,7 +605,7 @@ new file mode 100644
 + 	int rdd_idx = mt7996_get_rdd_idx(phy, false);
 + 
 +diff --git a/mt7996/main.c b/mt7996/main.c
-+index 297ca8a..58e70f9 100644
++index d1d4211..eb178af 100644
 +--- a/mt7996/main.c
 ++++ b/mt7996/main.c
 +@@ -2111,24 +2111,27 @@ mt7996_sta_pre_rcu_remove(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
@@ -632,7 +636,7 @@ new file mode 100644
 + 	    new_state == IEEE80211_STA_ASSOC) {
 + 		struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
 + 
-+@@ -2236,24 +2239,34 @@ static void mt7996_tx(struct ieee80211_hw *hw,
++@@ -2236,24 +2239,42 @@ static void mt7996_tx(struct ieee80211_hw *hw,
 + 	if (!mphy) {
 + 		ieee80211_free_txskb(hw, skb);
 + 		goto unlock;
@@ -645,16 +649,24 @@ new file mode 100644
 + 		if (msta_link)
 + 			wcid = &msta_link->wcid;
 + 	}
-++	if (unlikely(READ_ONCE(mphy->dev->sta_diag.enabled)) &&
-++	    (ieee80211_is_auth(hdr->frame_control) ||
-++	    ieee80211_is_assoc_req(hdr->frame_control) ||
-++	    ieee80211_is_reassoc_req(hdr->frame_control) ||
-++	    ieee80211_is_deauth(hdr->frame_control) ||
-++	    ieee80211_is_disassoc(hdr->frame_control) ||
-++	    skb->protocol == cpu_to_be16(ETH_P_PAE)))
-++		mt76_sta_diag_event(mphy->dev, MT76_DIAG_CTRL_TX, mphy->band_idx,
-++			0, le16_to_cpu(hdr->frame_control), link_id,
-++			skb->protocol == cpu_to_be16(ETH_P_PAE), 0);
+++	if (unlikely(READ_ONCE(mphy->dev->sta_diag.enabled))) {
+++		/* 802.3 frames start with the destination address, not an
+++		 * 802.11 header: only EAPOL is recognised, with fc 0
+++		 */
+++		bool encap = info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP;
+++		bool eapol = skb->protocol == cpu_to_be16(ETH_P_PAE);
+++
+++		if (eapol || (!encap &&
+++			      (ieee80211_is_auth(hdr->frame_control) ||
+++			       ieee80211_is_assoc_req(hdr->frame_control) ||
+++			       ieee80211_is_reassoc_req(hdr->frame_control) ||
+++			       ieee80211_is_deauth(hdr->frame_control) ||
+++			       ieee80211_is_disassoc(hdr->frame_control))))
+++			mt76_sta_diag_event(mphy->dev, MT76_DIAG_CTRL_TX,
+++				mphy->band_idx, 0,
+++				encap ? 0 : le16_to_cpu(hdr->frame_control),
+++				link_id, eapol, 0);
+++	}
 + 	mt76_tx(mphy, control->sta, mt7996_get_tx_wcid(wcid), skb);
 + unlock:
 + 	rcu_read_unlock();

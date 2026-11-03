@@ -5,7 +5,7 @@ diff --git a/package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch b/
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch
-@@ -0,0 +1,4554 @@
+@@ -0,0 +1,4571 @@
 +From: ACK72 <ACK72@users.noreply.github.com>
 +Subject: [PATCH] mt76: complete channel operations and fail closed on recovery errors
 +
@@ -35,9 +35,15 @@ new file mode 100644
 +Only the failure warning remains in change_chanctx, and the beacon loss
 +diagnostics use the loaded interval.
 +
++A failed return to the operating channel at the end of a scan or ROC
++clears the off-channel flag, which nothing else would clear and which
++gates TX on the band, and still ends the off-channel period for associated
++stations. mt7996_set_channel re-arms mac_work after any channel set outside
++MCU recovery, as upstream does.
++
 +--- a/channel.c
 ++++ b/channel.c
-+@@ -1,433 +1,456 @@
++@@ -1,433 +1,461 @@
 + // SPDX-License-Identifier: BSD-3-Clause-Clear
 + /*
 +  * Copyright (C) 2024 Felix Fietkau <nbd@nbd.name>
@@ -392,7 +398,12 @@ new file mode 100644
 + 	    !test_bit(MT76_MCU_RESET, &dev->phy.state)) {
 +-		__mt76_set_channel(phy, &phy->main_chandef, false);
 +-		mt76_offchannel_notify(phy, false);
-++		if (!__mt76_set_channel(phy, &phy->main_chandef, false))
+++		/* As after a scan, nothing else returns to the operating
+++		 * channel, so a failure must not keep TX gated
+++		 */
+++		if (__mt76_set_channel(phy, &phy->main_chandef, false))
+++			phy->offchannel = false;
+++		if (!test_bit(MT76_MCU_RESET, &dev->phy.state))
 ++			mt76_offchannel_notify(phy, false);
 + 	} else {
 + 		phy->offchannel = false;
@@ -2571,7 +2582,7 @@ new file mode 100644
 + out:
 +-	ieee80211_queue_delayed_work(mphy->hw, &mphy->mac_work,
 +-				     MT7996_WATCHDOG_TIME);
-++	if (!ret && !test_bit(MT76_MCU_RESET, &mphy->dev->phy.state))
+++	if (!test_bit(MT76_MCU_RESET, &mphy->dev->phy.state))
 ++		ieee80211_queue_delayed_work(mphy->hw, &mphy->mac_work,
 ++					     MT7996_WATCHDOG_TIME);
 + 
@@ -4207,7 +4218,7 @@ new file mode 100644
 + }
 +--- a/scan.c
 ++++ b/scan.c
-+@@ -1,333 +1,348 @@
++@@ -1,333 +1,354 @@
 + // SPDX-License-Identifier: BSD-3-Clause-Clear
 + /*
 +  * Copyright (C) 2024 Felix Fietkau <nbd@nbd.name>
@@ -4249,9 +4260,15 @@ new file mode 100644
 + 
 +-		__mt76_set_channel(phy, &phy->main_chandef, false);
 +-		if (offchannel)
-++		if (__mt76_set_channel(phy, &phy->main_chandef, false))
+++		/* Nothing retries the operating channel after the scan, so a
+++		 * failure must not leave the restored off-channel flag gating
+++		 * TX on this band
+++		 */
+++		if (__mt76_set_channel(phy, &phy->main_chandef, false)) {
+++			phy->offchannel = false;
 ++			abort = true;
-++		else if (offchannel)
+++		}
+++		if (offchannel && !test_bit(MT76_MCU_RESET, &dev->phy.state))
 + 			mt76_offchannel_notify(phy, false);
 + 	} else {
 + 		/* A phy that has no operating channel has nothing to restore,

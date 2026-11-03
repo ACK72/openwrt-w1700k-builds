@@ -144,7 +144,7 @@ new file mode 100644
 + 	mt76_tx_status_check(mphy->dev, false);
 + 
 +diff --git a/mt7996/main.c b/mt7996/main.c
-+index 58e70f9..946484b 100644
++index eb178af..58bc7af 100644
 +--- a/mt7996/main.c
 ++++ b/mt7996/main.c
 +@@ -1435,39 +1435,41 @@ mt7996_mac_sta_init_link(struct mt7996_dev *dev,
@@ -215,7 +215,7 @@ new file mode 100644
 + 
 + 		if (!link_conf_dereference_protected(vif, link_id)) {
 + 			err = -EINVAL;
-+@@ -2614,24 +2617,37 @@ static void mt7996_sta_statistics(struct ieee80211_hw *hw,
++@@ -2622,24 +2625,37 @@ static void mt7996_sta_statistics(struct ieee80211_hw *hw,
 + 	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
 + 		sinfo->tx_bytes = msta_link->wcid.stats.tx_bytes;
 + 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BYTES64);
@@ -254,7 +254,7 @@ new file mode 100644
 + 	struct mt7996_phy *phy = mt7996_vif_link_phy(&msta->vif->deflink);
 + 	struct mt7996_dev *dev;
 +diff --git a/mt7996/mcu.c b/mt7996/mcu.c
-+index acc680d..78644dd 100644
++index 5ab7440..b460938 100644
 +--- a/mt7996/mcu.c
 ++++ b/mt7996/mcu.c
 +@@ -976,96 +976,108 @@ mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
