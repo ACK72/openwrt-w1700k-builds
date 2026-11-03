@@ -142,7 +142,7 @@ new file mode 100644
 + 	return val;
 +--- a/mt7996/mcu.c
 ++++ b/mt7996/mcu.c
-+@@ -6185,17 +6185,17 @@
++@@ -6501,17 +6501,17 @@
 + 	struct mt7996_power_path_limits *path;
 + 	struct mt76_power_limits *la;
 + 	struct sk_buff *skb;
@@ -161,7 +161,7 @@ new file mode 100644
 + 		mphy->txpower_cur = tx_power;
 + 	} else {
 + 		mphy->txpower_cur = tx_power;
-+@@ -6232,27 +6232,28 @@
++@@ -6548,27 +6548,28 @@
 + 	ret = mt76_mcu_skb_send_msg(&dev->mt76, skb,
 + 				    MCU_WM_UNI_CMD(TXPOWER), true);
 + 	if (ret)
@@ -194,7 +194,7 @@ new file mode 100644
 + 	skb_put_data(skb, &path->ofdm, MT7996_SKU_PATH_OFDM_LEN);
 + 	skb_put_data(skb, &path->ofdm_bf, MT7996_SKU_PATH_OFDM_BF_LEN);
 + 
-+@@ -6261,21 +6262,18 @@
++@@ -6577,21 +6578,18 @@
 + 		u8 idx = i / 2;
 + 		s8 *buf = bf ? path->ru_bf[idx] : path->ru[idx];
 + 

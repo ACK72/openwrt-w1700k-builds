@@ -167,7 +167,7 @@ new file mode 100644
 + 
 +--- a/npu.c
 ++++ b/npu.c
-+@@ -306,91 +306,91 @@
++@@ -349,91 +349,91 @@
 + 	struct airoha_npu *npu;
 + 
 + 	if (!mt76_queue_is_npu(q))

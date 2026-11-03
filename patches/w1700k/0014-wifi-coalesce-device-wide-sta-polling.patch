@@ -34,10 +34,10 @@ new file mode 100644
 +Source: https://github.com/Gilly1970/Gemtek-W1700K-6.18/tree/4b8fb8c3a2619dd239fb44fd511ee2848a07e768/openwrt-patches
 +
 +diff --git a/mt7996/mac.c b/mt7996/mac.c
-+index b8215dc..20c6a0d 100644
++index 333ce45..a17af8a 100644
 +--- a/mt7996/mac.c
 ++++ b/mt7996/mac.c
-+@@ -2940,24 +2940,72 @@ void mt7996_mac_sta_rc_work(struct work_struct *work)
++@@ -2961,24 +2961,72 @@ void mt7996_mac_sta_rc_work(struct work_struct *work)
 + 			mt7996_mcu_set_fixed_field(dev, msta_link->sta, NULL,
 + 						   msta_link->wcid.link_id,
 + 						   RATE_PARAM_MMPS_UPDATE);
@@ -110,7 +110,7 @@ new file mode 100644
 + 	diag_start = mt76_sta_diag_clock(mphy->dev);
 + 	if (diag_start)
 + 		mt76_sta_diag_event(mphy->dev, MT76_DIAG_WORK_BEGIN,
-+@@ -2973,31 +3021,25 @@ void mt7996_mac_work(struct work_struct *work)
++@@ -2994,31 +3042,25 @@ void mt7996_mac_work(struct work_struct *work)
 + 				mphy->band_idx, diag_start,
 + 				mt76_sta_diag_us(diag_start, diag_locked),
 + 				mt76_sta_diag_us(diag_locked, ktime_get_ns()),
@@ -144,10 +144,10 @@ new file mode 100644
 + 	mt76_tx_status_check(mphy->dev, false);
 + 
 +diff --git a/mt7996/main.c b/mt7996/main.c
-+index 02639e5..d341878 100644
++index 58e70f9..946484b 100644
 +--- a/mt7996/main.c
 ++++ b/mt7996/main.c
-+@@ -1346,39 +1346,41 @@ mt7996_mac_sta_init_link(struct mt7996_dev *dev,
++@@ -1435,39 +1435,41 @@ mt7996_mac_sta_init_link(struct mt7996_dev *dev,
 + 	mt7996_sta_link_hdr_trans_set(msta, msta_link);
 + 
 + 	ewma_avg_signal_init(&msta_link->avg_ack_signal);
@@ -189,7 +189,7 @@ new file mode 100644
 + 	if (msta_link->wcid.link_valid) {
 + 		mt7996_mac_wtbl_update(dev, msta_link->wcid.idx,
 + 				       MT_WTBL_UPDATE_ADM_COUNT_CLEAR);
-+@@ -1452,24 +1454,25 @@ mt7996_mac_sta_add_links(struct mt7996_dev *dev, struct ieee80211_vif *vif,
++@@ -1541,24 +1543,25 @@ mt7996_mac_sta_add_links(struct mt7996_dev *dev, struct ieee80211_vif *vif,
 + 	unsigned long created = 0, returned = 0;
 + 	unsigned int link_id;
 + 	int err = 0;
@@ -215,7 +215,7 @@ new file mode 100644
 + 
 + 		if (!link_conf_dereference_protected(vif, link_id)) {
 + 			err = -EINVAL;
-+@@ -2515,24 +2518,37 @@ static void mt7996_sta_statistics(struct ieee80211_hw *hw,
++@@ -2614,24 +2617,37 @@ static void mt7996_sta_statistics(struct ieee80211_hw *hw,
 + 	if (mtk_wed_device_active(&dev->mt76.mmio.wed)) {
 + 		sinfo->tx_bytes = msta_link->wcid.stats.tx_bytes;
 + 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BYTES64);
@@ -254,10 +254,10 @@ new file mode 100644
 + 	struct mt7996_phy *phy = mt7996_vif_link_phy(&msta->vif->deflink);
 + 	struct mt7996_dev *dev;
 +diff --git a/mt7996/mcu.c b/mt7996/mcu.c
-+index b76d764..d59246e 100644
++index acc680d..78644dd 100644
 +--- a/mt7996/mcu.c
 ++++ b/mt7996/mcu.c
-+@@ -929,96 +929,108 @@ mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
++@@ -976,96 +976,108 @@ mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
 + 		elem_size = sizeof(res->msdu_cnt[0]);
 + 		break;
 + 	case UNI_ALL_STA_TXRX_AIR_TIME:
@@ -387,7 +387,7 @@ new file mode 100644
 + 	struct mt7996_mcu_thermal_notify *n;
 + 	struct mt7996_phy *phy;
 + 
-+@@ -5959,93 +5971,131 @@ int mt7996_mcu_get_all_sta_info(struct mt7996_phy *phy, u16 tag)
++@@ -6246,93 +6258,131 @@ int mt7996_mcu_get_all_sta_info(struct mt7996_phy *phy, u16 tag)
 + 	return mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(ALL_STA_INFO),
 + 				 &req, sizeof(req), false);
 + }
@@ -521,7 +521,7 @@ new file mode 100644
 + 					if (mphy)
 + 						msta_link->ack_signal =
 +diff --git a/mt7996/mt7996.h b/mt7996/mt7996.h
-+index 46a6f0b..6d5748f 100644
++index 3c9c6a1..4dfbbcd 100644
 +--- a/mt7996/mt7996.h
 ++++ b/mt7996/mt7996.h
 +@@ -280,24 +280,25 @@ enum {
@@ -550,7 +550,7 @@ new file mode 100644
 + 	unsigned long changed;
 + 
 + 	struct mt76_connac_sta_key_conf bip;
-+@@ -489,24 +490,30 @@ struct mt7996_dev {
++@@ -494,24 +495,30 @@ struct mt7996_dev {
 + 
 + 	const struct mt76_bus_ops *bus_ops;
 + 	struct mt7996_phy phy;
