@@ -2,7 +2,7 @@
   "base": "e304e64c26e026127d5ef26ec3360f7bdc92f69c",
   "description": "W1700K patches, applied after the complete fanboy ubi2-oc stack.",
   "release_offset": {
-    "description": "After the patches, set each recipe's PKG_RELEASE to the official release plus this offset, so apk keeps the patched packages above official builds of the same source. Replaces former patch 0004, whose context broke on every upstream release bump.",
+    "description": "After the patches, set each recipe's PKG_RELEASE to the official release plus this offset, so apk keeps the patched packages above official builds of the same source. Replaces the former release patch 0004-package-bump-mt76-and-hostapd-releases-after-backpor.patch, whose context broke on every upstream release bump.",
     "offset": 100,
     "recipes": [
       "package/kernel/mt76/Makefile",
@@ -23,11 +23,11 @@
       "original": "5bb8b4d8807dffe0789ba46bdeebabcd9a7a27b6"
     },
     {
-      "file": "0005-airoha-initialize-perstout-reset-value.patch",
+      "file": "0004-airoha-initialize-perstout-reset-value.patch",
       "description": "Initialize the inherited PERSTOUT reset value."
     },
     {
-      "file": "0006-wifi-mt76-mt7996-reg_lock-irqsave-prevent-AP-panic.patch",
+      "file": "0005-wifi-mt76-mt7996-reg_lock-irqsave-prevent-AP-panic.patch",
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
       "selected": [
         "034"
@@ -35,7 +35,7 @@
       "author": "Shayne Chen <shayne.chen@mediatek.com>"
     },
     {
-      "file": "0007-wifi-mt76-fix-queue-assignment-for-disassoc-packets.patch",
+      "file": "0006-wifi-mt76-fix-queue-assignment-for-disassoc-packets.patch",
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed",
       "selected": [
         "042"
@@ -43,7 +43,7 @@
       "author": "Peter Chiu <chui-hao.chiu@mediatek.com>"
     },
     {
-      "file": "0008-wifi-fix-npu-rx-buffer-ownership.patch",
+      "file": "0007-wifi-fix-npu-rx-buffer-ownership.patch",
       "description": "wifi: validate NPU RX ownership with a single-buffer fast path",
       "author": "ACK72 <acikom72@gmail.com>",
       "consolidated_from": [
@@ -52,7 +52,7 @@
       ]
     },
     {
-      "file": "0009-airoha-select-gilly-event-and-ethernet-fixes.patch",
+      "file": "0008-airoha-select-gilly-event-and-ethernet-fixes.patch",
       "selected": [
         "026 (upstream in mt76 56c8b4a4b407; AIR_TIME sizing kept)",
         "044 (upstream in mt76 d17b8d5eff29)",
@@ -63,11 +63,11 @@
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed"
     },
     {
-      "file": "0010-wifi-fix-channel-and-npu-recovery-lifecycle.patch",
+      "file": "0009-wifi-fix-channel-and-npu-recovery-lifecycle.patch",
       "description": "Complete scan/ROC, propagate channel failures, keep TX gated and retry when a scan or ROC cannot return to the operating channel, and check NPU stop/restart before resuming recovery. Includes adapted Gilly 047."
     },
     {
-      "file": "0011-wifi-service-pending-frames-before-data.patch",
+      "file": "0010-wifi-service-pending-frames-before-data.patch",
       "description": "wifi: fairly service pending frames and batch ordinary TX kicks",
       "author": "ACK72 <acikom72@gmail.com>",
       "consolidated_from": [
@@ -76,11 +76,11 @@
       ]
     },
     {
-      "file": "0012-airoha-name-qdma-napi-threads.patch",
+      "file": "0011-airoha-name-qdma-napi-threads.patch",
       "description": "Expose real QDMA/ring names for IRQ/NAPI group locality; no RSS or PID-order inference. Names live in a net/core table, so struct napi_struct keeps the official layout."
     },
     {
-      "file": "0013-wifi-add-opt-in-sta-control-diagnostics.patch",
+      "file": "0012-wifi-add-opt-in-sta-control-diagnostics.patch",
       "description": "wifi: add opt-in station diagnostics with accepted NAPI timing",
       "author": "ACK72 <acikom72@gmail.com>",
       "consolidated_from": [
@@ -90,7 +90,7 @@
       ]
     },
     {
-      "file": "0014-wifi-coalesce-device-wide-sta-polling.patch",
+      "file": "0013-wifi-coalesce-device-wide-sta-polling.patch",
       "description": "wifi: coalesce NPU station statistics and unlock RSSI waits",
       "author": "ACK72 <acikom72@gmail.com>",
       "consolidated_from": [
@@ -105,11 +105,11 @@
       ]
     },
     {
-      "file": "0015-wifi-name-napi-by-rx-queue-role.patch",
-      "description": "Persist actual mt76 RX queue roles in threaded NAPI names for IRQ-local placement. Requires named-NAPI kernel API from 0012."
+      "file": "0014-wifi-name-napi-by-rx-queue-role.patch",
+      "description": "Persist actual mt76 RX queue roles in threaded NAPI names for IRQ-local placement. Requires named-NAPI kernel API from 0011."
     },
     {
-      "file": "0016-airoha-isolate-ipv6-source-mac-slots.patch",
+      "file": "0015-airoha-isolate-ipv6-source-mac-slots.patch",
       "selected": [
         "972/973 (reference-counted slot redesign)"
       ],
@@ -122,27 +122,27 @@
       ]
     },
     {
-      "file": "0017-wifi-reduce-mmio-and-power-table-overhead.patch",
+      "file": "0016-wifi-reduce-mmio-and-power-table-overhead.patch",
       "description": "wifi: reduce MMIO lookup and power-table preparation overhead",
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0018-airoha-reduce-guarded-control-path-overhead.patch",
+      "file": "0017-airoha-reduce-guarded-control-path-overhead.patch",
       "description": "airoha: reduce guarded L2, mailbox and initialization overhead; the TRTCM readback change is upstream in airoha 187",
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0019-wifi-count-only-final-tx-failures.patch",
+      "file": "0018-wifi-count-only-final-tx-failures.patch",
       "description": "wifi: report frames lost after all retries as tx_failed, not every failed attempt",
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0020-build-extract-git-archives-with-the-umask.patch",
+      "file": "0019-build-extract-git-archives-with-the-umask.patch",
       "description": "build: pack git sources as root with the same modes as unprivileged builds, matching PKG_MIRROR_HASH",
       "author": "ACK72 <acikom72@gmail.com>"
     },
     {
-      "file": "0021-wifi-raise-sta-beacon-loss-threshold.patch",
+      "file": "0020-wifi-raise-sta-beacon-loss-threshold.patch",
       "description": "wifi: wait 20 beacon intervals (about 2.2 s) before reporting STA beacon loss, so short AP beacon gaps no longer disconnect the uplink",
       "author": "ACK72 <acikom72@gmail.com>"
     }

@@ -19,7 +19,7 @@ difference with its verdict and reason. In short:
 
 | Difference | Verdict |
 | --- | --- |
-| Patch 0012 names QDMA NAPI threads | Compatible: names live in a net/core table, `struct napi_struct` keeps the official layout |
+| Patch 0011 names QDMA NAPI threads | Compatible: names live in a net/core table, `struct napi_struct` keeps the official layout |
 | 603, 672, 675-01, 675-03, 675-05, 886 (fanboy) | Compatible: no layout or exported interface used by official modules changes |
 | Kernel configuration (fanboy) | Safe failure only: official pstore kmods do not load |
 | Profile kernel options | Compatible |
