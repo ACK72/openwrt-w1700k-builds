@@ -28,10 +28,17 @@ Official kmods that cannot work on this firmware:
 
 - **pstore/ramoops**: built into this kernel.
 - **mt76 drivers other than mt7996** (for example `kmod-mt7921e` or
-  `kmod-mt7915e`): fanboy builds mt76 from a different revision than the
-  official feed, and the image's `kmod-mt76-core` and `kmod-mt76-connac` carry
-  the W1700K patches. Official drivers would load against them. The review
-  below does not cover out-of-tree packages, so do not install these.
+  `kmod-mt7915e`): the image's `kmod-mt76-core` and `kmod-mt76-connac` carry
+  the fanboy and W1700K patches, so official drivers built without them would
+  load against different structures. The review below does not cover
+  out-of-tree packages, so do not install these.
+
+The image's mt76 and hostapd packages use release 16, which keeps them above
+official builds of the same source. Once the official feeds update the mt76 or
+hostapd source, their packages have a higher version, and `apk upgrade` would
+replace the image's ones and drop these patches, including the NAPI names the
+affinity policy requires. Do not upgrade `kmod-mt76*`, `kmod-mt7996*`,
+`hostapd*` or `wpad*` from the official feeds; install a newer image instead.
 
 ## When the review stops a build
 
