@@ -26,7 +26,7 @@ new file mode 100644
 +Consolidates former ACK72 patches 0016, 0028.
 +
 +diff --git a/mt76.h b/mt76.h
-+index 14afdbd..5d31296 100644
++index e2593b4..60432c6 100644
 +--- a/mt76.h
 ++++ b/mt76.h
 +@@ -250,24 +250,27 @@ struct mt76_queue {
@@ -57,7 +57,7 @@ new file mode 100644
 + 	u32 wed_regs;
 + 
 + 	dma_addr_t desc_dma;
-+@@ -973,24 +976,25 @@ struct mt76_dev {
++@@ -974,24 +977,25 @@ struct mt76_dev {
 + 	struct sk_buff_head rx_skb[__MT_RXQ_MAX];
 + 	struct tasklet_struct irq_tasklet;
 + 

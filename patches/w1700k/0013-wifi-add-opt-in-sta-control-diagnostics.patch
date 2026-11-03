@@ -137,10 +137,10 @@ new file mode 100644
 + {
 + 	netif_napi_add(dev->napi_dev, &dev->napi[qid], poll);
 +diff --git a/mac80211.c b/mac80211.c
-+index 1ed8e8d..5fef1f0 100644
++index ed0b76f..d6ffe52 100644
 +--- a/mac80211.c
 ++++ b/mac80211.c
-+@@ -684,24 +684,25 @@ mt76_alloc_device(struct device *pdev, unsigned int size,
++@@ -685,24 +685,25 @@ mt76_alloc_device(struct device *pdev, unsigned int size,
 + 	dev->hw = hw;
 + 	dev->dev = pdev;
 + 	dev->init_wiphy = NULL;
@@ -166,7 +166,7 @@ new file mode 100644
 + 	init_waitqueue_head(&dev->mcu.wait);
 + 	mutex_init(&dev->mcu.mutex);
 + 	dev->tx_worker.fn = mt76_tx_worker;
-+@@ -813,24 +814,25 @@ void mt76_unregister_device(struct mt76_dev *dev)
++@@ -814,24 +815,25 @@ void mt76_unregister_device(struct mt76_dev *dev)
 + 		return;
 + 
 + 	if (IS_ENABLED(CONFIG_MT76_LEDS))
@@ -192,7 +192,7 @@ new file mode 100644
 + 
 + static void mt76_reset_phy(struct mt76_phy *phy)
 + {
-+@@ -2348,24 +2350,26 @@ static void mt76_rx_beacon_iter(void *_data, u8 *mac,
++@@ -2349,24 +2351,26 @@ static void mt76_rx_beacon_iter(void *_data, u8 *mac,
 + 
 + 		link_conf = rcu_dereference(vif->link_conf[link_id]);
 + 		if (!link_conf)
@@ -219,7 +219,7 @@ new file mode 100644
 + 		.bssid = hdr->addr3,
 + 	};
 + 
-+@@ -2384,24 +2388,25 @@ void mt76_rx_beacon(struct mt76_phy *phy, struct sk_buff *skb)
++@@ -2385,24 +2389,25 @@ void mt76_rx_beacon(struct mt76_phy *phy, struct sk_buff *skb)
 + EXPORT_SYMBOL_GPL(mt76_rx_beacon);
 + 
 + struct mt76_beacon_mon_data {
@@ -245,7 +245,7 @@ new file mode 100644
 + 
 + 		if (link_id == mvif->deflink_id)
 + 			mlink = (struct mt76_vif_link *)vif->drv_priv;
-+@@ -2415,34 +2420,41 @@ static void mt76_beacon_mon_iter(void *data, u8 *mac,
++@@ -2416,34 +2421,41 @@ static void mt76_beacon_mon_iter(void *data, u8 *mac,
 + 		 */
 + 		interval = smp_load_acquire(&mlink->beacon_mon_interval);
 + 		if (!interval)
@@ -356,7 +356,7 @@ new file mode 100644
 + 	while (len > 0) {
 + 		cur_len = min_t(int, max_len, len);
 +diff --git a/mt76.h b/mt76.h
-+index 5d31296..102075c 100644
++index 60432c6..5149e05 100644
 +--- a/mt76.h
 ++++ b/mt76.h
 +@@ -1,21 +1,24 @@
@@ -384,7 +384,7 @@ new file mode 100644
 + #include "airoha_offload.h"
 + #endif
 + #include <linux/soc/mediatek/mtk_wed.h>
-+@@ -930,24 +933,26 @@ struct mt76_phy {
++@@ -931,24 +934,26 @@ struct mt76_phy {
 + 	} rx_amsdu[__MT_RXQ_MAX];
 + 
 + 	struct mt76_freq_range_power *frp;
@@ -411,7 +411,7 @@ new file mode 100644
 + 	spinlock_t cc_lock;
 + 
 + 	u32 cur_cc_bss_rx;
-+@@ -1049,26 +1054,87 @@ struct mt76_dev {
++@@ -1050,26 +1055,87 @@ struct mt76_dev {
 + 		u32 offset;
 + 	} test_mtd;
 + #endif

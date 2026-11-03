@@ -5,7 +5,7 @@ diff --git a/package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch b/
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-y-mt76-recovery-lifecycle.patch
-@@ -0,0 +1,4571 @@
+@@ -0,0 +1,5233 @@
 +From: ACK72 <ACK72@users.noreply.github.com>
 +Subject: [PATCH] mt76: complete channel operations and fail closed on recovery errors
 +
@@ -35,15 +35,18 @@ new file mode 100644
 +Only the failure warning remains in change_chanctx, and the beacon loss
 +diagnostics use the loaded interval.
 +
-+A failed return to the operating channel at the end of a scan or ROC
-+clears the off-channel flag, which nothing else would clear and which
-+gates TX on the band, and still ends the off-channel period for associated
-+stations. mt7996_set_channel re-arms mac_work after any channel set outside
-+MCU recovery, as upstream does.
++A scan or ROC that cannot return to the operating channel, because the
++channel set fails or MCU recovery is running, leaves the phy off-channel:
++its TX stays gated and its beacons stopped, as the radio may still be on
++the other channel. A delayed work retries the return until it succeeds, a
++scan or ROC returns itself or the channel context is removed, and then
++ends the off-channel period for associated stations. mt7996_set_channel
++re-arms mac_work after any channel set outside MCU recovery, as upstream
++does.
 +
 +--- a/channel.c
 ++++ b/channel.c
-+@@ -1,433 +1,461 @@
++@@ -1,433 +1,515 @@
 + // SPDX-License-Identifier: BSD-3-Clause-Clear
 + /*
 +  * Copyright (C) 2024 Felix Fietkau <nbd@nbd.name>
@@ -135,6 +138,10 @@ new file mode 100644
 + 	if (phy->chanctx == ctx)
 + 		phy->chanctx = NULL;
 + 	mutex_unlock(&dev->mutex);
+++
+++	/* Without a channel context there is no operating channel to restore */
+++	if (!phy->chanctx)
+++		cancel_delayed_work_sync(&phy->main_chan_work);
 + }
 + EXPORT_SYMBOL_GPL(mt76_remove_chanctx);
 + 
@@ -384,6 +391,66 @@ new file mode 100644
 + 	kfree_rcu(mlink, rcu_head);
 + }
 + 
+++#define MT76_MAIN_CHAN_RETRY	(HZ / 2)
+++
+++/* Return to the operating channel after a scan or ROC. Until that works, the
+++ * phy stays off-channel, which keeps its TX gated and its beacons stopped,
+++ * and the return is retried: nothing else sets the operating channel again.
+++ */
+++int mt76_restore_main_chan(struct mt76_phy *phy, bool notify)
+++{
+++	struct mt76_dev *dev = phy->dev;
+++	int ret;
+++
+++	lockdep_assert_held(&dev->mutex);
+++
+++	ret = __mt76_set_channel(phy, &phy->main_chandef, false);
+++	if (!ret) {
+++		if (notify)
+++			mt76_offchannel_notify(phy, false);
+++		return 0;
+++	}
+++
+++	/* A phy without a channel context has no operating channel to keep */
+++	if (!phy->chanctx) {
+++		phy->offchannel = false;
+++		return ret;
+++	}
+++
+++	if (!test_bit(MT76_MCU_RESET, &dev->phy.state))
+++		dev_warn_ratelimited(dev->dev,
+++				     "operating channel restore failed on band %u, retrying\n",
+++				     phy->band_idx);
+++	phy->offchannel = true;
+++	ieee80211_queue_delayed_work(phy->hw, &phy->main_chan_work,
+++				     MT76_MAIN_CHAN_RETRY);
+++
+++	return ret;
+++}
+++
+++void mt76_main_chan_work(struct work_struct *work)
+++{
+++	struct mt76_phy *phy = container_of(work, struct mt76_phy,
+++					    main_chan_work.work);
+++	struct mt76_dev *dev = phy->dev;
+++
+++	mutex_lock(&dev->mutex);
+++	/* A scan or ROC restores the operating channel when it ends */
+++	if (!phy->offchannel || !phy->chanctx || phy->roc_vif ||
+++	    mt76_phy_scanning(phy))
+++		goto out;
+++
+++	/* A failure keeps the phy off-channel */
+++	if (test_bit(MT76_RESTART, &dev->phy.state) ||
+++	    __mt76_set_channel(phy, &phy->main_chandef, false))
+++		ieee80211_queue_delayed_work(phy->hw, &phy->main_chan_work,
+++					     MT76_MAIN_CHAN_RETRY);
+++	else
+++		mt76_offchannel_notify(phy, false);
+++out:
+++	mutex_unlock(&dev->mutex);
+++}
+++
 + void mt76_roc_complete(struct mt76_phy *phy)
 + {
 + 	struct mt76_vif_link *mlink = phy->roc_link;
@@ -394,20 +461,16 @@ new file mode 100644
 + 
 + 	if (mlink)
 + 		mlink->mvif->roc_phy = NULL;
-+ 	if (phy->chanctx && phy->main_chandef.chan && phy->offchannel &&
-+ 	    !test_bit(MT76_MCU_RESET, &dev->phy.state)) {
++-	if (phy->chanctx && phy->main_chandef.chan && phy->offchannel &&
++-	    !test_bit(MT76_MCU_RESET, &dev->phy.state)) {
 +-		__mt76_set_channel(phy, &phy->main_chandef, false);
 +-		mt76_offchannel_notify(phy, false);
-++		/* As after a scan, nothing else returns to the operating
-++		 * channel, so a failure must not keep TX gated
-++		 */
-++		if (__mt76_set_channel(phy, &phy->main_chandef, false))
-++			phy->offchannel = false;
-++		if (!test_bit(MT76_MCU_RESET, &dev->phy.state))
-++			mt76_offchannel_notify(phy, false);
-+ 	} else {
++-	} else {
+++	if (phy->chanctx && phy->main_chandef.chan && phy->offchannel)
+++		mt76_restore_main_chan(phy, true);
+++	else
 + 		phy->offchannel = false;
-+ 	}
++-	}
 + 	mt76_put_vif_phy_link(phy, phy->roc_vif, phy->roc_link);
 + 	phy->roc_vif = NULL;
 + 	phy->roc_link = NULL;
@@ -478,10 +541,8 @@ new file mode 100644
 + 		mt76_offchannel_notify(phy, true);
 + 	ret = __mt76_set_channel(phy, &chandef, offchannel);
 + 	if (ret) {
-++		if (offchannel && phy->main_chandef.chan &&
-++		    !test_bit(MT76_MCU_RESET, &dev->phy.state) &&
-++		    !__mt76_set_channel(phy, &phy->main_chandef, false))
-++			mt76_offchannel_notify(phy, false);
+++		if (offchannel && phy->main_chandef.chan)
+++			mt76_restore_main_chan(phy, true);
 + 		mlink->mvif->roc_phy = NULL;
 + 		phy->roc_vif = NULL;
 + 		phy->roc_link = NULL;
@@ -515,7 +576,209 @@ new file mode 100644
 + EXPORT_SYMBOL_GPL(mt76_cancel_remain_on_channel);
 +--- a/mac80211.c
 ++++ b/mac80211.c
-+@@ -962,290 +962,326 @@
++@@ -336,200 +336,201 @@
++ 	ht_cap->ht_supported = true;
++ 	ht_cap->cap |= IEEE80211_HT_CAP_SUP_WIDTH_20_40 |
++ 		       IEEE80211_HT_CAP_GRN_FLD |
++ 		       IEEE80211_HT_CAP_SGI_20 |
++ 		       IEEE80211_HT_CAP_SGI_40 |
++ 		       (1 << IEEE80211_HT_CAP_RX_STBC_SHIFT);
++ 
++ 	ht_cap->mcs.tx_params = IEEE80211_HT_MCS_TX_DEFINED;
++ 	ht_cap->ampdu_factor = IEEE80211_HT_MAX_AMPDU_64K;
++ 
++ 	mt76_init_stream_cap(phy, sband, vht);
++ 
++ 	if (!vht)
++ 		return 0;
++ 
++ 	vht_cap = &sband->vht_cap;
++ 	vht_cap->vht_supported = true;
++ 	vht_cap->cap |= IEEE80211_VHT_CAP_RXLDPC |
++ 			IEEE80211_VHT_CAP_RXSTBC_1 |
++ 			IEEE80211_VHT_CAP_SHORT_GI_80 |
++ 			(3 << IEEE80211_VHT_CAP_MAX_A_MPDU_LENGTH_EXPONENT_SHIFT);
++ 
++ 	return 0;
++ }
++ 
++ static int
++ mt76_init_sband_2g(struct mt76_phy *phy, struct ieee80211_rate *rates,
++ 		   int n_rates)
++ {
++ 	phy->hw->wiphy->bands[NL80211_BAND_2GHZ] = &phy->sband_2g.sband;
++ 
++ 	return mt76_init_sband(phy, &phy->sband_2g, mt76_channels_2ghz,
++ 			       ARRAY_SIZE(mt76_channels_2ghz), rates,
++ 			       n_rates, true, false);
++ }
++ 
++ static int
++ mt76_init_sband_5g(struct mt76_phy *phy, struct ieee80211_rate *rates,
++ 		   int n_rates, bool vht)
++ {
++ 	phy->hw->wiphy->bands[NL80211_BAND_5GHZ] = &phy->sband_5g.sband;
++ 
++ 	return mt76_init_sband(phy, &phy->sband_5g, mt76_channels_5ghz,
++ 			       ARRAY_SIZE(mt76_channels_5ghz), rates,
++ 			       n_rates, true, vht);
++ }
++ 
++ static int
++ mt76_init_sband_6g(struct mt76_phy *phy, struct ieee80211_rate *rates,
++ 		   int n_rates)
++ {
++ 	phy->hw->wiphy->bands[NL80211_BAND_6GHZ] = &phy->sband_6g.sband;
++ 
++ 	return mt76_init_sband(phy, &phy->sband_6g, mt76_channels_6ghz,
++ 			       ARRAY_SIZE(mt76_channels_6ghz), rates,
++ 			       n_rates, false, false);
++ }
++ 
++ static void
++ mt76_check_sband(struct mt76_phy *phy, struct mt76_sband *msband,
++ 		 enum nl80211_band band)
++ {
++ 	struct ieee80211_supported_band *sband = &msband->sband;
++ 	bool found = false;
++ 	int i;
++ 
++ 	if (!sband)
++ 		return;
++ 
++ 	for (i = 0; i < sband->n_channels; i++) {
++ 		if (sband->channels[i].flags & IEEE80211_CHAN_DISABLED)
++ 			continue;
++ 
++ 		found = true;
++ 		break;
++ 	}
++ 
++ 	if (found) {
++ 		cfg80211_chandef_create(&phy->chandef, &sband->channels[0],
++ 					NL80211_CHAN_HT20);
++ 		phy->chan_state = &msband->chan[0];
++ 		phy->dev->band_phys[band] = phy;
++ 		return;
++ 	}
++ 
++ 	sband->n_channels = 0;
++ 	if (phy->hw->wiphy->bands[band] == sband)
++ 		phy->hw->wiphy->bands[band] = NULL;
++ }
++ 
++ static int
++ mt76_phy_init(struct mt76_phy *phy, struct ieee80211_hw *hw)
++ {
++ 	struct mt76_dev *dev = phy->dev;
++ 	struct wiphy *wiphy = hw->wiphy;
++ 
++ 	INIT_LIST_HEAD(&phy->tx_list);
++ 	spin_lock_init(&phy->tx_lock);
++ 	INIT_DELAYED_WORK(&phy->roc_work, mt76_roc_complete_work);
++ 	INIT_DELAYED_WORK(&phy->scan_work, mt76_scan_work);
+++	INIT_DELAYED_WORK(&phy->main_chan_work, mt76_main_chan_work);
++ 
++ 	if ((void *)phy != hw->priv)
++ 		return 0;
++ 
++ 	SET_IEEE80211_DEV(hw, dev->dev);
++ 	SET_IEEE80211_PERM_ADDR(hw, phy->macaddr);
++ 
++ 	wiphy->features |= NL80211_FEATURE_AP_MODE_CHAN_WIDTH_CHANGE;
++ 	if (!phy->no_active_monitor)
++ 		wiphy->features |= NL80211_FEATURE_ACTIVE_MONITOR;
++ 	wiphy->flags |= WIPHY_FLAG_HAS_CHANNEL_SWITCH |
++ 			WIPHY_FLAG_SUPPORTS_TDLS |
++ 			WIPHY_FLAG_AP_UAPSD;
++ 
++ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CQM_RSSI_LIST);
++ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_AIRTIME_FAIRNESS);
++ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_AQL);
++ 
++ 	if (!wiphy->max_remain_on_channel_duration)
++ 		wiphy->max_remain_on_channel_duration = 5000;
++ 	if (!wiphy->available_antennas_tx)
++ 		wiphy->available_antennas_tx = phy->antenna_mask;
++ 	if (!wiphy->available_antennas_rx)
++ 		wiphy->available_antennas_rx = phy->antenna_mask;
++ 
++ 	wiphy->sar_capa = &mt76_sar_capa;
++ 	phy->frp = devm_kcalloc(dev->dev, wiphy->sar_capa->num_freq_ranges,
++ 				sizeof(struct mt76_freq_range_power),
++ 				GFP_KERNEL);
++ 	if (!phy->frp)
++ 		return -ENOMEM;
++ 
++ 	hw->txq_data_size = sizeof(struct mt76_txq);
++ 	hw->uapsd_max_sp_len = IEEE80211_WMM_IE_STA_QOSINFO_SP_ALL;
++ 
++ 	if (!hw->max_tx_fragments)
++ 		hw->max_tx_fragments = 16;
++ 
++ 	ieee80211_hw_set(hw, SIGNAL_DBM);
++ 	ieee80211_hw_set(hw, AMPDU_AGGREGATION);
++ 	ieee80211_hw_set(hw, SUPPORTS_RC_TABLE);
++ 	ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
++ 	ieee80211_hw_set(hw, SUPPORTS_CLONED_SKBS);
++ 	ieee80211_hw_set(hw, SUPPORTS_AMSDU_IN_AMPDU);
++ 	ieee80211_hw_set(hw, SUPPORTS_REORDERING_BUFFER);
++ 	ieee80211_hw_set(hw, SPECTRUM_MGMT);
++ 
++ 	if (!(dev->drv->drv_flags & MT_DRV_AMSDU_OFFLOAD) &&
++ 	    hw->max_tx_fragments > 1) {
++ 		ieee80211_hw_set(hw, TX_AMSDU);
++ 		ieee80211_hw_set(hw, TX_FRAG_LIST);
++ 	}
++ 
++ 	ieee80211_hw_set(hw, MFP_CAPABLE);
++ 	ieee80211_hw_set(hw, AP_LINK_PS);
++ 	ieee80211_hw_set(hw, REPORTS_TX_ACK_STATUS);
++ 
++ 	return 0;
++ }
++ 
++ struct mt76_phy *
++ mt76_alloc_radio_phy(struct mt76_dev *dev, unsigned int size,
++ 		     u8 band_idx)
++ {
++ 	struct ieee80211_hw *hw = dev->phy.hw;
++ 	unsigned int phy_size;
++ 	struct mt76_phy *phy;
++ 
++ 	phy_size = ALIGN(sizeof(*phy), 8);
++ 	phy = devm_kzalloc(dev->dev, size + phy_size, GFP_KERNEL);
++ 	if (!phy)
++ 		return NULL;
++ 
++ 	phy->dev = dev;
++ 	phy->hw = hw;
++ 	phy->priv = (void *)phy + phy_size;
++ 	phy->band_idx = band_idx;
++ 
++ 	return phy;
++ }
++ EXPORT_SYMBOL_GPL(mt76_alloc_radio_phy);
++ 
++ struct mt76_phy *
++ mt76_alloc_phy(struct mt76_dev *dev, unsigned int size,
++ 	       const struct ieee80211_ops *ops, u8 band_idx)
++ {
++ 	struct ieee80211_hw *hw;
++ 	unsigned int phy_size;
++ 	struct mt76_phy *phy;
++ 
++ 	phy_size = ALIGN(sizeof(*phy), 8);
++ 	hw = ieee80211_alloc_hw(size + phy_size, ops);
++ 	if (!hw)
++ 		return NULL;
++ 
++ 	phy = hw->priv;
++ 	phy->dev = dev;
++ 	phy->hw = hw;
++ 	phy->priv = hw->priv + phy_size;
++ 	phy->band_idx = band_idx;
++@@ -962,290 +963,326 @@
 + 		return;
 + 	}
 + 
@@ -844,7 +1107,7 @@ new file mode 100644
 + 		else if (diff <= 2)
 + 			signal += 2;
 + 		else if (diff <= 6)
-+@@ -2250,148 +2286,180 @@
++@@ -2250,148 +2287,180 @@
 + 		if (link_id == mvif->deflink_id)
 + 			mlink = (struct mt76_vif_link *)vif->drv_priv;
 + 		else
@@ -1031,7 +1294,209 @@ new file mode 100644
 ++EXPORT_SYMBOL_GPL(mt76_beacon_mon_reset);
 +--- a/mt76.h
 ++++ b/mt76.h
-+@@ -1556,200 +1556,201 @@
++@@ -798,200 +798,201 @@
++ 	struct sk_buff *tx_skb;
++ 
++ 	u32 tx_count;
++ 	u16 tx_mpdu_len;
++ 
++ 	u8 tx_rate_mode;
++ 	u8 tx_rate_idx;
++ 	u8 tx_rate_nss;
++ 	u8 tx_rate_sgi;
++ 	u8 tx_rate_ldpc;
++ 	u8 tx_rate_stbc;
++ 	u8 tx_ltf;
++ 
++ 	u8 tx_antenna_mask;
++ 	u8 tx_spe_idx;
++ 
++ 	u8 tx_duty_cycle;
++ 	u32 tx_time;
++ 	u32 tx_ipg;
++ 
++ 	u32 freq_offset;
++ 
++ 	u8 tx_power[4];
++ 	u8 tx_power_control;
++ 
++ 	u8 addr[3][ETH_ALEN];
++ 
++ 	u32 tx_pending;
++ 	u32 tx_queued;
++ 	u16 tx_queued_limit;
++ 	u32 tx_done;
++ 	struct {
++ 		u64 packets[__MT_RXQ_MAX];
++ 		u64 fcs_error[__MT_RXQ_MAX];
++ 	} rx_stats;
++ };
++ 
++ struct mt76_vif_link {
++ 	u8 idx;
++ 	u8 link_idx;
++ 	u8 omac_idx;
++ 	u8 band_idx;
++ 	u8 wmm_idx;
++ 	u8 scan_seq_num;
++ 	u8 cipher;
++ 	u8 basic_rates_idx;
++ 	u8 mcast_rates_idx;
++ 	u8 beacon_rates_idx;
++ 	bool offchannel;
++ 	unsigned long beacon_mon_last;
++ 	u16 beacon_mon_interval;
++ 	struct ieee80211_chanctx_conf *ctx;
++ 	struct mt76_wcid *wcid;
++ 	struct mt76_vif_data *mvif;
++ 	struct rcu_head rcu_head;
++ };
++ 
++ struct mt76_vif_data {
++ 	struct mt76_vif_link __rcu *link[IEEE80211_MLD_MAX_NUM_LINKS];
++ 
++ 	struct mt76_phy *roc_phy;
++ 	u16 valid_links;
++ 	u8 deflink_id;
++ };
++ 
++ struct mt76_phy {
++ 	struct ieee80211_hw *hw;
++ 	struct mt76_dev *dev;
++ 	void *priv;
++ 
++ 	unsigned long state;
++ 	unsigned int num_sta;
++ 	u8 band_idx;
++ 
++ 	spinlock_t tx_lock;
++ 	struct list_head tx_list;
++ 	struct mt76_queue *q_tx[__MT_TXQ_MAX];
++ 
++ 	atomic_t mgmt_tx_pending;
++ 
++ 	struct cfg80211_chan_def chandef;
++ 	struct cfg80211_chan_def main_chandef;
++ 	bool offchannel;
++ 	bool radar_enabled;
++ 	bool no_active_monitor;
++ 
++ 	struct delayed_work roc_work;
++ 	struct ieee80211_vif *roc_vif;
++ 	struct mt76_vif_link *roc_link;
++ 
++ 	struct delayed_work scan_work;
++ 	struct {
++ 		struct ieee80211_channel *chan;
++ 		struct mt76_vif_link *mlink;
++ 		int chan_idx;
++ 		bool beacon_wait;
++ 		bool beacon_received;
++ 	} scan;
++ 
++ 	struct mt76_chanctx *chanctx;
+++	struct delayed_work main_chan_work;
++ 
++ 	struct mt76_channel_state *chan_state;
++ 	enum mt76_dfs_state dfs_state;
++ 	ktime_t survey_time;
++ 
++ 	u32 aggr_stats[32];
++ 
++ 	struct mt76_hw_cap cap;
++ 	struct mt76_sband sband_2g;
++ 	struct mt76_sband sband_5g;
++ 	struct mt76_sband sband_6g;
++ 
++ 	u8 macaddr[ETH_ALEN];
++ 
++ 	int txpower_cur;
++ 	u8 antenna_mask;
++ 	u16 chainmask;
++ 
++ #ifdef CONFIG_NL80211_TESTMODE
++ 	struct mt76_testmode_data test;
++ #endif
++ 
++ 	struct delayed_work mac_work;
++ 	u8 mac_work_count;
++ 
++ 	struct {
++ 		struct sk_buff *head;
++ 		struct sk_buff **tail;
++ 		u16 seqno;
++ 	} rx_amsdu[__MT_RXQ_MAX];
++ 
++ 	struct mt76_freq_range_power *frp;
++ 
++ 	struct {
++ 		struct led_classdev cdev;
++ 		char name[32];
++ 		bool al;
++ 		u8 pin;
++ 	} leds;
++ };
++ 
++ struct mt76_dev {
++ 	struct mt76_phy phy; /* must be first */
++ 	struct mt76_phy *phys[__MT_MAX_BAND];
++ 	struct mt76_phy *band_phys[NUM_NL80211_BANDS];
++ 
++ 	struct ieee80211_hw *hw;
++ 
++ 	spinlock_t wed_lock;
++ 	spinlock_t lock;
++ 	spinlock_t cc_lock;
++ 
++ 	u32 cur_cc_bss_rx;
++ 
++ 	struct mt76_rx_status rx_ampdu_status;
++ 	u32 rx_ampdu_len;
++ 	u32 rx_ampdu_ref;
++ 
++ 	struct mutex mutex;
++ 
++ 	const struct mt76_bus_ops *bus;
++ 	const struct mt76_driver_ops *drv;
++ 	const struct mt76_mcu_ops *mcu_ops;
++ 
++ 	/* Optional callback to finalize wiphy state before registration. */
++ 	int (*init_wiphy)(struct mt76_dev *dev);
++ 	struct device *dev;
++ 	struct device *dma_dev;
++ 
++ 	struct mt76_mcu mcu;
++ 
++ 	struct net_device *napi_dev;
++ 	struct net_device *tx_napi_dev;
++ 	spinlock_t rx_lock;
++ 	struct napi_struct napi[__MT_RXQ_MAX];
++ 	struct sk_buff_head rx_skb[__MT_RXQ_MAX];
++ 	struct tasklet_struct irq_tasklet;
++ 
++ 	struct list_head txwi_cache;
++ 	struct list_head rxwi_cache;
++ 	struct mt76_queue *q_mcu[__MT_MCUQ_MAX];
++ 	struct mt76_queue q_rx[__MT_RXQ_MAX];
++ 	const struct mt76_queue_ops *queue_ops;
++ 	int tx_dma_idx[4];
++ 	enum mt76_hwrro_mode hwrro_mode;
++ 
++ 	struct mt76_worker tx_worker;
++ 	struct napi_struct tx_napi;
++ 
++ 	spinlock_t token_lock;
++ 	struct idr token;
++ 	u16 wed_token_count;
++ 	u16 token_count;
++ 	u16 token_start;
++ 	u16 token_size;
++ 
++ 	spinlock_t rx_token_lock;
++ 	struct idr rx_token;
++ 	u16 rx_token_size;
++ 
++@@ -1556,200 +1557,201 @@
 + 	     struct mt76_wcid *wcid, struct sk_buff *skb);
 + void mt76_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq);
 + void mt76_stop_tx_queues(struct mt76_phy *phy, struct ieee80211_sta *sta,
@@ -1233,6 +1698,209 @@ new file mode 100644
 + 					struct mt76_queue *q)
 + {
 + }
++@@ -1765,200 +1767,202 @@
++ 					enum tc_setup_type type,
++ 					void *type_data)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline int mt76_npu_send_txrx_addr(struct mt76_dev *dev, int ifindex,
++ 					  u32 direction, u32 i_count_addr,
++ 					  u32 o_status_addr, u32 o_count_addr)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ #endif /* CONFIG_MT76_NPU */
++ 
++ static inline bool mt76_npu_device_active(struct mt76_dev *dev)
++ {
++ 	return mt76_is_mmio(dev) && !!rcu_access_pointer(dev->mmio.npu);
++ }
++ 
++ static inline bool mt76_ppe_device_active(struct mt76_dev *dev)
++ {
++ 	return mt76_is_mmio(dev) && !!rcu_access_pointer(dev->mmio.ppe_dev);
++ }
++ 
++ static inline int mt76_npu_send_msg(struct airoha_npu *npu, int ifindex,
++ 				    enum airoha_npu_wlan_set_cmd cmd,
++ 				    u32 val, gfp_t gfp)
++ {
++ 	return airoha_npu_wlan_send_msg(npu, ifindex, cmd, &val, sizeof(val),
++ 					gfp);
++ }
++ 
++ static inline int mt76_npu_get_msg(struct airoha_npu *npu, int ifindex,
++ 				   enum airoha_npu_wlan_get_cmd cmd,
++ 				   u32 *val, gfp_t gfp)
++ {
++ 	return airoha_npu_wlan_get_msg(npu, ifindex, cmd, val, sizeof(*val),
++ 				       gfp);
++ }
++ 
++ static inline void mt76_testmode_reset(struct mt76_phy *phy, bool disable)
++ {
++ #ifdef CONFIG_NL80211_TESTMODE
++ 	enum mt76_testmode_state state = MT76_TM_STATE_IDLE;
++ 
++ 	if (disable || phy->test.state == MT76_TM_STATE_OFF)
++ 		state = MT76_TM_STATE_OFF;
++ 
++ 	mt76_testmode_set_state(phy, state);
++ #endif
++ }
++ 
++ extern const struct nla_policy mt76_tm_policy[NUM_MT76_TM_ATTRS];
++ 
++ /* internal */
++ static inline struct ieee80211_hw *
++ mt76_tx_status_get_hw(struct mt76_dev *dev, struct sk_buff *skb)
++ {
++ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++ 	u8 phy_idx = (info->hw_queue & MT_TX_HW_QUEUE_PHY) >> 2;
++ 	struct ieee80211_hw *hw = mt76_phy_hw(dev, phy_idx);
++ 
++ 	info->hw_queue &= ~MT_TX_HW_QUEUE_PHY;
++ 
++ 	return hw;
++ }
++ 
++ void mt76_put_txwi(struct mt76_dev *dev, struct mt76_txwi_cache *t);
++ void mt76_put_rxwi(struct mt76_dev *dev, struct mt76_txwi_cache *t);
++ struct mt76_txwi_cache *mt76_get_rxwi(struct mt76_dev *dev);
++ void mt76_free_pending_rxwi(struct mt76_dev *dev);
++ void mt76_rx_complete(struct mt76_dev *dev, struct sk_buff_head *frames,
++ 		      struct napi_struct *napi);
++ void mt76_rx_poll_complete(struct mt76_dev *dev, enum mt76_rxq_id q,
++ 			   struct napi_struct *napi);
++ void mt76_rx_aggr_reorder(struct sk_buff *skb, struct sk_buff_head *frames);
++ void mt76_testmode_tx_pending(struct mt76_phy *phy);
++ void mt76_queue_tx_complete(struct mt76_dev *dev, struct mt76_queue *q,
++ 			    struct mt76_queue_entry *e);
++ int __mt76_set_channel(struct mt76_phy *phy, struct cfg80211_chan_def *chandef,
++ 		       bool offchannel);
++ 
++ static inline bool
++ mt76_offchannel_chandef(struct mt76_phy *phy, struct ieee80211_channel *chan,
++ 			struct cfg80211_chan_def *chandef)
++ {
++ 	cfg80211_chandef_create(chandef, chan, NL80211_CHAN_HT20);
++ 	if (phy->main_chandef.chan != chan)
++ 		return true;
++ 
++ 	*chandef = phy->main_chandef;
++ 	return false;
++ }
++ int mt76_set_channel(struct mt76_phy *phy, struct cfg80211_chan_def *chandef,
++ 		     bool offchannel);
++ void mt76_scan_work(struct work_struct *work);
++ void mt76_abort_scan(struct mt76_dev *dev);
++ void mt76_roc_complete_work(struct work_struct *work);
++ void mt76_roc_complete(struct mt76_phy *phy);
++ void mt76_abort_roc(struct mt76_phy *phy);
+++int mt76_restore_main_chan(struct mt76_phy *phy, bool notify);
+++void mt76_main_chan_work(struct work_struct *work);
++ struct mt76_vif_link *mt76_get_vif_phy_link(struct mt76_phy *phy,
++ 					    struct ieee80211_vif *vif);
++ void mt76_put_vif_phy_link(struct mt76_phy *phy, struct ieee80211_vif *vif,
++ 			   struct mt76_vif_link *mlink);
++ void mt76_offchannel_notify(struct mt76_phy *phy, bool offchannel);
++ 
++ /* usb */
++ static inline bool mt76u_urb_error(struct urb *urb)
++ {
++ 	return urb->status &&
++ 	       urb->status != -ECONNRESET &&
++ 	       urb->status != -ESHUTDOWN &&
++ 	       urb->status != -ENOENT;
++ }
++ 
++ static inline int
++ mt76u_bulk_msg(struct mt76_dev *dev, void *data, int len, int *actual_len,
++ 	       int timeout, int ep)
++ {
++ 	struct usb_interface *uintf = to_usb_interface(dev->dev);
++ 	struct usb_device *udev = interface_to_usbdev(uintf);
++ 	struct mt76_usb *usb = &dev->usb;
++ 	unsigned int pipe;
++ 
++ 	if (actual_len)
++ 		pipe = usb_rcvbulkpipe(udev, usb->in_ep[ep]);
++ 	else
++ 		pipe = usb_sndbulkpipe(udev, usb->out_ep[ep]);
++ 
++ 	return usb_bulk_msg(udev, pipe, data, len, actual_len, timeout);
++ }
++ 
++ void mt76_ethtool_page_pool_stats(struct mt76_dev *dev, u64 *data, int *index);
++ void mt76_ethtool_worker(struct mt76_ethtool_worker_info *wi,
++ 			 struct mt76_sta_stats *stats, bool eht);
++ int mt76_skb_adjust_pad(struct sk_buff *skb, int pad);
++ int __mt76u_vendor_request(struct mt76_dev *dev, u8 req, u8 req_type,
++ 			   u16 val, u16 offset, void *buf, size_t len);
++ int mt76u_vendor_request(struct mt76_dev *dev, u8 req,
++ 			 u8 req_type, u16 val, u16 offset,
++ 			 void *buf, size_t len);
++ void mt76u_single_wr(struct mt76_dev *dev, const u8 req,
++ 		     const u16 offset, const u32 val);
++ void mt76u_read_copy(struct mt76_dev *dev, u32 offset,
++ 		     void *data, int len);
++ u32 ___mt76u_rr(struct mt76_dev *dev, u8 req, u8 req_type, u32 addr);
++ void ___mt76u_wr(struct mt76_dev *dev, u8 req, u8 req_type,
++ 		 u32 addr, u32 val);
++ int __mt76u_init(struct mt76_dev *dev, struct usb_interface *intf,
++ 		 struct mt76_bus_ops *ops);
++ int mt76u_init(struct mt76_dev *dev, struct usb_interface *intf);
++ int mt76u_alloc_mcu_queue(struct mt76_dev *dev);
++ int mt76u_alloc_queues(struct mt76_dev *dev);
++ void mt76u_stop_tx(struct mt76_dev *dev);
++ void mt76u_stop_rx(struct mt76_dev *dev);
++ int mt76u_resume_rx(struct mt76_dev *dev);
++ void mt76u_queues_deinit(struct mt76_dev *dev);
++ 
++ int mt76s_init(struct mt76_dev *dev, struct sdio_func *func,
++ 	       const struct mt76_bus_ops *bus_ops);
++ int mt76s_alloc_rx_queue(struct mt76_dev *dev, enum mt76_rxq_id qid);
++ int mt76s_alloc_tx(struct mt76_dev *dev);
++ void mt76s_deinit(struct mt76_dev *dev);
++ void mt76s_sdio_irq(struct sdio_func *func);
++ void mt76s_txrx_worker(struct mt76_sdio *sdio);
++ bool mt76s_txqs_empty(struct mt76_dev *dev);
++ int mt76s_hw_init(struct mt76_dev *dev, struct sdio_func *func,
++ 		  int hw_ver);
++ u32 mt76s_rr(struct mt76_dev *dev, u32 offset);
++ void mt76s_wr(struct mt76_dev *dev, u32 offset, u32 val);
++ u32 mt76s_rmw(struct mt76_dev *dev, u32 offset, u32 mask, u32 val);
++ u32 mt76s_read_pcr(struct mt76_dev *dev);
++ void mt76s_write_copy(struct mt76_dev *dev, u32 offset,
++ 		      const void *data, int len);
++ void mt76s_read_copy(struct mt76_dev *dev, u32 offset,
++ 		     void *data, int len);
++ int mt76s_wr_rp(struct mt76_dev *dev, u32 base,
++ 		const struct mt76_reg_pair *data,
++ 		int len);
++ int mt76s_rd_rp(struct mt76_dev *dev, u32 base,
++ 		struct mt76_reg_pair *data, int len);
++ 
++ struct sk_buff *
++ __mt76_mcu_msg_alloc(struct mt76_dev *dev, const void *data,
++ 		     int len, int data_len, gfp_t gfp);
++ static inline struct sk_buff *
++ mt76_mcu_msg_alloc(struct mt76_dev *dev, const void *data,
++ 		   int data_len)
++ {
++ 	return __mt76_mcu_msg_alloc(dev, data, data_len, data_len, GFP_KERNEL);
++ }
++ 
++ void mt76_mcu_rx_event(struct mt76_dev *dev, struct sk_buff *skb);
++ struct sk_buff *mt76_mcu_get_response(struct mt76_dev *dev,
++ 				      unsigned long expires);
++ int mt76_mcu_send_and_get_msg(struct mt76_dev *dev, int cmd, const void *data,
++ 			      int len, bool wait_resp, struct sk_buff **ret);
++ int mt76_mcu_skb_send_and_get_msg(struct mt76_dev *dev, struct sk_buff *skb,
++ 				  int cmd, bool wait_resp, struct sk_buff **ret);
++ int __mt76_mcu_send_firmware(struct mt76_dev *dev, int cmd, const void *data,
 +--- a/mt7996/dma.c
 ++++ b/mt7996/dma.c
 +@@ -860,198 +860,211 @@
@@ -4218,7 +4886,7 @@ new file mode 100644
 + }
 +--- a/scan.c
 ++++ b/scan.c
-+@@ -1,333 +1,354 @@
++@@ -1,333 +1,343 @@
 + // SPDX-License-Identifier: BSD-3-Clause-Clear
 + /*
 +  * Copyright (C) 2024 Felix Fietkau <nbd@nbd.name>
@@ -4254,22 +4922,16 @@ new file mode 100644
 + 	 * any channel set during the scan ran with MT76_SCANNING held, which
 + 	 * left DFS radar detection disabled
 + 	 */
-+ 	if (phy->main_chandef.chan &&
-+ 	    !test_bit(MT76_MCU_RESET, &dev->phy.state)) {
-+ 		bool offchannel = phy->offchannel;
-+ 
++-	if (phy->main_chandef.chan &&
++-	    !test_bit(MT76_MCU_RESET, &dev->phy.state)) {
++-		bool offchannel = phy->offchannel;
++-
 +-		__mt76_set_channel(phy, &phy->main_chandef, false);
 +-		if (offchannel)
-++		/* Nothing retries the operating channel after the scan, so a
-++		 * failure must not leave the restored off-channel flag gating
-++		 * TX on this band
-++		 */
-++		if (__mt76_set_channel(phy, &phy->main_chandef, false)) {
-++			phy->offchannel = false;
++-			mt76_offchannel_notify(phy, false);
+++	if (phy->main_chandef.chan) {
+++		if (mt76_restore_main_chan(phy, phy->offchannel))
 ++			abort = true;
-++		}
-++		if (offchannel && !test_bit(MT76_MCU_RESET, &dev->phy.state))
-+ 			mt76_offchannel_notify(phy, false);
 + 	} else {
 + 		/* A phy that has no operating channel has nothing to restore,
 + 		 * but the flag also gates the TX queues of every station whose
