@@ -128,12 +128,12 @@ per-radio counter collection remain in place. Compared with repeated global
 queries from multiple PHYs, the global sampling frequency is lower; verify
 airtime accounting and RSSI/rate update responsiveness during device testing.
 
-Starting with mt76 package release 16, only the solicited RSSI response wait
-releases the device mutex. A device-wide in-flight flag prevents another PHY
-from starting a duplicate poll. Each requested WCID carries a host-side lifetime
-snapshot; samples crossing that station's removal/reallocation are discarded.
-Unrelated station changes do not discard valid samples. MCU reset cancels the
-reply, and no station pointer is retained for use across the wait.
+Only the solicited RSSI response wait releases the device mutex. A device-wide
+in-flight flag prevents another PHY from starting a duplicate poll. Each
+requested WCID carries a host-side lifetime snapshot; samples crossing that
+station's removal/reallocation are discarded. Unrelated station changes do not
+discard valid samples. MCU reset cancels the reply, and no station pointer is
+retained for use across the wait.
 Rate, airtime and traffic-counter requests retain their asynchronous protocol
 and counter semantics. An invalidated RSSI sample is retried on the next normal
 cycle, without extending the configured polling interval.

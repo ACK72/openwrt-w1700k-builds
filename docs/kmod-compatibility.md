@@ -33,12 +33,15 @@ Official kmods that cannot work on this firmware:
   load against different structures. The review below does not cover
   out-of-tree packages, so do not install these.
 
-The image's mt76 and hostapd packages use release 16, which keeps them above
-official builds of the same source. Once the official feeds update the mt76 or
-hostapd source, their packages have a higher version, and `apk upgrade` would
-replace the image's ones and drop these patches, including the NAPI names the
-affinity policy requires. Do not upgrade `kmod-mt76*`, `kmod-mt7996*`,
-`hostapd*` or `wpad*` from the official feeds; install a newer image instead.
+The source composition sets the release of the image's mt76 and hostapd
+packages to the official release plus 100 (`release_offset` in
+[`patches/w1700k/series.json`](../patches/w1700k/series.json)), which keeps
+them above official builds of the same source, including later release-only
+bumps. Once the official feeds update the mt76 or hostapd source, their
+packages have a higher version, and `apk upgrade` would replace the image's
+ones and drop these patches, including the NAPI names the affinity policy
+requires. Do not upgrade `kmod-mt76*`, `kmod-mt7996*`, `hostapd*` or `wpad*`
+from the official feeds; install a newer image instead.
 
 ## When the review stops a build
 

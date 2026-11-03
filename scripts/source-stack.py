@@ -20,6 +20,7 @@ FANBOY_REPO = "https://github.com/OpenWRT-fanboy/OpenW1700k.git"
 RC = "w1700k-oc-rc"
 STABLE = "w1700k-oc"
 SHA = re.compile(r"[a-f0-9]{40}\Z")
+RELEASE = re.compile(r"^(PKG_RELEASE\s*:?=\s*)(\d+)[ \t]*$", re.M)
 
 
 def git(root, *args, env=None):
@@ -77,6 +78,37 @@ def checkout(root, source, upstream, fanboy):
     git(root, "fetch", "--filter=blob:none", "--no-tags", "upstream", "+refs/heads/main:refs/remotes/upstream/main")
 
 
+def offset_releases(root, official, config):
+    """Set each recipe's release to the official one plus the offset.
+
+    apk compares releases only between builds of the same source version, so
+    the patched packages stay above official builds of it, including later
+    release-only bumps, without a patch that carries upstream's release.
+    """
+    offset = config["offset"]
+    if type(offset) is not int or offset <= 0:
+        raise ValueError("Invalid release offset")
+    releases = {}
+    for name in config["recipes"]:
+        if Path(name).is_absolute() or ".." in Path(name).parts:
+            raise ValueError("Invalid recipe path")
+        path = root / name
+        content = path.read_bytes().decode()
+        stock = RELEASE.findall(git(root, "show", f"{official}:{name}"))
+        if len(stock) != 1 or len(RELEASE.findall(content)) != 1:
+            raise ValueError(f"Expected one numeric PKG_RELEASE in {name}")
+        release = int(stock[0][1]) + offset
+        path.write_bytes(RELEASE.sub(lambda match: match[1] + str(release), content).encode())
+        releases[name] = release
+    env = os.environ.copy()
+    env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = git(root, "show", "-s", "--format=%cI", "HEAD")
+    git(root, "commit", "-m", f"package: raise patched package releases by {offset}\n\n"
+        "Each PKG_RELEASE is the official release plus the offset, so apk keeps\n"
+        "these packages above official builds of the same source.",
+        "--", *config["recipes"], env=env)
+    return releases
+
+
 def compose(root, patches, builder, source=None, upstream=UPSTREAM_REPO, fanboy=FANBOY_REPO):
     if not SHA.fullmatch(builder):
         raise ValueError("The builder revision must be an exact commit")
@@ -120,8 +152,13 @@ def compose(root, patches, builder, source=None, upstream=UPSTREAM_REPO, fanboy=
         git(root, "am", "--3way", "--committer-date-is-author-date", str(path.resolve()))
         local_patches.append({**entry, "applied": git(root, "rev-parse", "HEAD"),
                     "sha256": hashlib.sha256(content).hexdigest()})
+    release_offset = series["release_offset"]
+    digest.update(b"release_offset\0" + json.dumps(release_offset, sort_keys=True).encode() + b"\0")
+    releases = offset_releases(root, official, release_offset)
     result = {"schema": 1, "upstream": official, "fanboy": vendor, "fanboy_base": base,
               "fanboy_result": vendor_result, "fanboy_commits": mapping, "local_patches": local_patches,
+              "release_offset": {"offset": release_offset["offset"], "releases": releases,
+                                 "applied": git(root, "rev-parse", "HEAD")},
               "patch_digest": digest.hexdigest(), "builder_commit": builder,
               "source": git(root, "rev-parse", "HEAD"), "previous": heads}
     git(root, "diff", "--exit-code", "HEAD")
