@@ -60,7 +60,7 @@
         "044 (upstream in mt76 d17b8d5eff29)",
         "949 (upstream in airoha 185)",
         "957 (upstream in airoha 188)",
-        "980"
+        "980 (Vitaliy Sochnev, netdev: net: airoha: handle RX_NO_CPU_DSCP interrupt)"
       ],
       "source": "Gilly1970/Gemtek-W1700K-6.18@0aa0666de1366b69d5d73d98c19809affc1f76ed"
     },

@@ -33,8 +33,10 @@ flow to another hardware entry first removes the previous binding; a failed
 removal retains its owner. A timed-out MAC write or uncertain flow programming
 quarantines only the affected slot until full hardware initialization; a flow
 with an earlier hardware error cannot make its slot reusable on final deletion.
-When all usable slots have live references or are quarantined, additional
-distinct MACs use software forwarding. Slot reuse relies on the existing PPE
+Each quarantined slot is logged once ("IPv6 source MAC slot N quarantined until
+the PPE is reinitialized"); reloading the Ethernet driver or rebooting returns
+it to the pool. When all usable slots have live references or are quarantined,
+additional distinct MACs use software forwarding. Slot reuse relies on the existing PPE
 invalidation/ACK and coherent-memory ordering contract; software fault tests
 do not establish hardware pipeline timing. IPv4 inline MAC handling and bridge
 subflows that preserve the original source MAC retain their existing behavior.
