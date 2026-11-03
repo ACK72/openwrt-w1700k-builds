@@ -72,7 +72,7 @@ prepare() {
     rm -f "$WORK/build-stopped" "$WORK/make.pgid" "$WORK/downloads-before"
     OPENWRT_REPO=${OPENWRT_REPO:-$(python3 "$ROOT/scripts/repositories.py" openwrt)}
     checkout_source "$OPENWRT_REPO" "$OPENWRT_REF" "$OPENWRT" full
-    python3 "$ROOT/scripts/official_npu.py" check "$OPENWRT"
+    python3 "$ROOT/scripts/npu_firmware.py" check "$OPENWRT"
     # Preserve fast ccache compression independently of the firmware provider.
     sed -i 's/export CCACHE_NOCOMPRESS:=true/export CCACHE_COMPRESS:=true/' "$OPENWRT/rules.mk"
     mkdir -p "$CACHE/dl"
@@ -85,7 +85,7 @@ prepare() {
     fi
     {
         echo "openwrt=$(git -C "$OPENWRT" rev-parse HEAD)"
-        echo "npu=linux-firmware"
+        echo "npu=airoha-npu-0.8-test"
     } | tee "$WORK/sources.env"
 }
 
@@ -381,7 +381,7 @@ collect() {
     cp "$WORK/image-metadata.json" "$dest/image-metadata.json"
     cp "$OPENWRT/public-key.pem" "$dest/public-key.pem"
     "$OPENWRT/scripts/diffconfig.sh" > "$dest/config.diff"
-    python3 "$ROOT/scripts/official_npu.py" collect "$OPENWRT" "$dest"
+    python3 "$ROOT/scripts/npu_firmware.py" collect "$OPENWRT" "$dest"
     python3 "$ROOT/scripts/build-meta.py" manifest "$OPENWRT" "$dest"
     # Packages selected with =y are already installed in the image rootfs.
     # Keep diagnostics in the Actions artifact; releases publish only the ITB.

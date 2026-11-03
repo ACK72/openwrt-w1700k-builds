@@ -7,8 +7,10 @@ according with:
 
 	LICENSES/GPL-2.0
 
-The official prebuilt NPU firmware retains its Airoha license from
-linux-firmware. The build artifact includes that license alongside both blobs.
+The prebuilt NPU firmware is the v0.8 test binary from
+https://github.com/zhengping-zhang/airoha-npu (commit 1df6a36f849e), which
+the fanboy stack installs unchanged. That source publishes no license for it;
+the build artifact records its source alongside both blobs.
 
 The full license text is included in LICENSES/GPL-2.0.
 

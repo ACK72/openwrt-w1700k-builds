@@ -25,7 +25,7 @@ function plan_file(plan, path, value, effective) {
 		push(plan, { path, value, old, effective });
 }
 
-// MT7996 + official NPU topology on this board. Names come from RX queue
+// MT7996 + NPU topology on this board. Names come from RX queue
 // registration, including the idle firmware-owned RRO/page contexts.
 // PCIe IRQs deliver on CPU0; only NPU host RX IRQs deliver on CPU3.
 const wifi_roles = {

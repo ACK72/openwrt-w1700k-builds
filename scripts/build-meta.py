@@ -9,7 +9,7 @@ import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from official_npu import BINARIES, stock_npu_info, npu_identity
+from npu_firmware import BINARIES, npu_info, npu_identity
 from repositories import builder_repository
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -216,7 +216,7 @@ def check_installed(openwrt):
 
 
 def keys(openwrt):
-    npu = stock_npu_info(openwrt)
+    npu = npu_info(openwrt)
     commit = builder_commit()
     feeds = {
         p.name: git(p, "rev-parse", "HEAD")
@@ -261,8 +261,8 @@ def keys(openwrt):
     build = hashlib.sha256(("build-v4" + base_inputs + kernel_hash + vermagic).encode()).hexdigest()
     state = {
         "openwrt": git(openwrt, "rev-parse", "HEAD"),
-        "npu": "linux-firmware:" + npu["version"],
-        "npu_source": "linux-firmware", "npu_upstream": npu,
+        "npu": npu["provider"] + ":" + npu["version"],
+        "npu_source": npu["provider"], "npu_upstream": npu,
         "feeds": feeds, "builder": builder_hash, "builder_commit": commit, "toolchain": toolchain,
         "compiler": compiler, "host": host_hash, "build": build,
         "config": digest_paths(openwrt, [".config"]), "channel": "w1700k-oc-rc",
@@ -306,9 +306,10 @@ def manifest(openwrt, output):
     state["built_at"] = datetime.now(timezone.utc).isoformat()
     state["official_distfeeds"] = json.loads((openwrt.parent / "distfeeds.json").read_text(encoding="utf-8"))
     state["changelog"] = git(openwrt, "log", "-20", "--format=%h %s", "--abbrev=10", "HEAD").splitlines()
-    if state["npu_source"] != "linux-firmware" or state["npu_upstream"] != stock_npu_info(openwrt):
+    npu = npu_info(openwrt)
+    if state["npu_source"] != npu["provider"] or state["npu_upstream"] != npu:
         raise ValueError("NPU provider changed since configuration")
-    state["npu_compiler"] = None  # Official prebuilt binaries, not locally compiled.
+    state["npu_compiler"] = None  # Prebuilt binaries, not locally compiled.
     state["npu_patches"] = {}
     state["firmware_sha256"] = {
         name: hashlib.sha256((output / "npu" / name).read_bytes()).hexdigest()

@@ -51,7 +51,7 @@ would require a separate driver change and validation.
 ## Threaded Wi-Fi NAPI roles
 
 The policy requires `napi_threaded=1` and the following 16 named contexts for
-the W1700K MT7996 + official NPU topology. A context's existence does not mean
+the W1700K MT7996 + NPU topology. A context's existence does not mean
 it processes packets on the CPU: several RRO/page rings are owned by the NPU.
 
 | Queue IDs | Name suffixes | Role | CPU |
