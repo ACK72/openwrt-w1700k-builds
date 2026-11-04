@@ -86,21 +86,47 @@ in place. There is no firmware power-table cache or raised power limit. Failed
 recovery still blocks MMIO and traffic restart until the existing recovery
 requirements are met.
 
-## WAN flow control at 1 Gbps (test value)
+## Known limitation: WAN flow control at 1 Gbps
 
-Some ISPs enforce a slower line on a 1 Gbps link with PAUSE frames and drop what
-arrives after their limit. With TX fragmentation off (`TX_FRAG_LEN` 31), the XSI
-MAC sends two or three more frames after it receives XOFF, enough to lose packets
-and hold a single TCP upload far below the line rate.
+On a line that an ISP limits with PAUSE on a 1 Gbps link, a single TCP upload stays
+far below the line rate, about 27 Mbps on a 100 Mbps line. With TX fragmentation off
+(`TX_FRAG_LEN` 31) the XSI MAC sends two or three more frames after it receives XOFF,
+and the ISP drops what exceeds its headroom. This firmware does not fix it.
 
-On AN7581 E2 and later, the WAN MAC therefore uses a `TX_FRAG_LEN` of 4 at 1 Gbps
-or slower. This is a test value from short measurements on one line, not a general
-fix. The field's unit is not documented, so 4 is empirical: it stopped the MAC after
-the current frame on 91% of XOFFs under saturation, 2 and 8 behaved similarly, and
-16 began to fill the FIFO during PAUSE. Other ports and faster WAN links keep 31.
-Do not write other values to the running MAC to compare them: 30 stalled TX until
-a reboot.
+Lowering `TX_FRAG_LEN` was tried and removed. In short runs with frames of about
+1,350 bytes, values 2 to 16 reached about 100 Mbps with almost no retransmissions.
+Larger frames under sustained upload then failed every time, in the same order: the
+TX FIFO underrun bit in `INT_STS`, the link going down, the link returning about 3 s
+later, and no TX afterwards, while RX continued. DHCP cannot complete, so the WAN
+loses its address. Each value was measured once:
 
-Patch 0021 lists what applying this to every port and speed still needs: the
-field's meaning, long runs, more traffic types, speeds, ports and silicon, latency
-under load, other link partners, and upstream review.
+| `TX_FRAG_LEN` | TX FIFO AEMPTY | XOFF before underrun | Data before underrun |
+| ---: | ---: | ---: | ---: |
+| 4 | 22 | 28,455 | 217 MB |
+| 8 | 22 | 3,572 | 27 MB |
+| 12 | 22 | 60 | 0.6 MB |
+| 4 | 96 | 1,605 | 12 MB |
+
+Writing 30 stalled TX within a second, so do not write this field on a running MAC.
+Taking the device down and up recovers a stalled MAC without a reboot:
+
+```sh
+ip link set dev wan down; sleep 3; ip link set dev wan up
+```
+
+The same command recovered a WAN that stayed without a link after its cable was
+plugged in, while the PHY reported 1 Gbps. That failure is intermittent and its cause
+is unknown.
+
+These had no effect on the frames sent after XOFF, on retransmissions, or on both:
+the TX data FIFO almost-full threshold, the TX header FIFO threshold, `PSE_FC_CFG` bit
+23, the pause quanta cycle and a QDMA channel limit at the link rate. The WAN MAC has no
+FE fragment register, and the RTL8261CE driver offers no rate adaptation or other host
+modes. The meaning of `TX_FRAG_LEN`, and why the vendor keeps 31 on this MAC, are not
+documented.
+
+A built-in switch port avoids this MAC. With `lan3` as the WAN on the same line, uploads
+reached 87 to 94 Mbps over 2.9 GB without a link loss, in a test of about 4 minutes.
+It only suits lines up to 1 Gbps. Take the port out of `br-lan` before connecting the
+ISP cable: on the bridge it joins the ISP to the LAN, and `dnsmasq` then turns off LAN
+DHCP until a reboot.

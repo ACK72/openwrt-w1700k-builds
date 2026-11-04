@@ -145,11 +145,6 @@
       "file": "0020-wifi-raise-sta-beacon-loss-threshold.patch",
       "description": "wifi: wait 20 beacon intervals (about 2.2 s) before reporting STA beacon loss, so short AP beacon gaps no longer disconnect the uplink",
       "author": "ACK72 <acikom72@gmail.com>"
-    },
-    {
-      "file": "0021-airoha-test-wan-tx-frag-len-4-at-1g.patch",
-      "description": "TEST VALUE, not a general fix: use TX_FRAG_LEN 4 on the AN7581 E2+ WAN MAC at 1 Gbps or slower, so it stops after the current frame on XOFF and a PAUSE-policing ISP no longer drops frames. The patch lists what a fix for every port and speed still needs.",
-      "author": "ACK72 <acikom72@gmail.com>"
     }
   ]
 }
