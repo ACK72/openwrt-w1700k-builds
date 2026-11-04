@@ -130,3 +130,25 @@ reached 87 to 94 Mbps over 2.9 GB without a link loss, in a test of about 4 minu
 It only suits lines up to 1 Gbps. Take the port out of `br-lan` before connecting the
 ISP cable: on the bridge it joins the ISP to the LAN, and `dnsmasq` then turns off LAN
 DHCP until a reboot.
+
+Limiting the link also avoids it, because the MAC then sends no faster than the ISP's
+limit and XOFF stops arriving. With only 100baseT/Full advertised on the same line,
+uploads reached about 98 to 99 Mbps with no XOFF and no link loss, in a test of about
+30 s and 0.32 GB. Set the link on the `wan` device and leave `autoneg` unset:
+
+```
+config device
+	option name 'wan'
+	option speed '100'
+	option duplex '1'
+```
+
+Autonegotiation then stays on with only that mode advertised. `autoneg '0'` forces the
+mode instead, which can drop the other end to half duplex, and it was not tested on the
+RTL8261CE. Downloads are limited to the same speed. A saturating upload raised external
+ping to about 100 ms, as it did at 1 Gbps with `TX_FRAG_LEN` 4.
+
+netifd sends these options before the device is up, and `wan` and `lan2` have no PHY at
+that point. Patch 0021 sends them again once the device is up. netifd does not record the
+previous link settings, so removing these options should only take effect at the next
+reboot.

@@ -1,0 +1,100 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Thu, 5 Nov 2026 03:00:00 +0900
+Subject: [PATCH] netifd: apply link settings again after the device is up
+
+netifd applies speed, duplex and autoneg before it brings a device up.
+airoha_eth connects the PHY in ndo_open, so phylink has no PHY to pass them
+to, and the PHY starts with autonegotiation on and every mode advertised.
+With speed 100 and duplex 1 on the wan device the link stayed at 1 Gbps
+after a reboot, and nothing reported it.
+
+Send the link settings once more right after the device comes up. wan and
+lan2 connect their PHY on open and gain the settings. lan3 and lan4 connect
+theirs at creation and get the same request twice. A device without these
+options is unaffected.
+
+diff --git a/package/network/config/netifd/patches/9999-zzzzzzzz-0021-netifd-apply-link-settings-again-after-up.patch b/package/network/config/netifd/patches/9999-zzzzzzzz-0021-netifd-apply-link-settings-again-after-up.patch
+new file mode 100644
+--- /dev/null
++++ b/package/network/config/netifd/patches/9999-zzzzzzzz-0021-netifd-apply-link-settings-again-after-up.patch
+@@ -0,0 +1,80 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Thu, 5 Nov 2026 03:00:00 +0900
++Subject: [PATCH] system-linux: apply link settings again after the device is up
++
++netifd applies speed, duplex and autoneg before it brings a device up. A
++driver that connects its PHY in ndo_open has no PHY at that point, so
++phylink cannot pass them on, and the PHY then starts with autonegotiation
++on and every mode advertised. The ioctl result is not checked, so nothing
++reports this. On airoha_eth, speed 100 and duplex 1 left the link at 1 Gbps.
++
++Send the link settings once more right after the device comes up. Only that
++request runs again. The pause ioctl stays out because phylink reports rx and
++tx off under autonegotiation, and sending that back clears the pause
++advertisement on a device with nothing else to set.
++
++Commit 68c8a4f94 did this from link events and 02aa43d82 reverted it because
++it upset some PHY drivers. This runs once per bring-up, not on link events,
++and does nothing on a device without these options. A PHY attached later,
++such as on a hot-plugged SFP module, still misses the settings.
++
++--- a/system-linux.c
+++++ b/system-linux.c
++@@ -2751,7 +2751,7 @@ static int system_pse_set(struct device *dev, struct device_settings *s)
++ }
++ 
++ static void
++-system_set_ethtool_settings(struct device *dev, struct device_settings *s)
+++system_set_ethtool_link_settings(struct device *dev, struct device_settings *s)
++ {
++ 	struct {
++ 		struct ethtool_link_settings req;
++@@ -2764,15 +2764,6 @@ system_set_ethtool_settings(struct device *dev, struct device_settings *s)
++ 	__s8 nwords;
++ 	__u32 *supported, *advertising;
++ 
++-	system_set_ethtool_pause(dev, s);
++-
++-	if (s->flags & DEV_OPT_EEE)
++-		system_set_ethtool_eee_settings(dev, s);
++-
++-	/* Apply PSE (PoE) settings if configured */
++-	if (s->flags & (DEV_OPT_PSE | DEV_OPT_PSE_PODL | DEV_OPT_PSE_POWER_LIMIT | DEV_OPT_PSE_PRIORITY))
++-		system_pse_set(dev, s);
++-
++ 	/* Avoid a rmw ioctl call if nothing needs to be changed. */
++ 	if (!(s->flags & (DEV_OPT_AUTONEG | DEV_OPT_SPEED | DEV_OPT_DUPLEX | DEV_OPT_PAUSE | DEV_OPT_ASYM_PAUSE)))
++ 		return;
++@@ -2836,11 +2827,32 @@ system_set_ethtool_settings(struct device *dev, struct device_settings *s)
++ 	ioctl(sock_ioctl, SIOCETHTOOL, &ifr);
++ }
++ 
+++static void
+++system_set_ethtool_settings(struct device *dev, struct device_settings *s)
+++{
+++	system_set_ethtool_pause(dev, s);
+++
+++	if (s->flags & DEV_OPT_EEE)
+++		system_set_ethtool_eee_settings(dev, s);
+++
+++	/* Apply PSE (PoE) settings if configured */
+++	if (s->flags & (DEV_OPT_PSE | DEV_OPT_PSE_PODL | DEV_OPT_PSE_POWER_LIMIT | DEV_OPT_PSE_PRIORITY))
+++		system_pse_set(dev, s);
+++
+++	system_set_ethtool_link_settings(dev, s);
+++}
+++
++ static void
++ system_set_ethtool_settings_after_up(struct device *dev, struct device_settings *s)
++ {
++ 	if (s->flags & DEV_OPT_GRO)
++ 		system_set_ethtool_gro(dev, s);
+++
+++	/*
+++	 * A driver that connects its PHY in ndo_open has no PHY while the device
+++	 * is down, so link settings made then never reach it. Apply them again.
+++	 */
+++	system_set_ethtool_link_settings(dev, s);
++ }
++ 
++ void

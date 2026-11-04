@@ -145,6 +145,11 @@
       "file": "0020-wifi-raise-sta-beacon-loss-threshold.patch",
       "description": "wifi: wait 20 beacon intervals (about 2.2 s) before reporting STA beacon loss, so short AP beacon gaps no longer disconnect the uplink",
       "author": "ACK72 <acikom72@gmail.com>"
+    },
+    {
+      "file": "0021-netifd-apply-link-settings-again-after-up.patch",
+      "description": "netifd: send link settings again right after a device comes up, so speed and duplex reach PHYs connected in ndo_open",
+      "author": "ACK72 <acikom72@gmail.com>"
     }
   ]
 }
