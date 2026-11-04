@@ -1,0 +1,201 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Wed, 4 Nov 2026 19:00:00 +0900
+Subject: [PATCH] airoha: test TX_FRAG_LEN 4 on the WAN MAC at 1 Gbps
+
+TEST VALUE. This addresses PAUSE overshoot on one measured setup: a W1700K
+(E2) WAN at 1 Gbps on a 100 Mbps line that an ISP enforces with PAUSE. It is
+not a general fix. Keep it only until the conditions below are met or the
+value is replaced.
+
+With TX fragmentation off (TX_FRAG_LEN 31, set in post_config), the MAC
+keeps starting frames for about 20 us after it receives XOFF. At 1 Gbps
+that is two or three frames. An ISP that enforces a slower line with PAUSE
+drops what exceeds its headroom: a single TCP upload stays near 27 Mbps
+with 0.3% of its segments retransmitted, while a PC directly on the same
+line reaches the line rate.
+
+Measured during an upload, writing the register at run
+time for 8 to 12 s per value:
+
+  TX_FRAG_LEN  WAN TX    retransmitted  2+ frames after XOFF  FIFO full in pause
+           31   27 Mbps  0.28%                           58%                 73%
+           16  100 Mbps  0.009%                           7%                2.5%
+            8  100 Mbps  0.002%                           9%                  0%
+            4  102 Mbps  0.003%                           9%                  0%
+            2   98 Mbps  0.012%                          11%                  0%
+
+Writing 30 stalled TX within a second and the router needed a reboot.
+
+What 4 means: TX_FRAG_LEN is bits 21:17 of the XSI MAC's GLB_CFG. The driver
+and the vendor SDK use the maximum, 31, as "fragmentation off". The unit of
+smaller values and how they change the reaction to PAUSE are not documented,
+so 4 is not derived from a frame size or link rate. It was chosen because:
+- With 4 the MAC finished the current frame and stopped on 91% of XOFFs under
+  saturation, with the highest WAN TX of the values measured.
+- 2 and 8 gave similar results, but 16 began to show a full FIFO during PAUSE
+  and 30 stalled TX, so 4 stays away from the values that behaved worse.
+- A copy of the vendor SDK, whose origin is not verified, sets 4 on its PCIe,
+  USB and ETH MACs from E2 on. The same SDK keeps 31 before E2 and on this AE
+  WAN MAC, the latter without saying why, so it does not vouch for this port.
+
+Only the AN7581 WAN (PON PCS), E2 or later, at 1 Gbps or slower changes. Other
+ports and faster WAN links keep 31. The value is set in pcs_link_up(), where
+the speed is known and TX has been stopped since pcs_link_down() or
+pcs_pre_config().
+
+Required before applying this to every port and speed, or calling it a fix:
+1. Meaning: find out from Airoha or from measurements what TX_FRAG_LEN controls,
+   its unit and valid range, why 30 stalls TX, and why the SDK keeps 31 on the
+   AE WAN MAC.
+2. Long runs: hours of upload and download on this firmware with the TX FIFO
+   underrun and overrun bits of INT_STS clear, no TX stall, and the value kept
+   across reboots and link flaps. SMB reaches about 9 MB/s at PC links of 2.5G,
+   1G and 100M.
+3. Traffic: sustained 64 to 1514 byte frames, jumbo frames, PPPoE and VLAN,
+   through hardware offload, the CPU path and hardware QoS.
+4. Speeds: 10M to 10G on the WAN with a partner that sends PAUSE, and full line
+   rate at each speed without underruns, including a real 1 Gbps uplink.
+5. Ports: lan2 (GDM4, together with its FE fragment sizes), and the USB and PCIe
+   SerDes.
+6. Silicon: E1 stays excluded unless its flow control conflict is understood,
+   and AN7583 and later revisions are measured separately.
+7. Side effects: upload latency and simultaneous download compared with 31 and
+   with a PC on the line, because PAUSE now limits the flow instead of drops,
+   and no loss on other ports sharing the PSE buffers.
+8. Link partners: no regression on lines that do not police with PAUSE, and on
+   other ISPs that do.
+9. Review: acceptance by netdev or Airoha, based on measurements and not on the
+   unverified SDK copy.
+
+diff --git a/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0021-airoha-test-wan-tx-frag-len-4-at-1g.patch b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0021-airoha-test-wan-tx-frag-len-4-at-1g.patch
+new file mode 100644
+--- /dev/null
++++ b/target/linux/airoha/patches-6.18/9999-zzzzzzzz-0021-airoha-test-wan-tx-frag-len-4-at-1g.patch
+@@ -0,0 +1,127 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Wed, 4 Nov 2026 19:00:00 +0900
++Subject: [PATCH] net: pcs: airoha: test TX_FRAG_LEN 4 on the WAN MAC at 1 Gbps
++
++TEST VALUE. This addresses PAUSE overshoot on one measured setup: a W1700K
++(E2) WAN at 1 Gbps on a 100 Mbps line that an ISP enforces with PAUSE. It is
++not a general fix. Keep it only until the conditions below are met or the
++value is replaced.
++
++With TX fragmentation off (TX_FRAG_LEN 31, set in post_config), the MAC
++keeps starting frames for about 20 us after it receives XOFF. At 1 Gbps
++that is two or three frames. An ISP that enforces a slower line with PAUSE
++drops what exceeds its headroom: a single TCP upload stays near 27 Mbps
++with 0.3% of its segments retransmitted, while a PC directly on the same
++line reaches the line rate.
++
++Measured during an upload, writing the register at run
++time for 8 to 12 s per value:
++
++  TX_FRAG_LEN  WAN TX    retransmitted  2+ frames after XOFF  FIFO full in pause
++           31   27 Mbps  0.28%                           58%                 73%
++           16  100 Mbps  0.009%                           7%                2.5%
++            8  100 Mbps  0.002%                           9%                  0%
++            4  102 Mbps  0.003%                           9%                  0%
++            2   98 Mbps  0.012%                          11%                  0%
++
++Writing 30 stalled TX within a second and the router needed a reboot.
++
++What 4 means: TX_FRAG_LEN is bits 21:17 of the XSI MAC's GLB_CFG. The driver
++and the vendor SDK use the maximum, 31, as "fragmentation off". The unit of
++smaller values and how they change the reaction to PAUSE are not documented,
++so 4 is not derived from a frame size or link rate. It was chosen because:
++- With 4 the MAC finished the current frame and stopped on 91% of XOFFs under
++  saturation, with the highest WAN TX of the values measured.
++- 2 and 8 gave similar results, but 16 began to show a full FIFO during PAUSE
++  and 30 stalled TX, so 4 stays away from the values that behaved worse.
++- A copy of the vendor SDK, whose origin is not verified, sets 4 on its PCIe,
++  USB and ETH MACs from E2 on. The same SDK keeps 31 before E2 and on this AE
++  WAN MAC, the latter without saying why, so it does not vouch for this port.
++
++Only the AN7581 WAN (PON PCS), E2 or later, at 1 Gbps or slower changes. Other
++ports and faster WAN links keep 31. The value is set in pcs_link_up(), where
++the speed is known and TX has been stopped since pcs_link_down() or
++pcs_pre_config().
++
++Required before applying this to every port and speed, or calling it a fix:
++1. Meaning: find out from Airoha or from measurements what TX_FRAG_LEN controls,
++   its unit and valid range, why 30 stalls TX, and why the SDK keeps 31 on the
++   AE WAN MAC.
++2. Long runs: hours of upload and download on this firmware with the TX FIFO
++   underrun and overrun bits of INT_STS clear, no TX stall, and the value kept
++   across reboots and link flaps. SMB reaches about 9 MB/s at PC links of 2.5G,
++   1G and 100M.
++3. Traffic: sustained 64 to 1514 byte frames, jumbo frames, PPPoE and VLAN,
++   through hardware offload, the CPU path and hardware QoS.
++4. Speeds: 10M to 10G on the WAN with a partner that sends PAUSE, and full line
++   rate at each speed without underruns, including a real 1 Gbps uplink.
++5. Ports: lan2 (GDM4, together with its FE fragment sizes), and the USB and PCIe
++   SerDes.
++6. Silicon: E1 stays excluded unless its flow control conflict is understood,
++   and AN7583 and later revisions are measured separately.
++7. Side effects: upload latency and simultaneous download compared with 31 and
++   with a PC on the line, because PAUSE now limits the flow instead of drops,
++   and no loss on other ports sharing the PSE buffers.
++8. Link partners: no regression on lines that do not police with PAUSE, and on
++   other ISPs that do.
++9. Review: acceptance by netdev or Airoha, based on measurements and not on the
++   unverified SDK copy.
++
++--- a/drivers/net/pcs/airoha/pcs-airoha-common.c
+++++ b/drivers/net/pcs/airoha/pcs-airoha-common.c
++@@ -881,6 +881,24 @@ static void airoha_pcs_link_up(struct phylink_pcs *pcs, unsigned int neg_mode,
++ 	if (data->link_up)
++ 		data->link_up(priv, port->index);
++ 
+++	/* TEST VALUE, not a general fix. This patch's description lists what a
+++	 * fix for every port and speed still needs.
+++	 *
+++	 * With TX_FRAG_LEN at its maximum, 31, which means fragmentation off,
+++	 * the MAC keeps starting frames for about 20 us after it receives XOFF:
+++	 * two or three frames at 1 Gbps. A link partner that polices with PAUSE
+++	 * drops what exceeds its headroom. With 4 the MAC usually finishes the
+++	 * current frame and stops. 4 is empirical: the field's unit is not
+++	 * documented, and 30 stalled TX, so other values are not interchangeable.
+++	 *
+++	 * TX is stopped here until the enable below.
+++	 */
+++	if (priv->limit_tx_frag)
+++		regmap_update_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
+++				   AIROHA_PCS_XFI_TX_FRAG_LEN,
+++				   FIELD_PREP(AIROHA_PCS_XFI_TX_FRAG_LEN,
+++					      speed <= SPEED_1000 ? 4 : 31));
+++
++ 	/* BPI BMI enable */
++ 	regmap_clear_bits(maps->pcs_mac, AIROHA_PCS_XFI_MAC_XFI_GIB_CFG,
++ 			  AIROHA_PCS_XFI_RXMPI_STOP |
++@@ -1331,6 +1349,20 @@ static int airoha_pcs_probe(struct platform_device *pdev)
++ 			priv->manual_rx_calib = true;
++ 	}
++ 
+++	/* Limited to the measured port and revisions: the vendor SDK keeps TX
+++	 * fragmentation off before E2, where it conflicts with flow control.
+++	 */
+++	if (device_is_compatible(dev, "airoha,an7581-pcs-pon")) {
+++		u32 val;
+++
+++		ret = regmap_read(priv->scu, AIROHA_SCU_PDIDR, &val);
+++		if (ret)
+++			return ret;
+++
+++		if (FIELD_GET(AIROHA_SCU_PRODUCT_ID, val) >= 0x2)
+++			priv->limit_tx_frag = true;
+++	}
+++
++ 	for (index = 0; index < data->num_port; index++) {
++ 		struct airoha_pcs_port *port = &priv->ports[index];
++ 
++--- a/drivers/net/pcs/airoha/pcs-airoha.h
+++++ b/drivers/net/pcs/airoha/pcs-airoha.h
++@@ -1660,6 +1660,7 @@ struct airoha_pcs_priv {
++ 	struct phy *phy;
++ 
++ 	bool manual_rx_calib;
+++	bool limit_tx_frag;
++ };
++ 
++ struct airoha_pcs_port {

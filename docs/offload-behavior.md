@@ -85,3 +85,22 @@ upload. Both table uploads, regulatory/SAR/board limits and recalculation remain
 in place. There is no firmware power-table cache or raised power limit. Failed
 recovery still blocks MMIO and traffic restart until the existing recovery
 requirements are met.
+
+## WAN flow control at 1 Gbps (test value)
+
+Some ISPs enforce a slower line on a 1 Gbps link with PAUSE frames and drop what
+arrives after their limit. With TX fragmentation off (`TX_FRAG_LEN` 31), the XSI
+MAC sends two or three more frames after it receives XOFF, enough to lose packets
+and hold a single TCP upload far below the line rate.
+
+On AN7581 E2 and later, the WAN MAC therefore uses a `TX_FRAG_LEN` of 4 at 1 Gbps
+or slower. This is a test value from short measurements on one line, not a general
+fix. The field's unit is not documented, so 4 is empirical: it stopped the MAC after
+the current frame on 91% of XOFFs under saturation, 2 and 8 behaved similarly, and
+16 began to fill the FIFO during PAUSE. Other ports and faster WAN links keep 31.
+Do not write other values to the running MAC to compare them: 30 stalled TX until
+a reboot.
+
+Patch 0021 lists what applying this to every port and speed still needs: the
+field's meaning, long runs, more traffic types, speeds, ports and silicon, latency
+under load, other link partners, and upstream review.
