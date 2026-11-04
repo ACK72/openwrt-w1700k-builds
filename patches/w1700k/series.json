@@ -6,6 +6,7 @@
     "offset": 100,
     "recipes": [
       "package/kernel/mt76/Makefile",
+      "package/network/config/netifd/Makefile",
       "package/network/services/hostapd/Makefile"
     ]
   },
