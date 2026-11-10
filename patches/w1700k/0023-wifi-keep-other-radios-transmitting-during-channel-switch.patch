@@ -1,0 +1,200 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Tue, 10 Nov 2026 21:31:00 +0900
+Subject: [PATCH] wifi: keep other radios transmitting during a channel switch
+
+__mt76_set_channel() parks the TX worker for the whole switch. On a
+multi-radio device the worker serves every radio, so a scan step on one
+band stops host TX on the others for the drain wait and the firmware
+channel switch, about 12 ms per step on the W1700K MT7996. A 6 GHz STA
+scanning 59 channels repeats this several times a second.
+
+The worker already skips stations of a PHY in reset or off channel. Park
+it only while flushing this PHY's pending frames and setting the reset
+bit, then let it run for the other radios. Their frames can still reach a
+ring this PHY shares (5 and 6 GHz share one host ring with NPU offload),
+so record each ring's fill level and wait for the frames queued before
+that mark instead of an empty ring. Such a ring may not empty while the
+others transmit, so poll the mark rather than rely on the completion
+wakeup. A device with a single radio keeps the previous behavior.
+
+diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0023-wifi-keep-other-radios-transmitting-during-channel-switch.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0023-wifi-keep-other-radios-transmitting-during-channel-switch.patch
+new file mode 100644
+--- /dev/null
++++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0023-wifi-keep-other-radios-transmitting-during-channel-switch.patch
+@@ -0,0 +1,176 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Tue, 10 Nov 2026 21:31:00 +0900
++Subject: [PATCH] wifi: mt76: keep other radios transmitting during a channel switch
++
++__mt76_set_channel() parks the TX worker for the whole switch. On a
++multi-radio device the worker serves every radio, so a scan step on one
++band stops host TX on the others for the drain wait and the firmware
++channel switch, about 12 ms per step on the W1700K MT7996. A 6 GHz STA
++scanning 59 channels repeats this several times a second.
++
++The worker already skips stations of a PHY in reset or off channel. Park
++it only while flushing this PHY's pending frames and setting the reset
++bit, then let it run for the other radios. Their frames can still reach a
++ring this PHY shares (5 and 6 GHz share one host ring with NPU offload),
++so record each ring's fill level and wait for the frames queued before
++that mark instead of an empty ring. Such a ring may not empty while the
++others transmit, so poll the mark rather than rely on the completion
++wakeup. A device with a single radio keeps the previous behavior.
++
++diff --git a/mac80211.c b/mac80211.c
++--- a/mac80211.c
+++++ b/mac80211.c
++@@ -4,6 +4,7 @@
++  */
++ #include <linux/sched.h>
++ #include <linux/of.h>
+++#include <linux/delay.h>
++ #include "mt76.h"
++ 
++ #define CHAN2G(_idx, _freq) {			\
++@@ -1058,6 +1059,98 @@ void mt76_phy_chandef_set(struct mt76_phy *phy,
++ }
++ EXPORT_SYMBOL_GPL(mt76_phy_chandef_set);
++ 
+++static bool mt76_phy_has_peer(struct mt76_phy *phy)
+++{
+++	struct mt76_dev *dev = phy->dev;
+++	int i;
+++
+++	for (i = 0; i < ARRAY_SIZE(dev->phys); i++)
+++		if (dev->phys[i] && dev->phys[i] != phy)
+++			return true;
+++
+++	return false;
+++}
+++
+++struct mt76_tx_mark {
+++	struct mt76_queue *q;
+++	int head;
+++	int queued;
+++};
+++
+++/* Record how far each ring of this PHY was filled when it entered reset. A
+++ * ring shared with another radio keeps receiving that radio's frames, so
+++ * the switch waits for the frames queued before the mark, not for an empty
+++ * ring.
+++ */
+++static int mt76_phy_tx_mark(struct mt76_phy *phy, struct mt76_tx_mark *mark)
+++{
+++	int i, j, n = 0;
+++
+++	for (i = 0; i < __MT_TXQ_MAX; i++) {
+++		struct mt76_queue *q = phy->q_tx[i];
+++
+++		if (!q || !q->ndesc)
+++			continue;
+++
+++		for (j = 0; j < n; j++)
+++			if (mark[j].q == q)
+++				break;
+++		if (j < n)
+++			continue;
+++
+++		mark[n].q = q;
+++		mark[n].head = READ_ONCE(q->head);
+++		mark[n].queued = READ_ONCE(q->queued);
+++		n++;
+++	}
+++
+++	return n;
+++}
+++
+++static bool mt76_phy_tx_drained(struct mt76_phy *phy,
+++				const struct mt76_tx_mark *mark, int n)
+++{
+++	int i;
+++
+++	if (atomic_read(&phy->mgmt_tx_pending))
+++		return false;
+++
+++	for (i = 0; i < n; i++) {
+++		const struct mt76_queue *q = mark[i].q;
+++		int left;
+++
+++		if (!READ_ONCE(q->queued))
+++			continue;
+++
+++		/* Entries from the tail up to the mark. Once the tail passes
+++		 * the mark this wraps above the marked fill level.
+++		 */
+++		left = (mark[i].head - READ_ONCE(q->tail) + q->ndesc) % q->ndesc;
+++		if (left && left <= mark[i].queued)
+++			return false;
+++	}
+++
+++	return true;
+++}
+++
+++static bool mt76_phy_wait_tx_marked(struct mt76_phy *phy,
+++				    const struct mt76_tx_mark *mark, int n,
+++				    int timeout)
+++{
+++	unsigned long end = jiffies + timeout;
+++
+++	/* A shared ring may not become empty while other radios transmit, so
+++	 * its completion wakeup cannot be relied on: poll the mark instead.
+++	 */
+++	while (!mt76_phy_tx_drained(phy, mark, n)) {
+++		if (time_after(jiffies, end))
+++			return false;
+++		usleep_range(200, 500);
+++	}
+++
+++	return true;
+++}
+++
++ int __mt76_set_channel(struct mt76_phy *phy, struct cfg80211_chan_def *chandef,
++ 		       bool offchannel)
++ {
++@@ -1066,7 +1159,10 @@ int __mt76_set_channel(struct mt76_phy *phy, struct cfg80211_chan_def *chandef,
++ 	struct cfg80211_chan_def old_main = phy->main_chandef;
++ 	struct mt76_channel_state *old_state = phy->chan_state;
++ 	bool old_offchannel = phy->offchannel;
+++	struct mt76_tx_mark mark[__MT_TXQ_MAX];
+++	bool park = !mt76_phy_has_peer(phy);
++ 	int timeout = HZ / 5;
+++	bool drained;
++ 	int ret;
++ 
++ 	if (test_bit(MT76_MCU_RESET, &dev->phy.state))
++@@ -1077,8 +1173,23 @@ int __mt76_set_channel(struct mt76_phy *phy, struct cfg80211_chan_def *chandef,
++ 
++ 	set_bit(MT76_RESET, &phy->state);
++ 	mt76_mgmt_tx_expire(phy);
++-	if (!wait_event_timeout(dev->tx_wait, !mt76_has_tx_pending(phy),
++-				timeout))
+++	if (park) {
+++		drained = wait_event_timeout(dev->tx_wait,
+++					     !mt76_has_tx_pending(phy),
+++					     timeout);
+++	} else {
+++		int n = mt76_phy_tx_mark(phy, mark);
+++
+++		/* The worker was parked when the reset bit was set, so every
+++		 * later run sees it and skips the stations of this PHY. The
+++		 * other radios keep transmitting during the drain and the
+++		 * firmware channel switch.
+++		 */
+++		mt76_worker_enable(&dev->tx_worker);
+++		mt76_worker_schedule(&dev->tx_worker);
+++		drained = mt76_phy_wait_tx_marked(phy, mark, n, timeout);
+++	}
+++	if (!drained)
++ 		phy->chan_switch_tx_timeouts++;
++ 	mt76_update_survey(phy);
++ 
++@@ -1117,7 +1228,8 @@ int __mt76_set_channel(struct mt76_phy *phy, struct cfg80211_chan_def *chandef,
++ 		phy->chan_state = old_state;
++ 		phy->offchannel = old_offchannel;
++ 	}
++-	mt76_worker_enable(&dev->tx_worker);
+++	if (park)
+++		mt76_worker_enable(&dev->tx_worker);
++ 	mt76_worker_schedule(&dev->tx_worker);
++ 
++ 	return ret;
