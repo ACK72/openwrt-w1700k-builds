@@ -53,9 +53,9 @@
     {
       "patch": "target/linux/generic/config-6.18, target/linux/airoha/config-6.18, target/linux/airoha/an7581/config-6.18",
       "change": "config",
-      "fingerprint": "fb430594d2ef0fd0175399f14e42d8d09647bc9d50e32176908c02df8d19112e",
+      "fingerprint": "49a96b6b994acd0798e5fb17c4fd82dde397730ca9efa766e2c467568323e000",
       "verdict": "safe failure",
-      "reason": "PSTORE is built in: official pstore kmods duplicate built-in code. airoha_eth, the NPU and MT7530 are modules instead of built in, and the default cpufreq governor is performance. None changes structures or interfaces that official feed modules use."
+      "reason": "PSTORE is built in: official pstore kmods duplicate built-in code. airoha_eth, the NPU and MT7530 are modules instead of built in, and the default cpufreq governor is performance. WATCHDOG_SYSFS (fanboy 4efcaeeeb3, for the procd watchdog cap) only adds static sysfs attributes in drivers/watchdog/watchdog_dev.c of the built-in watchdog core; no header uses it. None changes structures or interfaces that official feed modules use."
     },
     {
       "patch": "configs/w1700k.config",
