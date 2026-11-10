@@ -9,6 +9,7 @@ In LuCI's **Attended Sysupgrade**, use **Check for GitHub firmware** to select a
 
 See [network steering](docs/network-steering.md) for IRQ/NAPI placement and optional RPS/RFS configuration.
 See [STA control diagnostics](docs/sta-control-diagnostics.md) for optional beacon, MCU and RX timing measurements.
+See [channel switches and TX](docs/channel-switch-tx.md) for why scans used to stall Wi-Fi on every band and the counters that show it.
 See [offload counters and shared resources](docs/offload-behavior.md) for NPU counter coverage, IPv6 source-MAC slot limits and hardware LRO behavior.
 See [official kmod compatibility](docs/kmod-compatibility.md) for which official kmods work on this kernel and how kernel ABI changes are reviewed.
 
