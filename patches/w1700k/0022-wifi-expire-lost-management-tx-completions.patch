@@ -1,0 +1,207 @@
+From: ACK72 <acikom72@gmail.com>
+Date: Tue, 10 Nov 2026 21:30:00 +0900
+Subject: [PATCH] wifi: stop channel switches waiting on lost management TX completions
+
+Since "wifi: mt76: wait for firmware TX completion of mgmt frames before
+channel switch" (447cc8c8), __mt76_set_channel() waits up to HZ/5 for the
+per-PHY count of PSD tokens. A token whose TX-free record never arrives
+keeps that count above zero until the next device reset, so every later
+channel switch of the PHY waits the full 200 ms with the device-wide TX
+worker parked.
+
+On the W1700K the 6 GHz STA lost its AP and kept scanning. Each of the 59
+scan steps then stopped host TX on all three bands for 200 ms: Wi-Fi
+clients saw 80-150 ms average ping to the router with peaks above 400 ms,
+a scan took 17.3 s instead of about 5 s, and five host tokens stayed in
+flight. A reboot cleared it; the same scan steps then cost about 12 ms.
+
+Stop counting a PSD token two seconds after it was consumed. Firmware
+sends these frames right away, so its record is lost by then. The token
+and its buffers stay allocated, so a late record still releases them.
+Log the oldest expired frame's age and frame control, and report the
+pending count, expired frames and wait timeouts per band in token_info.
+
+diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-expire-lost-management-tx-completions.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-expire-lost-management-tx-completions.patch
+new file mode 100644
+--- /dev/null
++++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-expire-lost-management-tx-completions.patch
+@@ -0,0 +1,179 @@
++From: ACK72 <acikom72@gmail.com>
++Date: Tue, 10 Nov 2026 21:30:00 +0900
++Subject: [PATCH] wifi: mt76: expire management TX completions that never arrive
++
++Since "wifi: mt76: wait for firmware TX completion of mgmt frames before
++channel switch" (447cc8c8), __mt76_set_channel() waits up to HZ/5 for the
++per-PHY count of PSD tokens. A token whose TX-free record never arrives
++keeps that count above zero until the next device reset, so every later
++channel switch of the PHY waits the full 200 ms with the device-wide TX
++worker parked.
++
++On the W1700K the 6 GHz STA lost its AP and kept scanning. Each of the 59
++scan steps then stopped host TX on all three bands for 200 ms: Wi-Fi
++clients saw 80-150 ms average ping to the router with peaks above 400 ms,
++a scan took 17.3 s instead of about 5 s, and five host tokens stayed in
++flight. A reboot cleared it; the same scan steps then cost about 12 ms.
++
++Stop counting a PSD token two seconds after it was consumed. Firmware
++sends these frames right away, so its record is lost by then. The token
++and its buffers stay allocated, so a late record still releases them.
++Log the oldest expired frame's age and frame control, and report the
++pending count, expired frames and wait timeouts per band in token_info.
++
++diff --git a/mac80211.c b/mac80211.c
++--- a/mac80211.c
+++++ b/mac80211.c
++@@ -1076,7 +1076,10 @@ int __mt76_set_channel(struct mt76_phy *phy, struct cfg80211_chan_def *chandef,
++ 	mt76_txq_schedule_pending(phy);
++ 
++ 	set_bit(MT76_RESET, &phy->state);
++-	wait_event_timeout(dev->tx_wait, !mt76_has_tx_pending(phy), timeout);
+++	mt76_mgmt_tx_expire(phy);
+++	if (!wait_event_timeout(dev->tx_wait, !mt76_has_tx_pending(phy),
+++				timeout))
+++		phy->chan_switch_tx_timeouts++;
++ 	mt76_update_survey(phy);
++ 
++ 	if (phy->chandef.chan->center_freq != chandef->chan->center_freq ||
++diff --git a/mt76.h b/mt76.h
++--- a/mt76.h
+++++ b/mt76.h
++@@ -471,6 +471,10 @@ struct mt76_txwi_cache {
++ 
++ 	u8 qid;
++ 	u8 phy_idx;
+++
+++	/* PSD token counted in mgmt_tx_pending; written under token_lock */
+++	bool mgmt_counted;
+++	unsigned long consumed;
++ };
++ 
++ struct mt76_rx_tid {
++@@ -884,6 +888,11 @@ struct mt76_phy {
++ 	struct mt76_queue *q_tx[__MT_TXQ_MAX];
++ 
++ 	atomic_t mgmt_tx_pending;
+++	/* debugfs: management frames that never got a TX completion, and
+++	 * channel switches that gave up waiting for this PHY's TX
+++	 */
+++	u32 mgmt_tx_expired;
+++	u32 chan_switch_tx_timeouts;
++ 
++ 	struct cfg80211_chan_def chandef;
++ 	struct cfg80211_chan_def main_chandef;
++@@ -1646,6 +1655,7 @@ void mt76_release_buffered_frames(struct ieee80211_hw *hw,
++ void mt76_sta_ps_transition(struct mt76_dev *dev, struct mt76_wcid *wcid,
++ 			    bool ps);
++ bool mt76_has_tx_pending(struct mt76_phy *phy);
+++void mt76_mgmt_tx_expire(struct mt76_phy *phy);
++ int mt76_update_channel(struct mt76_phy *phy);
++ void mt76_update_survey(struct mt76_phy *phy);
++ void mt76_phy_chandef_set(struct mt76_phy *phy,
++diff --git a/mt7996/debugfs.c b/mt7996/debugfs.c
++--- a/mt7996/debugfs.c
+++++ b/mt7996/debugfs.c
++@@ -1049,6 +1049,24 @@ static int mt7996_token_info_read(struct seq_file *s, void *data)
++ 			   i, type, q->ndesc, q->queued, q->head, q->tail);
++ 	}
++ 
+++	/* A pending count that stays above zero makes every channel switch of
+++	 * that band wait the full timeout; expired counts frames whose TX-free
+++	 * record never arrived.
+++	 */
+++	seq_printf(s, "\n=== Channel-switch TX wait (per-band) ===\n");
+++	seq_puts(s, "     band | mgmt_pending | mgmt_expired | wait_timeouts |\n");
+++	for (i = 0; i < __MT_MAX_BAND; i++) {
+++		struct mt76_phy *phy = mdev->phys[i];
+++
+++		if (!phy)
+++			continue;
+++
+++		seq_printf(s, "  band %d  | %12d | %12u | %13u |\n", i,
+++			   atomic_read(&phy->mgmt_tx_pending),
+++			   READ_ONCE(phy->mgmt_tx_expired),
+++			   READ_ONCE(phy->chan_switch_tx_timeouts));
+++	}
+++
++ 	return 0;
++ }
++ 
++diff --git a/tx.c b/tx.c
++--- a/tx.c
+++++ b/tx.c
++@@ -1153,7 +1153,9 @@ int mt76_token_consume(struct mt76_dev *dev, struct mt76_txwi_cache **ptxwi)
++ 	if (token >= dev->token_start) {
++ 		dev->token_count++;
++ 
++-		if ((*ptxwi)->qid == MT_TXQ_PSD) {
+++		(*ptxwi)->mgmt_counted = (*ptxwi)->qid == MT_TXQ_PSD;
+++		(*ptxwi)->consumed = jiffies;
+++		if ((*ptxwi)->mgmt_counted) {
++ 			struct mt76_phy *mphy = mt76_dev_phy(dev, (*ptxwi)->phy_idx);
++ 			atomic_inc(&mphy->mgmt_tx_pending);
++ 		}
++@@ -1203,8 +1205,11 @@ mt76_token_release(struct mt76_dev *dev, int token, bool *wake)
++ 	if (txwi) {
++ 		dev->token_count--;
++ 
++-		if (txwi->qid == MT_TXQ_PSD) {
+++		/* An expired token no longer holds the counter. */
+++		if (txwi->mgmt_counted) {
++ 			struct mt76_phy *mphy = mt76_dev_phy(dev, txwi->phy_idx);
+++
+++			txwi->mgmt_counted = false;
++ 			if (atomic_dec_and_test(&mphy->mgmt_tx_pending))
++ 				wake_up(&dev->tx_wait);
++ 		}
++@@ -1227,6 +1232,51 @@ mt76_token_release(struct mt76_dev *dev, int token, bool *wake)
++ }
++ EXPORT_SYMBOL_GPL(mt76_token_release);
++ 
+++/* Firmware sends PSD (ALTX) frames right away without powersave buffering,
+++ * so their TX-free record arrives well within this time. A token still
+++ * counted after that lost its record; left counted, it would make every
+++ * channel switch of its PHY wait the full timeout with the TX worker parked.
+++ */
+++#define MT76_MGMT_TX_STALE	(2 * HZ)
+++
+++void mt76_mgmt_tx_expire(struct mt76_phy *phy)
+++{
+++	struct mt76_dev *dev = phy->dev;
+++	unsigned long now = jiffies, oldest = now;
+++	struct mt76_txwi_cache *txwi;
+++	u16 fc = 0;
+++	int id, n = 0;
+++
+++	if (!atomic_read(&phy->mgmt_tx_pending))
+++		return;
+++
+++	spin_lock_bh(&dev->token_lock);
+++	idr_for_each_entry(&dev->token, txwi, id) {
+++		if (!txwi->mgmt_counted || txwi->phy_idx != phy->band_idx ||
+++		    time_before(now, txwi->consumed + MT76_MGMT_TX_STALE))
+++			continue;
+++
+++		/* Keep the token and its buffers: a late TX-free record still
+++		 * releases them, it just no longer touches the counter.
+++		 */
+++		txwi->mgmt_counted = false;
+++		atomic_dec(&phy->mgmt_tx_pending);
+++		if (!n++ || time_before_eq(txwi->consumed, oldest)) {
+++			oldest = txwi->consumed;
+++			if (txwi->skb && txwi->skb->len >= sizeof(__le16))
+++				fc = le16_to_cpu(*(__le16 *)txwi->skb->data);
+++		}
+++	}
+++	phy->mgmt_tx_expired += n;
+++	spin_unlock_bh(&dev->token_lock);
+++
+++	if (n)
+++		dev_warn_ratelimited(dev->dev,
+++				     "band %u: %d management frame(s) got no TX completion (oldest %u ms, fc 0x%04x); channel switches no longer wait for them\n",
+++				     phy->band_idx, n,
+++				     jiffies_to_msecs(now - oldest), fc);
+++}
+++
++ struct mt76_txwi_cache *
++ mt76_rx_token_release(struct mt76_dev *dev, int token)
++ {

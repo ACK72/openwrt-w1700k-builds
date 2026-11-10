@@ -151,6 +151,11 @@
       "file": "0021-netifd-apply-link-settings-again-after-up.patch",
       "description": "netifd: send link settings again right after a device comes up, so speed and duplex reach PHYs connected in ndo_open",
       "author": "ACK72 <acikom72@gmail.com>"
+    },
+    {
+      "file": "0022-wifi-expire-lost-management-tx-completions.patch",
+      "description": "wifi: stop counting a management TX token whose TX-free record has not arrived after 2 s, so a lost record no longer makes every channel switch of its band wait 200 ms with the TX worker parked; report the counts in token_info",
+      "author": "ACK72 <acikom72@gmail.com>"
     }
   ]
 }
