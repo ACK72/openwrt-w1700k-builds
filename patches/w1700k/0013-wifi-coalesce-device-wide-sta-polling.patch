@@ -17,7 +17,7 @@ diff --git a/package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch b
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-zzz-mt7996-device-sta-poll.patch
-@@ -0,0 +1,563 @@
+@@ -0,0 +1,527 @@
 +From: ACK72 <acikom72@gmail.com>
 +Date: Mon, 28 Sep 2026 22:56:33 +0900
 +Subject: [PATCH] wifi: coalesce NPU station statistics and unlock RSSI waits
@@ -37,17 +37,8 @@ new file mode 100644
 +index 333ce45..a17af8a 100644
 +--- a/mt7996/mac.c
 ++++ b/mt7996/mac.c
-+@@ -2961,24 +2961,72 @@ void mt7996_mac_sta_rc_work(struct work_struct *work)
-+ 			mt7996_mcu_set_fixed_field(dev, msta_link->sta, NULL,
-+ 						   msta_link->wcid.link_id,
-+ 						   RATE_PARAM_MMPS_UPDATE);
-+ 
-+ 		spin_lock_bh(&dev->mt76.sta_poll_lock);
++@@ -3000,6 +3000,54 @@ mt7996_mac_token_check(struct mt7996_dev *dev)
 + 	}
-+ 
-+ 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
-+ 
-+ 	mutex_unlock(&dev->mt76.mutex);
 + }
 + 
 ++static void mt7996_mac_sta_poll(struct mt7996_phy *phy)
@@ -101,25 +92,7 @@ new file mode 100644
 + void mt7996_mac_work(struct work_struct *work)
 + {
 + 	struct mt7996_phy *phy;
-+ 	struct mt76_phy *mphy;
-+ 	u64 diag_start, diag_locked;
-+ 
-+ 	mphy = (struct mt76_phy *)container_of(work, struct mt76_phy,
-+ 					       mac_work.work);
-+ 	phy = mphy->priv;
-+ 	diag_start = mt76_sta_diag_clock(mphy->dev);
-+ 	if (diag_start)
-+ 		mt76_sta_diag_event(mphy->dev, MT76_DIAG_WORK_BEGIN,
-+@@ -2994,31 +3042,25 @@ void mt7996_mac_work(struct work_struct *work)
-+ 				mphy->band_idx, diag_start,
-+ 				mt76_sta_diag_us(diag_start, diag_locked),
-+ 				mt76_sta_diag_us(diag_locked, ktime_get_ns()),
-+ 				0, -ECANCELED);
-+ 		return;
-+ 	}
-+ 	mt76_update_survey(mphy);
-+ 	if (++mphy->mac_work_count == 5) {
-+ 		mphy->mac_work_count = 0;
++@@ -3033,13 +3081,7 @@ void mt7996_mac_work(struct work_struct *work)
 + 
 + 		mt7996_mac_update_stats(phy);
 + 
@@ -134,15 +107,6 @@ new file mode 100644
 + 	}
 + 
 + 	mutex_unlock(&mphy->dev->mutex);
-+ 
-+ 	if (diag_start)
-+ 		mt76_sta_diag_event(mphy->dev, MT76_DIAG_WORK_END,
-+ 			mphy->band_idx, diag_start,
-+ 			mt76_sta_diag_us(diag_start, diag_locked),
-+ 			mt76_sta_diag_us(diag_locked, ktime_get_ns()), 0, 0);
-+ 	mt76_beacon_mon_check(mphy);
-+ 	mt76_tx_status_check(mphy->dev, false);
-+ 
 +diff --git a/mt7996/main.c b/mt7996/main.c
 +index eb178af..58bc7af 100644
 +--- a/mt7996/main.c

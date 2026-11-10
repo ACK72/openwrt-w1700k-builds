@@ -13,7 +13,7 @@ diff --git a/package/kernel/mt76/patches/9999-zz-sta-control-diagnostics.patch b
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-zz-sta-control-diagnostics.patch
-@@ -0,0 +1,1114 @@
+@@ -0,0 +1,1066 @@
 +From: ACK72 <acikom72@gmail.com>
 +Date: Mon, 28 Sep 2026 22:56:33 +0900
 +Subject: [PATCH] wifi: add opt-in station diagnostics with accepted NAPI timing
@@ -503,16 +503,7 @@ new file mode 100644
 +index 8da50a9..333ce45 100644
 +--- a/mt7996/mac.c
 ++++ b/mt7996/mac.c
-+@@ -556,24 +556,30 @@ mt7996_mac_fill_rx(struct mt7996_dev *dev, enum mt76_rxq_id q,
-+ 
-+ 	if (!hdr_trans) {
-+ 		struct ieee80211_hdr *hdr;
-+ 
-+ 		if (insert_ccmp_hdr) {
-+ 			u8 key_id = FIELD_GET(MT_RXD1_NORMAL_KEY_ID, rxd1);
-+ 
-+ 			mt76_insert_ccmp_hdr(skb, key_id);
-+ 		}
++@@ -565,6 +565,12 @@ mt7996_mac_fill_rx(struct mt7996_dev *dev, enum mt76_rxq_id q,
 + 
 + 		hdr = mt76_skb_get_hdr(skb);
 + 		fc = hdr->frame_control;
@@ -525,25 +516,7 @@ new file mode 100644
 + 		if (ieee80211_is_beacon(fc))
 + 			mt76_rx_beacon(mphy, skb);
 + 		if (ieee80211_is_data_qos(fc)) {
-+ 			u8 *qos = ieee80211_get_qos_ctl(hdr);
-+ 
-+ 			seq_ctrl = le16_to_cpu(hdr->seq_ctrl);
-+ 			qos_ctl = *qos;
-+ 
-+ 			/* Mesh DA/SA/Length will be stripped after hardware
-+ 			 * de-amsdu, so here needs to clear amsdu present bit
-+ 			 * to mark it as a normal mesh frame.
-+ 			 */
-+@@ -2959,52 +2965,69 @@ void mt7996_mac_sta_rc_work(struct work_struct *work)
-+ 		spin_lock_bh(&dev->mt76.sta_poll_lock);
-+ 	}
-+ 
-+ 	spin_unlock_bh(&dev->mt76.sta_poll_lock);
-+ 
-+ 	mutex_unlock(&dev->mt76.mutex);
-+ }
-+ 
-+ void mt7996_mac_work(struct work_struct *work)
++@@ -2998,15 +3004,27 @@ void mt7996_mac_work(struct work_struct *work)
 + {
 + 	struct mt7996_phy *phy;
 + 	struct mt76_phy *mphy;
@@ -571,19 +544,7 @@ new file mode 100644
 + 		return;
 + 	}
 + 	mt76_update_survey(mphy);
-+ 	if (++mphy->mac_work_count == 5) {
-+ 		mphy->mac_work_count = 0;
-+ 
-+ 		mt7996_mac_update_stats(phy);
-+ 
-+ 		mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_RATE);
-+ 		mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_AIR_TIME);
-+ 		mt7996_mcu_get_per_sta_info(phy, UNI_PER_STA_RSSI);
-+ 		if (mtk_wed_device_active(&phy->dev->mt76.mmio.wed)) {
-+ 			mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_ADM_STAT);
-+ 			mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_MSDU_COUNT);
-+ 		}
-+ 	}
++@@ -3026,6 +3044,11 @@ void mt7996_mac_work(struct work_struct *work)
 + 
 + 	mutex_unlock(&mphy->dev->mutex);
 + 
@@ -594,16 +555,7 @@ new file mode 100644
 ++			mt76_sta_diag_us(diag_locked, ktime_get_ns()), 0, 0);
 + 	mt76_beacon_mon_check(mphy);
 + 	mt76_tx_status_check(mphy->dev, false);
-+ 
-+ 	ieee80211_queue_delayed_work(mphy->hw, &mphy->mac_work,
-+ 				     MT7996_WATCHDOG_TIME);
-+ }
-+ 
-+ static void mt7996_dfs_stop_radar_detector(struct mt7996_phy *phy)
-+ {
-+ 	struct mt7996_dev *dev = phy->dev;
-+ 	int rdd_idx = mt7996_get_rdd_idx(phy, false);
-+ 
++ 	mt7996_mac_token_check(phy->dev);
 +diff --git a/mt7996/main.c b/mt7996/main.c
 +index d1d4211..eb178af 100644
 +--- a/mt7996/main.c
