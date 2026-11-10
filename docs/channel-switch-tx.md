@@ -28,6 +28,12 @@ them. The first lost frames of a burst are logged:
 band 2: 1 management frame(s) got no TX completion (oldest 2310 ms, fc 0x00b0); channel switches no longer wait for them
 ```
 
+The fanboy stack's own fix (`0006-wifi-mt76-reclaim-lost-txfree-tokens.patch`)
+frees tokens of frames without status tracking after 5 s. It decrements the same
+count, so all three places (completion, this expiry and that reclaim) use one
+per-token flag and a token is subtracted only once. Frames that request a TX
+status, such as authentication frames, are not reclaimed there.
+
 `fc` is the 802.11 frame control of the oldest one: `0x00b0` authentication,
 `0x00c0` deauthentication, `0x00d0` action, `0x0040` probe request, `0x0048` null
 data and `0x00c8` QoS null. The to-DS and power-management flags add `0x0100` and

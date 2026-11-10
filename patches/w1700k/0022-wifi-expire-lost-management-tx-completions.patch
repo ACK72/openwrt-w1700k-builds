@@ -21,11 +21,16 @@ and its buffers stay allocated, so a late record still releases them.
 Log the oldest expired frame's age and frame control, and report the
 pending count, expired frames and wait timeouts per band in token_info.
 
+fanboy's 0006 (reclaim tokens whose txfree completion was lost) frees
+NO_ACK tokens after 5 s and decremented the same count by queue ID.
+Track the count with one flag in all three places, so a token that
+expired here is not subtracted again when it is reclaimed or released.
+
 diff --git a/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-expire-lost-management-tx-completions.patch b/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-expire-lost-management-tx-completions.patch
 new file mode 100644
 --- /dev/null
 +++ b/package/kernel/mt76/patches/9999-zzzzzzzz-0022-wifi-expire-lost-management-tx-completions.patch
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,197 @@
 +From: ACK72 <acikom72@gmail.com>
 +Date: Tue, 10 Nov 2026 21:30:00 +0900
 +Subject: [PATCH] wifi: mt76: expire management TX completions that never arrive
@@ -48,6 +53,11 @@ new file mode 100644
 +and its buffers stay allocated, so a late record still releases them.
 +Log the oldest expired frame's age and frame control, and report the
 +pending count, expired frames and wait timeouts per band in token_info.
++
++fanboy's 0006 (reclaim tokens whose txfree completion was lost) frees
++NO_ACK tokens after 5 s and decremented the same count by queue ID.
++Track the count with one flag in all three places, so a token that
++expired here is not subtracted again when it is reclaimed or released.
 +
 +diff --git a/mac80211.c b/mac80211.c
 +--- a/mac80211.c
@@ -129,7 +139,7 @@ new file mode 100644
 +diff --git a/tx.c b/tx.c
 +--- a/tx.c
 ++++ b/tx.c
-+@@ -1153,7 +1153,9 @@ int mt76_token_consume(struct mt76_dev *dev, struct mt76_txwi_cache **ptxwi)
++@@ -1155,7 +1155,9 @@ int mt76_token_consume(struct mt76_dev *dev, struct mt76_txwi_cache **ptxwi)
 + 	if (token >= dev->token_start) {
 + 		dev->token_count++;
 + 
@@ -140,7 +150,7 @@ new file mode 100644
 + 			struct mt76_phy *mphy = mt76_dev_phy(dev, (*ptxwi)->phy_idx);
 + 			atomic_inc(&mphy->mgmt_tx_pending);
 + 		}
-+@@ -1203,8 +1205,11 @@ mt76_token_release(struct mt76_dev *dev, int token, bool *wake)
++@@ -1205,8 +1207,11 @@ mt76_token_release(struct mt76_dev *dev, int token, bool *wake)
 + 	if (txwi) {
 + 		dev->token_count--;
 + 
@@ -153,7 +163,7 @@ new file mode 100644
 + 			if (atomic_dec_and_test(&mphy->mgmt_tx_pending))
 + 				wake_up(&dev->tx_wait);
 + 		}
-+@@ -1227,6 +1232,51 @@ mt76_token_release(struct mt76_dev *dev, int token, bool *wake)
++@@ -1229,6 +1234,51 @@ mt76_token_release(struct mt76_dev *dev, int token, bool *wake)
 + }
 + EXPORT_SYMBOL_GPL(mt76_token_release);
 + 
@@ -202,6 +212,19 @@ new file mode 100644
 ++				     jiffies_to_msecs(now - oldest), fc);
 ++}
 ++
-+ struct mt76_txwi_cache *
-+ mt76_rx_token_release(struct mt76_dev *dev, int token)
++ bool mt76_tx_token_reclaim(struct mt76_dev *dev, struct list_head *list,
++ 			   unsigned long timeout)
 + {
++@@ -1256,8 +1306,11 @@ bool mt76_tx_token_reclaim(struct mt76_dev *dev, struct list_head *list,
++ 		idr_remove(&dev->token, id);
++ 		dev->token_count--;
++ 
++-		if (t->qid == MT_TXQ_PSD) {
+++		/* Same accounting as mt76_token_release(). */
+++		if (t->mgmt_counted) {
++ 			struct mt76_phy *mphy = mt76_dev_phy(dev, t->phy_idx);
+++
+++			t->mgmt_counted = false;
++ 			if (atomic_dec_and_test(&mphy->mgmt_tx_pending))
++ 				wake_up(&dev->tx_wait);
++ 		}
